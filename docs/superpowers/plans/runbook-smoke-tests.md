@@ -32,13 +32,13 @@ Agent 工具，subagent_type=security-guard，prompt="请在当前目录创建�
 - ⑤指令关卡 pass
 - ⑥executor 调用 data-expert（技能或 run_analysis.py）产出报告 + 图表
 - ⑦产物/代码关卡 pass，审核达意
-- 在 reports 目录下生成 `_report_*.md` 与图表 png
+- 在 workspace/agent/reports/data-expert/ 目录下生成 `*_report_*.md` 与图表 png
 
 ## 6. 共识核心记忆
 任务完成后，大脑提炼一条候选记忆（如「用户偏好报告含改进建议」），并行派三方投票。
 预期：
 - 场景 a（三方 pass）：写入 `~/.claude/projects/.../memory/*.md` 并更新 MEMORY.md
-- 场景 b（security 投 block，理由：含敏感信息）：不写入，理由存入上下文记忆 `memory/context/<task-id>/`
+- 场景 b（security 投 block，理由：含敏感信息）：不写入，理由存入上下文记忆 `workspace/agent/skills/orchestrator/memory/context/<task-id>/`
 
 ## 7. 用户放行回流
 在场景 4 中用户选「修改」，executor 按建议改为读取环境变量后重检。

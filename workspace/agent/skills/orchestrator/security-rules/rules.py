@@ -21,7 +21,7 @@ def load_raw(path: Path) -> list[dict[str, Any]]:
     return data.get("rules", [])
 
 
-def merge_rules(default: list[dict], overrides: list[dict]) -> list[dict]:
+def merge_rules(default: list[dict[str, Any]], overrides: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """合并默认与覆盖规则：同 id 覆盖，新 id 追加。保留默认顺序，追加项在后。"""
     by_id: dict[str, dict] = {}
     for r in default:

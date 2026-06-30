@@ -45,4 +45,5 @@ def test_every_rule_has_required_fields():
         assert "category" in r
         assert "pattern" in r
         assert "severity" in r
+        assert "description" in r
         assert r["severity"] in ("block", "warn")
