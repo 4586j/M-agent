@@ -59,3 +59,27 @@ def create_worker_app(runner: AgentRunner, cfg: WorkerConfig) -> FastAPI:
         return {"content": full.read_text(encoding="utf-8")}
 
     return app
+
+
+def _build_app():
+    """从配置装配 worker_app，Fake runner 默认，可经环境变量切换 Sdk。"""
+    import os
+    from worker_config import load_worker_config
+    from agent_runner import FakeAgentRunner, SdkAgentRunner
+
+    cfg = load_worker_config()
+    runner_kind = os.environ.get("ORCH_RUNNER", "fake").lower()
+    if runner_kind == "sdk":
+        runner = SdkAgentRunner(work_dir=cfg.work_dir, executor_def_path=cfg.executor_def_path)
+    else:
+        runner = FakeAgentRunner(work_dir=cfg.work_dir)
+    return create_worker_app(runner, cfg)
+
+
+if __name__ == "__main__":
+    import uvicorn
+    from worker_config import load_worker_config
+
+    cfg = load_worker_config()
+    uvicorn.run(_build_app, host=cfg.listen_host, port=cfg.listen_port)
+

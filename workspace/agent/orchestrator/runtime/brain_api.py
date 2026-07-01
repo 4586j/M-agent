@@ -50,3 +50,23 @@ def create_brain_app(registry: WorkerRegistry, task_store: TaskStore, cfg: Confi
         return [asdict(w) for w in registry.active_workers()]
 
     return app
+
+
+def _build_app() -> FastAPI:
+    """从 config 装配 brain_app，供 uvicorn 启动。"""
+    from config import load_config
+    cfg = load_config()
+    registry = WorkerRegistry(heartbeat_timeout=cfg.heartbeat_timeout)
+    store = TaskStore(cfg.task_store_dir)
+    return create_brain_app(registry, store, cfg)
+
+
+if __name__ == "__main__":
+    import uvicorn
+    from config import load_config
+
+    cfg = load_config()
+    host = "127.0.0.1"
+    port = int(cfg.brain_url.rsplit(":", 1)[-1]) if ":" in cfg.brain_url else 7000
+    uvicorn.run(_build_app, host=host, port=port)
+
