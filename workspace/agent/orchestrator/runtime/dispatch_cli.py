@@ -3,13 +3,11 @@
 大脑主会话是 prompt 语义的 skill，无法直接 import Python。本脚本提供
 可执行入口，主会话通过 Bash 调用：
 
-    python -m workspace.agent.orchestrator.runtime.dispatch_cli "<prompt>"
+    python dispatch_cli.py "<prompt>"
 
-脚本读取 ORCH_MODE 决定走 LocalDispatcher（V1 单机，回退主会话 Agent 工具）
-还是 RemoteDispatcher（V2 跨主机，HTTP 派发到 worker）。结果输出为 JSON
-到 stdout，主会话据此判定。
-
-RemoteDispatcher 的 HTTP 客户端用 requests 真实调用 worker。
+脚本不自行持有 Dispatcher——派发与 worker 注册状态须在同一进程
+（brain_api），因此本脚本转发 HTTP 到运行中的 brain_api 的 /dispatch 端点。
+brain_url 由 ORCH_BRAIN_URL 指定（默认 http://127.0.0.1:7000）。
 """
 import json
 import os
@@ -17,35 +15,18 @@ import sys
 
 import requests
 
-from config import load_config
-from dispatcher import DispatchResult, LocalDispatcher, RemoteDispatcher
-from task_store import TaskStore
-from worker_registry import WorkerRegistry
-
-
-def _http_call(method: str, url: str, **kwargs) -> dict:
-    """真实 HTTP 客户端，签名与 dispatcher 期望一致。"""
-    resp = requests.request(method, url, timeout=30, **kwargs)
-    try:
-        body = resp.json()
-    except ValueError:
-        body = {"raw": resp.text}
-    return {"status_code": resp.status_code, "json": body}
-
-
-def build_dispatcher(cfg):
-    store = TaskStore(cfg.task_store_dir)
-    if cfg.mode == "remote":
-        registry = WorkerRegistry(heartbeat_timeout=cfg.heartbeat_timeout)
-        return RemoteDispatcher(task_store=store, registry=registry, http_call=_http_call)
-    return LocalDispatcher(task_store=store)
-
 
 def dispatch(prompt: str, role: str = "executor",
-             context_memory: str | None = None, model: str | None = None) -> DispatchResult:
-    cfg = load_config()
-    d = build_dispatcher(cfg)
-    return d.dispatch(role=role, prompt=prompt, context_memory=context_memory, model=model)
+             context_memory: str | None = None, model: str | None = None) -> dict:
+    brain_url = os.environ.get("ORCH_BRAIN_URL", "http://127.0.0.1:7000")
+    resp = requests.post(f"{brain_url}/dispatch", json={
+        "prompt": prompt, "role": role,
+        "context_memory": context_memory, "model": model,
+    }, timeout=120)
+    try:
+        return resp.json()
+    except ValueError:
+        return {"status": "failed", "error": f"brain 返回非 JSON: {resp.text}"}
 
 
 def main() -> int:
@@ -53,16 +34,9 @@ def main() -> int:
     role = os.environ.get("ORCH_ROLE", "executor")
     ctx = os.environ.get("ORCH_CONTEXT_MEMORY") or None
     model = os.environ.get("ORCH_MODEL") or None
-    try:
-        res = dispatch(prompt, role=role, context_memory=ctx, model=model)
-    except RuntimeError as e:
-        print(json.dumps({"status": "failed", "error": str(e)}, ensure_ascii=False))
-        return 1
-    print(json.dumps({
-        "task_id": res.task_id, "status": res.status,
-        "output": res.output, "artifacts": res.artifacts, "error": res.error,
-    }, ensure_ascii=False))
-    return 0
+    res = dispatch(prompt, role=role, context_memory=ctx, model=model)
+    print(json.dumps(res, ensure_ascii=False))
+    return 0 if res.get("status") == "done" else 1
 
 
 if __name__ == "__main__":

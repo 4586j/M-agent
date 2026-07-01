@@ -51,8 +51,9 @@ security-guard 返回 block 时，你**不自行放行、不自行修正**。立
 - `ORCH_MODE=remote`（V2 跨主机）：用 Bash 调用桥脚本派发，结果为 JSON：
   ```bash
   ORCH_CONTEXT_MEMORY="<相关上下文记忆>" \
-  python -m workspace.agent.orchestrator.runtime.dispatch_cli "<任务 prompt>"
+  python workspace/agent/orchestrator/runtime/dispatch_cli.py "<任务 prompt>"
   ```
+  桥脚本转发到运行中的 brain_api 的 /dispatch 端点（brain_url 由 ORCH_BRAIN_URL 指定）。
   输出 JSON：`{task_id, status, output, artifacts, error}`。status=done 取 output/artifacts；status=failed 看 error。无可用 worker 时返回 failed + 错误说明，告知用户「无可用 worker，先启动 worker 并注册」。
   需要产物文件时（关卡②检验代码），用 Bash `curl` 向 worker 拉取：`curl http://<worker host>:<port>/artifact/<task_id>?path=<路径>`。
 
