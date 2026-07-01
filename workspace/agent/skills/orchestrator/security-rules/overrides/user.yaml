@@ -1,0 +1,13 @@
+# 用户覆盖/扩展规则
+# 语义：同 id 覆盖默认；新 id 追加
+rules:
+  - id: R-INJECT-02
+    category: injection
+    description: 本项目允许受控脚本使用 shell=True（按需放宽为 warn）
+    pattern: 'shell\s*=\s*True'
+    severity: warn
+  - id: R-USER-01
+    category: dangerous_command
+    description: 禁止删除 reports 目录下的报告文件
+    pattern: 'rm\s+.*reports/'
+    severity: block

@@ -1,0 +1,29 @@
+"""大脑侧运行时配置。mode=local 保留 V1 单机行为，mode=remote 启用跨主机。"""
+import os
+from dataclasses import dataclass
+
+VALID_MODES = ("local", "remote")
+
+
+@dataclass
+class Config:
+    mode: str = "local"
+    brain_url: str = "http://127.0.0.1:7000"
+    heartbeat_interval: int = 15
+    heartbeat_timeout: int = 45
+    task_store_dir: str = "workspace/agent/orchestrator/runtime/.tasks"
+
+
+def load_config() -> Config:
+    mode = os.environ.get("ORCH_MODE", "local")
+    if mode not in VALID_MODES:
+        mode = "local"
+    return Config(
+        mode=mode,
+        brain_url=os.environ.get("ORCH_BRAIN_URL", "http://127.0.0.1:7000"),
+        heartbeat_interval=int(os.environ.get("ORCH_HEARTBEAT_INTERVAL", "15")),
+        heartbeat_timeout=int(os.environ.get("ORCH_HEARTBEAT_TIMEOUT", "45")),
+        task_store_dir=os.environ.get(
+            "ORCH_TASK_STORE_DIR", "workspace/agent/orchestrator/runtime/.tasks"
+        ),
+    )

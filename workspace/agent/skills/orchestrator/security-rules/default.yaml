@@ -1,0 +1,54 @@
+# 安全检验默认规则（框架自带，勿直接改；用 overrides/user.yaml 覆盖/扩展）
+# severity: block=否决并停给用户; warn=记录但放行
+# pattern 为正则字符串（YAML 单引号内反斜杠为字面量）
+rules:
+  - id: R-DANGER-01
+    category: dangerous_command
+    description: 禁止递归强制删除根目录/家目录
+    pattern: 'rm\s+-rf\s+(/|~|\$HOME)(\s|$)'
+    severity: block
+  - id: R-DANGER-02
+    category: dangerous_command
+    description: 禁止强制推送到远程主干分支
+    pattern: 'git\s+push.*--force.*\b(main|master)\b'
+    severity: block
+  - id: R-DANGER-03
+    category: dangerous_command
+    description: 禁止 hard reset 到远程分支
+    pattern: 'git\s+reset\s+--hard\s+\S*origin/'
+    severity: block
+  - id: R-PATH-01
+    category: path_escalation
+    description: 禁止访问工作区外的越界路径
+    pattern: '\.\./\.\./'
+    severity: block
+  - id: R-PATH-02
+    category: path_escalation
+    description: 禁止操作系统目录
+    pattern: '(/etc|/usr|/bin|C:\\Windows|C:\\Program Files)'
+    severity: block
+  - id: R-INJECT-01
+    category: injection
+    description: 禁止使用 eval/exec 执行动态代码
+    pattern: '\b(eval|exec)\s*\('
+    severity: block
+  - id: R-INJECT-02
+    category: injection
+    description: 禁止 shell=True 拼接命令
+    pattern: 'shell\s*=\s*True'
+    severity: block
+  - id: R-INJECT-03
+    category: injection
+    description: 疑似未参数化 SQL 拼接（提示确认）
+    pattern: '(SELECT|INSERT|UPDATE|DELETE).*(\+|%).*(--|;)'
+    severity: warn
+  - id: R-SECRET-01
+    category: secret_leak
+    description: 禁止硬编码 API key/token/密码
+    pattern: '(api[_-]?key|secret|token|password)\s*=\s*["''][A-Za-z0-9]{16,}'
+    severity: block
+  - id: R-EXFIL-01
+    category: data_exfil
+    description: 禁止将凭证外发到网络
+    pattern: '(curl|wget|requests\.post).*?(api[_-]?key|token|password)'
+    severity: block
