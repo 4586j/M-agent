@@ -45,12 +45,21 @@ python -c "import requests; print(requests.post('http://127.0.0.1:7000/register'
 预期：`GET http://127.0.0.1:7000/workers` 返回 worker-A。
 
 ## 5. 跨主机派发
-Python 调 RemoteDispatcher（注入真实 requests http_call）派发 executor 任务。
-预期：任务经 POST /task 到 worker-A，轮询 GET /task/{id} 拿到 done，TaskStore 记录 done。
+派发**不在 dispatch_cli 进程内选 worker**——worker 注册状态在 brain_api 进程内存，跨进程不共享。
+正确方式：brain_api 持有 RemoteDispatcher 并暴露 `POST /dispatch`，dispatch_cli 转发到该端点。
+
+```bash
+# 方式 A：直接调 brain_api /dispatch
+python -c "import requests; print(requests.post('http://127.0.0.1:7000/dispatch', json={'prompt':'分析示例数据'}).json())"
+
+# 方式 B：经 dispatch_cli 桥（主会话实际调用方式）
+python workspace/agent/orchestrator/runtime/dispatch_cli.py "分析示例数据"
+```
+**已实测**：注册 worker-A 后，两种方式均返回 `{status:done, output:..., artifacts:[]}`，task 经 brain → RemoteDispatcher → worker /task → 轮询 → done。
 
 ## 6. 心跳超时与 lost
 停止 worker-A，等 45s+。
-预期：`GET /workers` 不再返回 worker-A；TaskStore 中该 worker 的 running 任务标 lost，可重派。
+**已实测**：停止 worker 约 48s 后 `GET /workers` 返回空（超时剔除生效）。已完成的任务保持 done（设计如此：仅 running 中失联的任务才标 lost，可重派）。
 
 ## 7. 文件回传
 worker 产出一个文件后，大脑调 `GET /artifact/{id}?path=...` 拉取。

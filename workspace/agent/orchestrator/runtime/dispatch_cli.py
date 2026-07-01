@@ -1,0 +1,43 @@
+"""大脑↔runtime 桥：CLI 入口让主会话派发 executor。
+
+大脑主会话是 prompt 语义的 skill，无法直接 import Python。本脚本提供
+可执行入口，主会话通过 Bash 调用：
+
+    python dispatch_cli.py "<prompt>"
+
+脚本不自行持有 Dispatcher——派发与 worker 注册状态须在同一进程
+（brain_api），因此本脚本转发 HTTP 到运行中的 brain_api 的 /dispatch 端点。
+brain_url 由 ORCH_BRAIN_URL 指定（默认 http://127.0.0.1:7000）。
+"""
+import json
+import os
+import sys
+
+import requests
+
+
+def dispatch(prompt: str, role: str = "executor",
+             context_memory: str | None = None, model: str | None = None) -> dict:
+    brain_url = os.environ.get("ORCH_BRAIN_URL", "http://127.0.0.1:7000")
+    resp = requests.post(f"{brain_url}/dispatch", json={
+        "prompt": prompt, "role": role,
+        "context_memory": context_memory, "model": model,
+    }, timeout=120)
+    try:
+        return resp.json()
+    except ValueError:
+        return {"status": "failed", "error": f"brain 返回非 JSON: {resp.text}"}
+
+
+def main() -> int:
+    prompt = sys.argv[1] if len(sys.argv) > 1 else ""
+    role = os.environ.get("ORCH_ROLE", "executor")
+    ctx = os.environ.get("ORCH_CONTEXT_MEMORY") or None
+    model = os.environ.get("ORCH_MODEL") or None
+    res = dispatch(prompt, role=role, context_memory=ctx, model=model)
+    print(json.dumps(res, ensure_ascii=False))
+    return 0 if res.get("status") == "done" else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
