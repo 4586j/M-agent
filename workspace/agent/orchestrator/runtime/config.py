@@ -18,6 +18,7 @@ class Config:
     heartbeat_interval: int = 15
     heartbeat_timeout: int = 45
     task_store_dir: str = _default_task_store_dir()
+    security_llm: bool = False  # security-guard LLM 增强（需 brain 侧 claude-agent-sdk）
 
 
 def load_config() -> Config:
@@ -30,4 +31,5 @@ def load_config() -> Config:
         heartbeat_interval=int(os.environ.get("ORCH_HEARTBEAT_INTERVAL", "15")),
         heartbeat_timeout=int(os.environ.get("ORCH_HEARTBEAT_TIMEOUT", "45")),
         task_store_dir=os.environ.get("ORCH_TASK_STORE_DIR", _default_task_store_dir()),
+        security_llm=os.environ.get("ORCH_SECURITY_LLM", "0") in ("1", "true", "True"),
     )

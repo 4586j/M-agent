@@ -3,12 +3,22 @@ import time
 import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Callable
 
 from task_store import TaskStore, TaskRecord
 from worker_registry import WorkerRegistry
 
 _POLL_MAX = 1000  # 轮询上限，防死循环
+
+# 产物检验时拉取的文本类扩展名（二进制跳过，避免拉取巨大/无意义内容）
+_TEXT_ARTIFACT_EXT = {".md", ".txt", ".py", ".json", ".yaml", ".yml", ".sh",
+                      ".ts", ".tsx", ".js", ".jsx", ".csv", ".log", ".ini",
+                      ".toml", ".env", ".xml", ".html", ".css"}
+
+
+def _is_text_artifact(path: str) -> bool:
+    return Path(path).suffix.lower() in _TEXT_ARTIFACT_EXT
 
 
 @dataclass
@@ -18,6 +28,7 @@ class DispatchResult:
     output: Any = None
     artifacts: list = field(default_factory=list)
     error: Any = None
+    verdict: dict | None = None  # security-guard 产物裁决（done 且命中规则时存在）
 
 
 class Dispatcher(ABC):
@@ -34,9 +45,11 @@ class Dispatcher(ABC):
 class LocalDispatcher(Dispatcher):
     """V1 兼容：记录任务并标记 done。真实本地执行由主会话 Agent 工具完成。"""
 
-    def __init__(self, task_store: TaskStore, now_fn: Callable[[], str] | None = None):
+    def __init__(self, task_store: TaskStore, now_fn: Callable[[], str] | None = None,
+                 product_check: Callable[[str], dict] | None = None):
         self.task_store = task_store
         self._now = now_fn or (lambda: str(int(time.time())))
+        self.product_check = product_check
 
     def dispatch(self, role: str, prompt: str,
                  context_memory: str | None = None, model: str | None = None) -> DispatchResult:
@@ -47,9 +60,12 @@ class LocalDispatcher(Dispatcher):
             status="done", created_at=ts, updated_at=ts,
             output="本地派发：由主会话 Agent 工具执行", artifacts=[], error=None,
         )
+        if self.product_check:
+            rec.verdict = self.product_check(rec.output or "")
         self.task_store.write(rec)
         return DispatchResult(task_id=task_id, status="done",
-                              output=rec.output, artifacts=[], error=None)
+                              output=rec.output, artifacts=[], error=None,
+                              verdict=rec.verdict)
 
     def redispatch(self, task_id: str, model: str | None = None) -> DispatchResult:
         rec = self.task_store.get(task_id)
@@ -64,12 +80,14 @@ class RemoteDispatcher(Dispatcher):
 
     def __init__(self, task_store: TaskStore, registry: WorkerRegistry,
                  http_call: Callable[..., dict], now_fn: Callable[[], str] | None = None,
-                 select_strategy: str = "round_robin"):
+                 select_strategy: str = "round_robin",
+                 product_check: Callable[[str], dict] | None = None):
         self.task_store = task_store
         self.registry = registry
         self.http_call = http_call  # (method, url, **kwargs) -> {"status_code", "json"}
         self._now = now_fn or (lambda: str(int(time.time())))
         self.select_strategy = select_strategy
+        self.product_check = product_check
 
     def dispatch(self, role: str, prompt: str,
                  context_memory: str | None = None, model: str | None = None) -> DispatchResult:
@@ -99,17 +117,36 @@ class RemoteDispatcher(Dispatcher):
             data = r.get("json", {})
             st = data.get("status")
             if st in ("done", "failed"):
+                out = data.get("output")
+                arts = data.get("artifacts", [])
+                verdict = None
+                if st == "done" and self.product_check:
+                    verdict = self._check_product(base, task_id, out, arts)
                 self.task_store.update(
-                    task_id, status=st, output=data.get("output"),
-                    artifacts=data.get("artifacts", []), error=data.get("error"),
+                    task_id, status=st, output=out,
+                    artifacts=arts, error=data.get("error"), verdict=verdict,
                 )
                 return DispatchResult(
-                    task_id, st, data.get("output"),
-                    data.get("artifacts", []), data.get("error"),
+                    task_id, st, out, arts, data.get("error"), verdict,
                 )
             time.sleep(0.5)
         self.task_store.update(task_id, status="failed", error="poll timeout")
         return DispatchResult(task_id, "failed", error="poll timeout")
+
+    def _check_product(self, base: str, task_id: str, output: Any,
+                       artifacts: list) -> dict | None:
+        """合并 output + 文本 artifacts 内容过产物检验；二进制产物跳过。"""
+        combined = output or ""
+        for art in artifacts or []:
+            if not _is_text_artifact(art):
+                continue
+            try:
+                ar = self.http_call("GET", f"{base}/artifact/{task_id}", params={"path": art})
+                if ar.get("status_code") == 200:
+                    combined += f"\n\n--- artifact: {art} ---\n" + ar.get("json", {}).get("content", "")
+            except Exception:
+                continue
+        return self.product_check(combined)
 
     def redispatch(self, task_id: str, model: str | None = None) -> DispatchResult:
         rec = self.task_store.get(task_id)

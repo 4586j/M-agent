@@ -125,3 +125,65 @@ def test_remote_dispatcher_redispatch(tmp_path):
     assert second.task_id != first.task_id
     assert store.get(second.task_id).prompt == "original"
 
+
+def test_remote_dispatcher_product_check_fills_verdict(tmp_path):
+    """done 后拉 artifacts + output 过产物检验，verdict 填充并持久化。"""
+    store = TaskStore(str(tmp_path))
+    reg = WorkerRegistry(heartbeat_timeout=45, now_fn=lambda: 0.0)
+    reg.register(make_info())
+
+    seen = {"content": ""}
+
+    def product_check(content):
+        seen["content"] = content
+        return {"verdict": "block", "reason": "产物含 secret",
+                "matched_rules": ["R-SECRET-01"], "suggestion": "删除"}
+
+    def fake_http(method, url, **kwargs):
+        if method == "POST":
+            return {"status_code": 200, "json": {"task_id": "task-p", "status": "accepted"}}
+        if "/artifact/" in url:
+            return {"status_code": 200, "json": {"content": "api_key='abcdef0123456789'"}}
+        return {"status_code": 200, "json": {
+            "task_id": "task-p", "status": "done",
+            "output": "结果", "artifacts": ["report.md"], "error": None}}
+
+    d = RemoteDispatcher(task_store=store, registry=reg, http_call=fake_http,
+                         now_fn=lambda: "t0", product_check=product_check)
+    res = d.dispatch(role="executor", prompt="do x")
+    assert res.status == "done"
+    assert res.verdict is not None
+    assert res.verdict["verdict"] == "block"
+    assert "report.md" in seen["content"]  # 拉了 artifact 内容
+    assert "结果" in seen["content"]  # 含 output
+    rec = store.get(res.task_id)
+    assert rec.verdict == res.verdict  # 持久化
+
+
+def test_remote_dispatcher_no_product_check_leaves_verdict_none(tmp_path):
+    store = TaskStore(str(tmp_path))
+    reg = WorkerRegistry(heartbeat_timeout=45, now_fn=lambda: 0.0)
+    reg.register(make_info())
+
+    def fake_http(method, url, **kwargs):
+        if method == "POST":
+            return {"status_code": 200, "json": {"task_id": "task-n", "status": "accepted"}}
+        return {"status_code": 200, "json": {
+            "task_id": "task-n", "status": "done",
+            "output": "ok", "artifacts": [], "error": None}}
+
+    d = RemoteDispatcher(task_store=store, registry=reg, http_call=fake_http, now_fn=lambda: "t0")
+    res = d.dispatch(role="executor", prompt="do x")
+    assert res.verdict is None
+
+
+def test_local_dispatcher_product_check(tmp_path):
+    store = TaskStore(str(tmp_path))
+    d = LocalDispatcher(task_store=store, now_fn=lambda: "t0",
+                        product_check=lambda c: {"verdict": "pass", "reason": "ok",
+                                                  "matched_rules": [], "suggestion": ""})
+    res = d.dispatch(role="executor", prompt="do x")
+    assert res.status == "done"
+    assert res.verdict is not None
+    assert res.verdict["verdict"] == "pass"
+

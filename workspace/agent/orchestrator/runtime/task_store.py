@@ -19,6 +19,7 @@ class TaskRecord:
     output: Any = None
     artifacts: list = field(default_factory=list)
     error: Any = None
+    verdict: dict | None = None  # security-guard 产物裁决（done 时若命中规则则存在）
 
 
 class TaskStore:

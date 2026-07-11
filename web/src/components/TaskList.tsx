@@ -23,6 +23,9 @@ export default function TaskList({
             className="w-full text-left p-2 rounded hover:bg-white flex items-center gap-2"
           >
             <StatusBadge status={t.status} />
+            {t.verdict?.verdict === 'block' && (
+              <span className="text-amber-600 text-xs" title={t.verdict.reason}>⚠</span>
+            )}
             <span className="font-mono text-xs text-slate-500">{t.task_id}</span>
             <span className="text-sm text-slate-700 truncate flex-1">{t.prompt}</span>
             <span className="text-xs text-slate-400 shrink-0">{timeAgo(t.updated_at)}</span>

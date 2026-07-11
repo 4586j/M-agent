@@ -11,7 +11,7 @@ from task_store import TaskStore
 from worker_registry import WorkerRegistry, WorkerInfo
 from dispatcher import Dispatcher, RemoteDispatcher, DispatchResult
 from config import Config
-from security_guard import check as security_check
+from security_guard import check_with_llm as security_check
 
 
 class RegisterReq(BaseModel):
@@ -124,6 +124,7 @@ def create_brain_app(registry: WorkerRegistry, task_store: TaskStore, cfg: Confi
         return {
             "task_id": res.task_id, "status": res.status,
             "output": res.output, "artifacts": res.artifacts, "error": res.error,
+            "product_verdict": res.verdict,
         }
 
     @app.post("/dispatch")
@@ -132,7 +133,7 @@ def create_brain_app(registry: WorkerRegistry, task_store: TaskStore, cfg: Confi
             return {"status": "failed", "error": "dispatcher 未配置（local 模式不提供 /dispatch）"}
         # security-guard 指令检验；force=true 跳过（用于放行 block 指令）
         if not req.force:
-            v = security_check(req.prompt)
+            v = security_check(req.prompt, use_llm=cfg.security_llm)
             if v["verdict"] == "block":
                 return {"status": "blocked", "verdict": v, "task_id": None,
                         "output": None, "artifacts": [], "error": None}
@@ -144,6 +145,7 @@ def create_brain_app(registry: WorkerRegistry, task_store: TaskStore, cfg: Confi
         return {
             "task_id": res.task_id, "status": res.status,
             "output": res.output, "artifacts": res.artifacts, "error": res.error,
+            "product_verdict": res.verdict,
         }
 
     @app.get("/stats")
@@ -205,8 +207,10 @@ def _build_app() -> FastAPI:
     dispatcher = None
     if cfg.mode == "remote":
         strategy = os.environ.get("ORCH_SELECT_STRATEGY", "round_robin")
+        product_check = (lambda c: security_check(c, use_llm=cfg.security_llm))
         dispatcher = RemoteDispatcher(task_store=store, registry=registry,
-                                      http_call=_http_call, select_strategy=strategy)
+                                      http_call=_http_call, select_strategy=strategy,
+                                      product_check=product_check)
     return create_brain_app(registry, store, cfg, dispatcher=dispatcher)
 
 

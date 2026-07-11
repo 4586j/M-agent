@@ -90,6 +90,20 @@ export default function TaskDetail({
             )}
           </Section>
         )}
+        {task.verdict?.verdict === 'block' && (
+          <Section title="security-guard 产物裁决">
+            <div className="bg-amber-50 border border-amber-200 rounded p-3">
+              <div className="text-amber-700 font-semibold text-sm mb-1">⚠ 产物被标记</div>
+              <div className="text-xs text-slate-700 mb-1">{task.verdict.reason}</div>
+              {task.verdict.matched_rules.length > 0 && (
+                <div className="text-xs text-slate-500 mb-1">命中: {task.verdict.matched_rules.join(', ')}</div>
+              )}
+              {task.verdict.suggestion && (
+                <div className="text-xs text-slate-600">建议: {task.verdict.suggestion}</div>
+              )}
+            </div>
+          </Section>
+        )}
         <div className="flex gap-2 items-center mt-4">
           <button
             disabled={busy || !cancellable}

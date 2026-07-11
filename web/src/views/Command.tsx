@@ -110,6 +110,18 @@ export default function Command() {
                 {result.error != null && (
                   <pre className="bg-rose-50 rounded p-2 text-sm whitespace-pre-wrap">{String(result.error)}</pre>
                 )}
+                {result.product_verdict?.verdict === 'block' && (
+                  <div className="mt-2 bg-amber-50 border border-amber-200 rounded p-3">
+                    <div className="text-amber-700 font-semibold text-sm mb-1">⚠ 产物被 security-guard 标记</div>
+                    <div className="text-xs text-slate-700 mb-1">{result.product_verdict.reason}</div>
+                    {result.product_verdict.matched_rules.length > 0 && (
+                      <div className="text-xs text-slate-500 mb-1">命中: {result.product_verdict.matched_rules.join(', ')}</div>
+                    )}
+                    {result.product_verdict.suggestion && (
+                      <div className="text-xs text-slate-600">建议: {result.product_verdict.suggestion}</div>
+                    )}
+                  </div>
+                )}
               </>
             )}
           </div>
@@ -127,6 +139,9 @@ export default function Command() {
                 <div className="flex items-center gap-2 mb-1 text-xs">
                   <span className="text-slate-400" title={timeAgo(t.created_at)}>{formatTime(t.created_at)}</span>
                   <StatusBadge status={t.status} />
+                  {t.verdict?.verdict === 'block' && (
+                    <span className="text-amber-600 text-xs" title={t.verdict.reason}>⚠ 产物拦截</span>
+                  )}
                   <span className="text-slate-500">→ {t.worker_id || '-'}</span>
                   <button onClick={() => setPrompt(t.prompt)}
                     className="ml-auto text-sky-600 hover:underline">回填</button>

@@ -23,6 +23,7 @@ export interface TaskRecord {
   output: unknown
   artifacts: string[]
   error: unknown
+  verdict?: SecurityVerdict
 }
 
 export interface SecurityVerdict {
@@ -38,7 +39,8 @@ export interface DispatchResult {
   output: unknown
   artifacts: string[]
   error: unknown
-  verdict?: SecurityVerdict  // status=='blocked' 时存在
+  verdict?: SecurityVerdict  // status=='blocked' 时存在（指令拦截）
+  product_verdict?: SecurityVerdict  // status=='done' 时可能存在（产物拦截）
 }
 
 export interface Stats {
