@@ -93,7 +93,7 @@ class RemoteDispatcher(Dispatcher):
             self.task_store.update(task_id, status="failed", error=f"post failed: {resp}")
             return DispatchResult(task_id, "failed", error=f"post failed: {resp}")
         self.task_store.update(task_id, status="running")
-        # 轮询
+        # 轮询：每 0.5s 拉一次，直到 done/failed 或达 _POLL_MAX 上限
         for _ in range(_POLL_MAX):
             r = self.http_call("GET", f"{base}/task/{task_id}")
             data = r.get("json", {})
@@ -107,6 +107,7 @@ class RemoteDispatcher(Dispatcher):
                     task_id, st, data.get("output"),
                     data.get("artifacts", []), data.get("error"),
                 )
+            time.sleep(0.5)
         self.task_store.update(task_id, status="failed", error="poll timeout")
         return DispatchResult(task_id, "failed", error="poll timeout")
 

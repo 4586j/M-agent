@@ -43,11 +43,11 @@ def test_get_missing_task(tmp_path):
 
 def test_artifact_endpoint_returns_file(tmp_path):
     client = make_client(tmp_path)
-    # 先放一个文件再拉
+    # 产物落在 work_dir/{task_id}/ 下，path 相对该子目录
     p = Path(tmp_path) / "task-1" / "report.md"
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text("报告内容", encoding="utf-8")
-    r = client.get("/artifact/task-1?path=task-1/report.md")
+    r = client.get("/artifact/task-1?path=report.md")
     assert r.status_code == 200
     assert "报告内容" in r.text
 

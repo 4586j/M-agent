@@ -83,8 +83,20 @@ def create_worker_app(runner: AgentRunner, cfg: WorkerConfig) -> FastAPI:
 
     @app.post("/task")
     def post_task(body: TaskBody):
-        # 同步执行（Fake 即时）；真实 SDK 可在此起线程异步
-        _execute(body)
+        # 异步执行：起后台线程跑 runner，立即返回 accepted；
+        # state 先占位 running 供 brain 轮询，完成或异常时覆盖。
+        with lock:
+            state[body.task_id] = TaskResult(body.task_id, "running")
+
+        def _bg():
+            try:
+                _execute(body)
+            except Exception as e:
+                with lock:
+                    state[body.task_id] = TaskResult(
+                        body.task_id, "failed", error=f"execute error: {e}")
+
+        threading.Thread(target=_bg, daemon=True, name=f"task-{body.task_id}").start()
         return {"task_id": body.task_id, "status": "accepted"}
 
     @app.get("/task/{task_id}")
@@ -101,11 +113,11 @@ def create_worker_app(runner: AgentRunner, cfg: WorkerConfig) -> FastAPI:
 
     @app.get("/artifact/{task_id}")
     def get_artifact(task_id: str, path: str):
-        full = Path(cfg.work_dir) / path
-        # 防路径穿越
+        # 产物落在 work_dir/{task_id}/ 下，path 相对该子目录
+        base = Path(cfg.work_dir).resolve()
+        full = (base / task_id / path).resolve()
+        # 防路径穿越：必须在 work_dir 内
         try:
-            full = full.resolve()
-            base = Path(cfg.work_dir).resolve()
             full.relative_to(base)
         except ValueError:
             raise HTTPException(status_code=400, detail="invalid path")

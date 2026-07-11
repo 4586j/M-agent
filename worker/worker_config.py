@@ -1,6 +1,19 @@
 """worker 配置。"""
 import os
 from dataclasses import dataclass
+from pathlib import Path
+
+_HERE = Path(__file__).resolve().parent
+
+
+def _default_work_dir() -> str:
+    """worker 自己的工作区，基于本文件位置，避免相对路径随 cwd 漂移。"""
+    return str(_HERE / ".worker_work")
+
+
+def _default_executor_def() -> str:
+    """定位到项目根 .claude/agents/executor.md，避免相对路径随 cwd 漂移。"""
+    return str(_HERE.parent / ".claude" / "agents" / "executor.md")
 
 
 @dataclass
@@ -10,8 +23,8 @@ class WorkerConfig:
     role: str = "executor"
     listen_host: str = "127.0.0.1"
     listen_port: int = 8000
-    executor_def_path: str = ".claude/agents/executor.md"
-    work_dir: str = "workspace/agent/orchestrator/runtime/.worker_work"
+    executor_def_path: str = _default_executor_def()
+    work_dir: str = _default_work_dir()
     heartbeat_interval: int = 15
     auto_register: bool = True
 
@@ -23,8 +36,8 @@ def load_worker_config() -> WorkerConfig:
         role="executor",
         listen_host=os.environ.get("ORCH_WORKER_HOST", "127.0.0.1"),
         listen_port=int(os.environ.get("ORCH_WORKER_PORT", "8000")),
-        executor_def_path=os.environ.get("ORCH_EXECUTOR_DEF", ".claude/agents/executor.md"),
-        work_dir=os.environ.get("ORCH_WORK_DIR", "workspace/agent/orchestrator/runtime/.worker_work"),
+        executor_def_path=os.environ.get("ORCH_EXECUTOR_DEF", _default_executor_def()),
+        work_dir=os.environ.get("ORCH_WORK_DIR", _default_work_dir()),
         heartbeat_interval=int(os.environ.get("ORCH_HEARTBEAT_INTERVAL", "15")),
         auto_register=os.environ.get("ORCH_AUTO_REGISTER", "1") not in ("0", "false", "False"),
     )

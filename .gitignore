@@ -9,4 +9,5 @@ web/dist/
 # 运行时产物（测试/运行生成）
 .playwright-mcp/
 workspace/agent/orchestrator/runtime/.tasks/
+worker/.worker_work/
 
