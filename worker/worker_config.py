@@ -26,6 +26,7 @@ class WorkerConfig:
     executor_def_path: str = _default_executor_def()
     work_dir: str = _default_work_dir()
     heartbeat_interval: int = 15
+    permission_mode: str = "bypassPermissions"
     auto_register: bool = True
 
 
@@ -39,5 +40,6 @@ def load_worker_config() -> WorkerConfig:
         executor_def_path=os.environ.get("ORCH_EXECUTOR_DEF", _default_executor_def()),
         work_dir=os.environ.get("ORCH_WORK_DIR", _default_work_dir()),
         heartbeat_interval=int(os.environ.get("ORCH_HEARTBEAT_INTERVAL", "15")),
+        permission_mode=os.environ.get("ORCH_PERMISSION_MODE", "bypassPermissions"),
         auto_register=os.environ.get("ORCH_AUTO_REGISTER", "1") not in ("0", "false", "False"),
     )

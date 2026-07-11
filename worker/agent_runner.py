@@ -56,10 +56,12 @@ class SdkAgentRunner(AgentRunner):
     通过 query() 异步执行后同步收集 ResultMessage。工作目录隔离到 task 子目录。
     """
 
-    def __init__(self, work_dir: str, executor_def_path: str):
+    def __init__(self, work_dir: str, executor_def_path: str,
+                 permission_mode: str = "bypassPermissions"):
         self.work_dir = Path(work_dir)
         self.work_dir.mkdir(parents=True, exist_ok=True)
         self.executor_def_path = executor_def_path
+        self.permission_mode = permission_mode
 
     def _parse_executor_def(self) -> dict:
         """解析 .claude/agents/executor.md 的 frontmatter + body。"""
@@ -94,7 +96,7 @@ class SdkAgentRunner(AgentRunner):
             cwd=str(task_dir),
             model=req.model or meta["model"],
             system_prompt=meta["prompt"],
-            permission_mode="acceptEdits",
+            permission_mode=self.permission_mode,
             max_turns=50,
         )
         if meta["tools"]:

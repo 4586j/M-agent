@@ -137,7 +137,8 @@ def _build_app():
     cfg = load_worker_config()
     runner_kind = os.environ.get("ORCH_RUNNER", "fake").lower()
     if runner_kind == "sdk":
-        runner = SdkAgentRunner(work_dir=cfg.work_dir, executor_def_path=cfg.executor_def_path)
+        runner = SdkAgentRunner(work_dir=cfg.work_dir, executor_def_path=cfg.executor_def_path,
+                                permission_mode=cfg.permission_mode)
     else:
         runner = FakeAgentRunner(work_dir=cfg.work_dir)
     if cfg.auto_register:
