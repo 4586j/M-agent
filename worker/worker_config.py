@@ -12,6 +12,8 @@ class WorkerConfig:
     listen_port: int = 8000
     executor_def_path: str = ".claude/agents/executor.md"
     work_dir: str = "workspace/agent/orchestrator/runtime/.worker_work"
+    heartbeat_interval: int = 15
+    auto_register: bool = True
 
 
 def load_worker_config() -> WorkerConfig:
@@ -23,4 +25,6 @@ def load_worker_config() -> WorkerConfig:
         listen_port=int(os.environ.get("ORCH_WORKER_PORT", "8000")),
         executor_def_path=os.environ.get("ORCH_EXECUTOR_DEF", ".claude/agents/executor.md"),
         work_dir=os.environ.get("ORCH_WORK_DIR", "workspace/agent/orchestrator/runtime/.worker_work"),
+        heartbeat_interval=int(os.environ.get("ORCH_HEARTBEAT_INTERVAL", "15")),
+        auto_register=os.environ.get("ORCH_AUTO_REGISTER", "1") not in ("0", "false", "False"),
     )

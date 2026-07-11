@@ -1,4 +1,5 @@
 """派发抽象。LocalDispatcher 保留 V1；RemoteDispatcher 走 HTTP 到 worker。"""
+import time
 import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -25,13 +26,17 @@ class Dispatcher(ABC):
                  context_memory: str | None = None,
                  model: str | None = None) -> DispatchResult: ...
 
+    @abstractmethod
+    def redispatch(self, task_id: str, model: str | None = None) -> DispatchResult:
+        """按已存在任务的 role/prompt 重新派发，返回新 DispatchResult。"""
+
 
 class LocalDispatcher(Dispatcher):
     """V1 兼容：记录任务并标记 done。真实本地执行由主会话 Agent 工具完成。"""
 
     def __init__(self, task_store: TaskStore, now_fn: Callable[[], str] | None = None):
         self.task_store = task_store
-        self._now = now_fn or (lambda: "t0")
+        self._now = now_fn or (lambda: str(int(time.time())))
 
     def dispatch(self, role: str, prompt: str,
                  context_memory: str | None = None, model: str | None = None) -> DispatchResult:
@@ -46,20 +51,29 @@ class LocalDispatcher(Dispatcher):
         return DispatchResult(task_id=task_id, status="done",
                               output=rec.output, artifacts=[], error=None)
 
+    def redispatch(self, task_id: str, model: str | None = None) -> DispatchResult:
+        rec = self.task_store.get(task_id)
+        if rec is None:
+            raise KeyError(f"task not found: {task_id}")
+        return self.dispatch(role=rec.role, prompt=rec.prompt,
+                             context_memory=None, model=model)
+
 
 class RemoteDispatcher(Dispatcher):
     """HTTP 派发到 worker：选 worker、写 pending、POST /task、轮询 GET /task/{id}。"""
 
     def __init__(self, task_store: TaskStore, registry: WorkerRegistry,
-                 http_call: Callable[..., dict], now_fn: Callable[[], str] | None = None):
+                 http_call: Callable[..., dict], now_fn: Callable[[], str] | None = None,
+                 select_strategy: str = "round_robin"):
         self.task_store = task_store
         self.registry = registry
         self.http_call = http_call  # (method, url, **kwargs) -> {"status_code", "json"}
-        self._now = now_fn or (lambda: "t0")
+        self._now = now_fn or (lambda: str(int(time.time())))
+        self.select_strategy = select_strategy
 
     def dispatch(self, role: str, prompt: str,
                  context_memory: str | None = None, model: str | None = None) -> DispatchResult:
-        worker = self.registry.select_worker(role)
+        worker = self.registry.select_worker(role, strategy=self.select_strategy)
         if worker is None:
             raise RuntimeError(f"无可用 {role} worker")
         task_id = f"task-{uuid.uuid4().hex[:8]}"
@@ -95,3 +109,10 @@ class RemoteDispatcher(Dispatcher):
                 )
         self.task_store.update(task_id, status="failed", error="poll timeout")
         return DispatchResult(task_id, "failed", error="poll timeout")
+
+    def redispatch(self, task_id: str, model: str | None = None) -> DispatchResult:
+        rec = self.task_store.get(task_id)
+        if rec is None:
+            raise KeyError(f"task not found: {task_id}")
+        return self.dispatch(role=rec.role, prompt=rec.prompt,
+                             context_memory=None, model=model)

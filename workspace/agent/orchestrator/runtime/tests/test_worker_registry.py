@@ -49,3 +49,38 @@ def test_role_filter():
     reg.register(make_info("B", role="security"))
     assert reg.select_worker("executor").worker_id == "A"
     assert reg.select_worker("security").worker_id == "B"
+
+
+def test_unregister_removes_worker():
+    reg = WorkerRegistry(heartbeat_timeout=45)
+    reg.register(make_info("A"))
+    assert reg.unregister("A") is True
+    assert reg.select_worker("executor") is None
+    assert reg.unregister("A") is False  # 已不在
+
+
+def test_heartbeat_stores_load():
+    reg = WorkerRegistry(heartbeat_timeout=45)
+    reg.register(make_info("A"))
+    reg.heartbeat("A", load=5)
+    w = reg.active_workers()[0]
+    assert w.load == 5
+
+
+def test_select_least_load_picks_lower_load():
+    reg = WorkerRegistry(heartbeat_timeout=45)
+    reg.register(make_info("A"))
+    reg.register(make_info("B"))
+    reg.heartbeat("A", load=9)
+    reg.heartbeat("B", load=1)
+    assert reg.select_worker("executor", strategy="least_load").worker_id == "B"
+
+
+def test_all_workers_includes_timed_out():
+    times = [0.0]
+    reg = WorkerRegistry(heartbeat_timeout=45, now_fn=lambda: times[0])
+    reg.register(make_info("A"))
+    times[0] = 1000.0  # 超时
+    assert reg.active_workers() == []
+    assert len(reg.all_workers()) == 1
+

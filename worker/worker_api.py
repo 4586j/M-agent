@@ -1,7 +1,9 @@
-"""worker HTTP 服务：接受任务、查询状态、回传产出文件。"""
+"""worker HTTP 服务：接受任务、查询状态、回传产出文件；启动即向大脑注册并定期心跳。"""
 import threading
+import time
 from pathlib import Path
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from agent_runner import AgentRunner, TaskRequest, TaskResult
@@ -15,10 +17,63 @@ class TaskBody(BaseModel):
     model: str | None = None
 
 
+def register_to_brain(cfg: WorkerConfig, http_post=None) -> bool:
+    """向大脑注册本 worker；失败重试 3 次。http_post 可注入便于单测。"""
+    import requests
+    http_post = http_post or requests.post
+    url = f"{cfg.brain_url}/register"
+    body = {"worker_id": cfg.worker_id, "role": cfg.role,
+            "host": cfg.listen_host, "port": cfg.listen_port, "capabilities": {}}
+    for _ in range(3):
+        try:
+            r = http_post(url, json=body, timeout=5)
+            if getattr(r, "status_code", 0) == 200:
+                return True
+        except Exception:
+            pass
+        time.sleep(2)
+    return False
+
+
+def start_auto_heartbeat(cfg: WorkerConfig, interval: int | None = None,
+                         stop_event: threading.Event | None = None,
+                         http_post=None) -> threading.Thread:
+    """后台线程：先注册，再按 interval 定期发心跳。daemon，随主进程退出。"""
+    http_post = http_post  # 真实默认在循环内懒加载，便于测试注入
+    interval = interval or cfg.heartbeat_interval
+    stop_event = stop_event or threading.Event()
+
+    def loop():
+        import requests
+        post = http_post or requests.post
+        register_to_brain(cfg, http_post=post)
+        hb_url = f"{cfg.brain_url}/heartbeat"
+        while not stop_event.is_set():
+            try:
+                post(hb_url, json={"worker_id": cfg.worker_id, "load": 0}, timeout=5)
+            except Exception:
+                pass
+            stop_event.wait(interval)
+
+    t = threading.Thread(target=loop, daemon=True, name="worker-heartbeat")
+    t.start()
+    return t
+
+
 def create_worker_app(runner: AgentRunner, cfg: WorkerConfig) -> FastAPI:
     app = FastAPI()
     state: dict[str, TaskResult] = {}
     lock = threading.Lock()
+
+    # CORS：开发期前端直连 worker 查任务/产物
+    origins = __import__("os").environ.get("ORCH_CORS_ORIGINS", "http://localhost:5173")
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=[o.strip() for o in origins.split(",") if o.strip()],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 
     def _execute(body: TaskBody):
         req = TaskRequest(body.task_id, body.prompt, body.context_memory, body.model)
@@ -73,6 +128,8 @@ def _build_app():
         runner = SdkAgentRunner(work_dir=cfg.work_dir, executor_def_path=cfg.executor_def_path)
     else:
         runner = FakeAgentRunner(work_dir=cfg.work_dir)
+    if cfg.auto_register:
+        start_auto_heartbeat(cfg)
     return create_worker_app(runner, cfg)
 
 
@@ -82,4 +139,3 @@ if __name__ == "__main__":
 
     cfg = load_worker_config()
     uvicorn.run(_build_app, host=cfg.listen_host, port=cfg.listen_port)
-

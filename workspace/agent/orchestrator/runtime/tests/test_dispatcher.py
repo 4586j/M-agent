@@ -82,3 +82,46 @@ def test_remote_dispatcher_failed_propagates(tmp_path):
     res = d.dispatch(role="executor", prompt="do x")
     assert res.status == "failed"
     assert res.error == "boom"
+
+
+def test_local_dispatcher_redispatch_uses_original_role_prompt(tmp_path):
+    store = TaskStore(str(tmp_path))
+    d = LocalDispatcher(task_store=store, now_fn=lambda: "t0")
+    res1 = d.dispatch(role="executor", prompt="do x")
+    res2 = d.redispatch(res1.task_id)
+    assert res2.status == "done"
+    assert res2.task_id != res1.task_id
+    rec2 = store.get(res2.task_id)
+    assert rec2.prompt == "do x"
+    assert rec2.role == "executor"
+
+
+def test_local_dispatcher_redispatch_missing_raises(tmp_path):
+    store = TaskStore(str(tmp_path))
+    d = LocalDispatcher(task_store=store, now_fn=lambda: "t0")
+    try:
+        d.redispatch("nope")
+        assert False, "应抛 KeyError"
+    except KeyError:
+        pass
+
+
+def test_remote_dispatcher_redispatch(tmp_path):
+    store = TaskStore(str(tmp_path))
+    reg = WorkerRegistry(heartbeat_timeout=45, now_fn=lambda: 0.0)
+    reg.register(make_info())
+
+    def fake_http(method, url, **kwargs):
+        if method == "POST":
+            return {"status_code": 200, "json": {"task_id": "task-r", "status": "accepted"}}
+        return {"status_code": 200, "json": {
+            "task_id": "task-r", "status": "done",
+            "output": "ok", "artifacts": [], "error": None}}
+
+    d = RemoteDispatcher(task_store=store, registry=reg, http_call=fake_http, now_fn=lambda: "t0")
+    first = d.dispatch(role="executor", prompt="original")
+    second = d.redispatch(first.task_id)
+    assert second.status == "done"
+    assert second.task_id != first.task_id
+    assert store.get(second.task_id).prompt == "original"
+

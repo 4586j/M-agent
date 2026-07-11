@@ -4,7 +4,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
-VALID_STATUSES = ("pending", "running", "done", "failed", "lost")
+VALID_STATUSES = ("pending", "running", "done", "failed", "lost", "cancelled")
 
 
 @dataclass
@@ -58,6 +58,12 @@ class TaskStore:
 
     def list_by_worker(self, worker_id: str) -> list[TaskRecord]:
         return [r for r in self._all() if r.worker_id == worker_id]
+
+    def list_all(self) -> list[TaskRecord]:
+        return self._all()
+
+    def list_by_status(self, status: str) -> list[TaskRecord]:
+        return [r for r in self._all() if r.status == status]
 
     def _all(self) -> list[TaskRecord]:
         out = []

@@ -50,3 +50,38 @@ def test_artifact_endpoint_returns_file(tmp_path):
     r = client.get("/artifact/task-1?path=task-1/report.md")
     assert r.status_code == 200
     assert "报告内容" in r.text
+
+
+def test_register_to_brain_success():
+    from worker_api import register_to_brain
+    from worker_config import WorkerConfig
+    cfg = WorkerConfig(brain_url="http://brain", worker_id="w1", role="executor",
+                       listen_host="127.0.0.1", listen_port=8001)
+
+    class FakeResp:
+        status_code = 200
+
+    calls = []
+
+    def fake_post(url, json=None, timeout=None):
+        calls.append((url, json))
+        return FakeResp()
+
+    assert register_to_brain(cfg, http_post=fake_post) is True
+    assert calls[0][0] == "http://brain/register"
+    assert calls[0][1]["worker_id"] == "w1"
+    assert calls[0][1]["port"] == 8001
+
+
+def test_register_to_brain_retries_then_fails(monkeypatch):
+    import worker_api
+    from worker_api import register_to_brain
+    from worker_config import WorkerConfig
+    monkeypatch.setattr(worker_api.time, "sleep", lambda *a, **k: None)
+    cfg = WorkerConfig(brain_url="http://brain", worker_id="w1")
+
+    def fake_post(url, json=None, timeout=None):
+        raise ConnectionError("no brain")
+
+    assert register_to_brain(cfg, http_post=fake_post) is False
+
