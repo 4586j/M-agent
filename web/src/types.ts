@@ -25,12 +25,20 @@ export interface TaskRecord {
   error: unknown
 }
 
+export interface SecurityVerdict {
+  verdict: 'pass' | 'block'
+  reason: string
+  matched_rules: string[]
+  suggestion: string
+}
+
 export interface DispatchResult {
   task_id: string
   status: string
   output: unknown
   artifacts: string[]
   error: unknown
+  verdict?: SecurityVerdict  // status=='blocked' 时存在
 }
 
 export interface Stats {
@@ -57,4 +65,5 @@ export interface DispatchBody {
   role: string
   context_memory: string | null
   model: string | null
+  force?: boolean
 }

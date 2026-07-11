@@ -11,6 +11,7 @@ from task_store import TaskStore
 from worker_registry import WorkerRegistry, WorkerInfo
 from dispatcher import Dispatcher, RemoteDispatcher, DispatchResult
 from config import Config
+from security_guard import check as security_check
 
 
 class RegisterReq(BaseModel):
@@ -31,6 +32,7 @@ class DispatchReq(BaseModel):
     role: str = "executor"
     context_memory: str | None = None
     model: str | None = None
+    force: bool = False  # 跳过 security-guard 检验，用于放行 block 指令
 
 
 class RedispatchReq(BaseModel):
@@ -128,6 +130,12 @@ def create_brain_app(registry: WorkerRegistry, task_store: TaskStore, cfg: Confi
     def dispatch(req: DispatchReq):
         if dispatcher is None:
             return {"status": "failed", "error": "dispatcher 未配置（local 模式不提供 /dispatch）"}
+        # security-guard 指令检验；force=true 跳过（用于放行 block 指令）
+        if not req.force:
+            v = security_check(req.prompt)
+            if v["verdict"] == "block":
+                return {"status": "blocked", "verdict": v, "task_id": None,
+                        "output": None, "artifacts": [], "error": None}
         try:
             res = dispatcher.dispatch(role=req.role, prompt=req.prompt,
                                       context_memory=req.context_memory, model=req.model)
