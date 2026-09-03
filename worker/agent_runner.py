@@ -42,12 +42,18 @@ class FakeAgentRunner(AgentRunner):
         return TaskResult(req.task_id, "done", output=out, artifacts=[], error=None)
 
 
-class SdkAgentRunner(AgentRunner):
-    """真实执行：用 claude-agent-sdk 加载 executor.md 起会话。
+def _run_async(coro):
+    """同步执行协程；若当前线程已在事件循环内（如 async 端点直接调用），
+    借独立线程起新 loop，避免 asyncio.run 抛 RuntimeError。"""
+    import asyncio
+    import concurrent.futures
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+        return ex.submit(asyncio.run, coro).result()
 
-    V2 骨架：真实 SDK 接入需根据具体 SDK 版本实现 query() 调用与流式产出收集，
-    在集成环境验证。单测不覆盖此实现。
-    """
 
 class SdkAgentRunner(AgentRunner):
     """真实执行：用 claude-agent-sdk 起 executor 会话。
@@ -81,7 +87,6 @@ class SdkAgentRunner(AgentRunner):
         }
 
     def run(self, req: TaskRequest) -> TaskResult:
-        import asyncio
         import claude_agent_sdk as sdk
 
         meta = self._parse_executor_def()
@@ -110,7 +115,7 @@ class SdkAgentRunner(AgentRunner):
             return "\n".join(outputs)
 
         try:
-            output = asyncio.run(_run())
+            output = _run_async(_run())
         except Exception as e:
             return TaskResult(req.task_id, "failed", error=f"sdk error: {e}")
 

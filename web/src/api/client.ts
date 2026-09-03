@@ -50,7 +50,7 @@ export const api = {
     request<DispatchResult>('/dispatch', { method: 'POST', body: JSON.stringify(body) }),
 
   artifact: (workerId: string, taskId: string, path: string) =>
-    request<{ content: string }>(
+    request<{ content: string; encoding?: string; size?: number }>(
       `/proxy/artifact?worker_id=${encodeURIComponent(workerId)}&task_id=${encodeURIComponent(taskId)}&path=${encodeURIComponent(path)}`,
     ),
 }

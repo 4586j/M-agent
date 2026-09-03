@@ -15,7 +15,9 @@ export default function TaskDetail({
 }) {
   const [busy, setBusy] = useState(false)
   const [msg, setMsg] = useState<string | null>(null)
-  const [artifact, setArtifact] = useState<{ path: string; content: string } | null>(null)
+  const [artifact, setArtifact] = useState<{
+    path: string; content: string; encoding?: string; size?: number
+  } | null>(null)
 
   const act = async (fn: () => Promise<unknown>, label: string) => {
     setBusy(true)
@@ -35,7 +37,7 @@ export default function TaskDetail({
     if (!task.worker_id) return
     try {
       const r = await api.artifact(task.worker_id, task.task_id, path)
-      setArtifact({ path, content: r.content })
+      setArtifact({ path, content: r.content, encoding: r.encoding, size: r.size })
     } catch (e) {
       setArtifact({ path, content: `加载失败: ${e instanceof Error ? e.message : String(e)}` })
     }
@@ -85,9 +87,7 @@ export default function TaskDetail({
                 </button>
               ))}
             </div>
-            {artifact && (
-              <pre className="bg-slate-900 text-slate-100 rounded p-2 text-xs whitespace-pre-wrap max-h-60 overflow-auto">{artifact.content}</pre>
-            )}
+            {artifact && <ArtifactView artifact={artifact} />}
           </Section>
         )}
         {task.verdict?.verdict === 'block' && (
@@ -132,5 +132,34 @@ function Section({ title, children }: { title: string; children: ReactNode }) {
       <div className="text-xs text-slate-500 mb-1">{title}</div>
       {children}
     </div>
+  )
+}
+
+const IMAGE_MIME: Record<string, string> = {
+  png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg',
+  gif: 'image/gif', webp: 'image/webp', bmp: 'image/bmp',
+}
+
+function ArtifactView({ artifact }: { artifact: { path: string; content: string; encoding?: string; size?: number } }) {
+  if (artifact.encoding === 'base64') {
+    const ext = artifact.path.split('.').pop()?.toLowerCase() ?? ''
+    const mime = IMAGE_MIME[ext]
+    if (mime) {
+      return (
+        <img
+          src={`data:${mime};base64,${artifact.content}`}
+          alt={artifact.path}
+          className="max-h-60 rounded border border-slate-200"
+        />
+      )
+    }
+    return (
+      <div className="text-xs text-slate-500 bg-slate-50 rounded p-2">
+        二进制文件（{artifact.size ?? '?'} 字节），不支持文本预览
+      </div>
+    )
+  }
+  return (
+    <pre className="bg-slate-900 text-slate-100 rounded p-2 text-xs whitespace-pre-wrap max-h-60 overflow-auto">{artifact.content}</pre>
   )
 }

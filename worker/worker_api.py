@@ -13,6 +13,7 @@ from worker_config import WorkerConfig
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "workspace" / "agent" / "orchestrator" / "runtime"))
 from auth import add_auth_middleware
+from safe_id import validate_id
 
 
 class TaskBody(BaseModel):
@@ -44,9 +45,8 @@ def register_to_brain(cfg: WorkerConfig, http_post=None) -> bool:
 
 def start_auto_heartbeat(cfg: WorkerConfig, interval: int | None = None,
                          stop_event: threading.Event | None = None,
-                         http_post=None) -> threading.Thread:
+                         http_post=None, load_fn=None) -> threading.Thread:
     """后台线程：先注册，再按 interval 定期发心跳。daemon，随主进程退出。"""
-    http_post = http_post  # 真实默认在循环内懒加载，便于测试注入
     interval = interval or cfg.heartbeat_interval
     stop_event = stop_event or threading.Event()
 
@@ -58,7 +58,8 @@ def start_auto_heartbeat(cfg: WorkerConfig, interval: int | None = None,
         headers = {"X-API-Key": cfg.api_key} if cfg.api_key else {}
         while not stop_event.is_set():
             try:
-                post(hb_url, json={"worker_id": cfg.worker_id, "load": 0},
+                post(hb_url, json={"worker_id": cfg.worker_id,
+                                   "load": load_fn() if load_fn else 0},
                      timeout=5, headers=headers)
             except Exception:
                 pass
@@ -91,6 +92,7 @@ def create_worker_app(runner: AgentRunner, cfg: WorkerConfig) -> FastAPI:
     state: dict[str, TaskResult] = {}
     cancelled: set[str] = set()
     lock = threading.Lock()
+    state_max = int(os.environ.get("ORCH_WORKER_STATE_MAX", "1000"))
 
     # CORS：开发期前端直连 worker 查任务/产物
     origins = __import__("os").environ.get("ORCH_CORS_ORIGINS", "http://localhost:5173")
@@ -104,29 +106,46 @@ def create_worker_app(runner: AgentRunner, cfg: WorkerConfig) -> FastAPI:
 
     add_auth_middleware(app, cfg.api_key)
 
+    # 参数校验（validate_id 等）抛的 ValueError 统一转 400
+    from fastapi.responses import JSONResponse
+
+    @app.exception_handler(ValueError)
+    def _on_value_error(request, exc):
+        return JSONResponse(status_code=400, content={"detail": str(exc)})
+
+    def _record(task_id: str, res: TaskResult):
+        with lock:
+            state[task_id] = res
+            # 已终态结果封顶，防长期运行内存增长；running 不清理
+            finished = [tid for tid, r in state.items() if r.status != "running"]
+            excess = len(finished) - state_max
+            for tid in finished[:excess]:
+                del state[tid]
+                cancelled.discard(tid)
+
     def _execute(body: TaskBody):
         req = TaskRequest(body.task_id, body.prompt, body.context_memory, body.model)
         res = runner.run(req)
-        with lock:
-            state[body.task_id] = res
+        _record(body.task_id, res)
 
     @app.post("/task")
     def post_task(body: TaskBody):
         # 异步执行：起后台线程跑 runner，立即返回 accepted；
         # state 先占位 running 供 brain 轮询，完成或异常时覆盖。
-        with lock:
-            state[body.task_id] = TaskResult(body.task_id, "running")
+        _record(body.task_id, TaskResult(body.task_id, "running"))
 
         def _bg():
             try:
                 _execute(body)
             except Exception as e:
-                with lock:
-                    state[body.task_id] = TaskResult(
-                        body.task_id, "failed", error=f"execute error: {e}")
-            if body.callback_url and body.task_id not in cancelled:
-                _send_callback(body.callback_url, state.get(body.task_id),
-                               api_key=cfg.api_key)
+                _record(body.task_id, TaskResult(
+                    body.task_id, "failed", error=f"execute error: {e}"))
+            with lock:
+                should_callback = body.task_id not in cancelled
+                res = state.get(body.task_id)
+                cancelled.discard(body.task_id)
+            if body.callback_url and should_callback:
+                _send_callback(body.callback_url, res, api_key=cfg.api_key)
 
         threading.Thread(target=_bg, daemon=True, name=f"task-{body.task_id}").start()
         return {"task_id": body.task_id, "status": "accepted"}
@@ -154,17 +173,34 @@ def create_worker_app(runner: AgentRunner, cfg: WorkerConfig) -> FastAPI:
 
     @app.get("/artifact/{task_id}")
     def get_artifact(task_id: str, path: str):
+        validate_id(task_id, "task_id")
         # 产物落在 work_dir/{task_id}/ 下，path 相对该子目录
         base = Path(cfg.work_dir).resolve()
-        full = (base / task_id / path).resolve()
-        # 防路径穿越：必须在 work_dir 内
+        task_base = base / task_id
+        full = (task_base / path).resolve()
+        # 防路径穿越：必须仍在该任务自己的子目录内（拒绝 ../ 跨任务读取）
         try:
-            full.relative_to(base)
+            full.relative_to(task_base)
         except ValueError:
             raise HTTPException(status_code=400, detail="invalid path")
-        if not full.exists():
+        if not full.is_file():
             raise HTTPException(status_code=404, detail="artifact not found")
-        return {"content": full.read_text(encoding="utf-8")}
+        size = full.stat().st_size
+        if size > cfg.artifact_max_bytes:
+            raise HTTPException(status_code=413, detail=f"artifact too large: {size} bytes")
+        data = full.read_bytes()
+        try:
+            return {"content": data.decode("utf-8"), "encoding": "utf-8", "size": size}
+        except UnicodeDecodeError:
+            import base64
+            return {"content": base64.b64encode(data).decode("ascii"),
+                    "encoding": "base64", "size": size}
+
+    def _running_count() -> int:
+        with lock:
+            return sum(1 for r in state.values() if r.status == "running")
+
+    app.state.get_load = _running_count
 
     return app
 
@@ -182,9 +218,10 @@ def _build_app():
                                 permission_mode=cfg.permission_mode)
     else:
         runner = FakeAgentRunner(work_dir=cfg.work_dir)
+    app = create_worker_app(runner, cfg)
     if cfg.auto_register:
-        start_auto_heartbeat(cfg)
-    return create_worker_app(runner, cfg)
+        start_auto_heartbeat(cfg, load_fn=app.state.get_load)
+    return app
 
 
 if __name__ == "__main__":

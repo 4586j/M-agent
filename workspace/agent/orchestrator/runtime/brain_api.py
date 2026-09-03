@@ -382,6 +382,10 @@ def create_brain_app(registry: WorkerRegistry, task_store: TaskStore, cfg: Confi
 
     @app.get("/proxy/artifact")
     def proxy_artifact(worker_id: str, task_id: str, path: str):
+        # 防御性校验：worker 端还会再做一次，这里先快速拒绝明显恶意参数
+        validate_id(task_id, "task_id")
+        if ".." in path or path.startswith(("/", "\\")) or "\\" in path:
+            raise HTTPException(status_code=400, detail="invalid path")
         w = next((x for x in registry.all_workers() if x.worker_id == worker_id), None)
         if w is None:
             raise HTTPException(status_code=404, detail="worker not found")

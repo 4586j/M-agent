@@ -29,6 +29,7 @@ class WorkerConfig:
     permission_mode: str = "bypassPermissions"
     auto_register: bool = True
     api_key: str = ""
+    artifact_max_bytes: int = 20 * 1024 * 1024
 
 
 def load_worker_config() -> WorkerConfig:
@@ -44,4 +45,6 @@ def load_worker_config() -> WorkerConfig:
         permission_mode=os.environ.get("ORCH_PERMISSION_MODE", "bypassPermissions"),
         auto_register=os.environ.get("ORCH_AUTO_REGISTER", "1") not in ("0", "false", "False"),
         api_key=os.environ.get("ORCH_API_KEY", ""),
+        artifact_max_bytes=int(os.environ.get("ORCH_ARTIFACT_MAX_BYTES",
+                                              str(20 * 1024 * 1024))),
     )

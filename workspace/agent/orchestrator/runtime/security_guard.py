@@ -92,6 +92,19 @@ def check_with_llm(content: str, use_llm: bool = False) -> dict:
     return rule_v
 
 
+def _run_async(coro):
+    """同步执行协程；若已在事件循环内（如 /dispatch/async 等 async 端点调用），
+    借独立线程起新 loop，避免 asyncio.run 抛 RuntimeError 导致 LLM 增强被静默跳过。"""
+    import asyncio
+    import concurrent.futures
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+        return ex.submit(asyncio.run, coro).result()
+
+
 def _llm_judge(content: str) -> dict | None:
     """用 claude-agent-sdk 起 haiku 只读会话做规则之外的安全判断。
 
@@ -100,7 +113,6 @@ def _llm_judge(content: str) -> dict | None:
     if not content:
         return None
     try:
-        import asyncio
         import claude_agent_sdk as sdk
     except Exception:
         return None
@@ -121,7 +133,7 @@ def _llm_judge(content: str) -> dict | None:
         return "\n".join(out)
 
     try:
-        text = asyncio.run(_run())
+        text = _run_async(_run())
     except Exception:
         return None
     return _parse_verdict_json(text)

@@ -4,7 +4,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from fastapi.testclient import TestClient
 from brain_api import create_brain_app
-from worker_registry import WorkerRegistry
+from worker_registry import WorkerRegistry, WorkerInfo
 from task_store import TaskStore, TaskRecord
 from config import Config
 
@@ -86,6 +86,18 @@ def test_heartbeat(tmp_path):
     r = client.post("/heartbeat", json={"worker_id": "worker-A", "load": 1})
     assert r.status_code == 200
     assert r.json()["status"] == "ok"
+
+
+def test_proxy_artifact_rejects_traversal(tmp_path):
+    client, reg, _ = make_app(tmp_path)
+    reg.register(WorkerInfo(worker_id="A", role="executor", host="127.0.0.1",
+                            port=8000, capabilities={}, last_heartbeat=0.0))
+    r = client.get("/proxy/artifact?worker_id=A&task_id=t1&path=../other/x")
+    assert r.status_code == 400
+    r = client.get("/proxy/artifact?worker_id=A&task_id=..%2Fevil&path=x")
+    assert r.status_code == 400
+    r = client.get("/proxy/artifact?worker_id=A&task_id=t1&path=%2Fetc%2Fpasswd")
+    assert r.status_code == 400
 
 
 def test_list_tasks_by_worker(tmp_path):
