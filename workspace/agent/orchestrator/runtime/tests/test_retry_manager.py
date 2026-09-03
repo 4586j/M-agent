@@ -1,0 +1,215 @@
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from retry_manager import RetryManager
+from task_store import TaskStore, TaskRecord
+from worker_registry import WorkerRegistry, WorkerInfo
+from dispatcher import DispatchResult
+
+
+def make_info(wid="worker-A"):
+    return WorkerInfo(
+        worker_id=wid, role="executor", host="127.0.0.1", port=8000,
+        capabilities={}, last_heartbeat=0.0,
+    )
+
+
+def make_record(task_id="task-1", status="pending", worker_id="worker-A",
+                retry_count=0, max_retries=0, last_retry_at=""):
+    return TaskRecord(
+        task_id=task_id, role="executor", prompt="do x",
+        worker_id=worker_id, status=status,
+        created_at="100", updated_at="100",
+        output=None, artifacts=[], error=None,
+        retry_count=retry_count, max_retries=max_retries,
+        last_retry_at=last_retry_at,
+    )
+
+
+class FakeDispatcher:
+    def __init__(self, result_status="done"):
+        self.calls = []
+        self.result_status = result_status
+
+    def dispatch(self, role, prompt, context_memory=None, model=None):
+        self.calls.append({"role": role, "prompt": prompt})
+        return DispatchResult(task_id="task-new", status=self.result_status)
+
+    def redispatch(self, task_id, model=None):
+        return self.dispatch(role="executor", prompt="redispatched")
+
+
+def test_sweep_marks_dead_worker_tasks_as_lost(tmp_path):
+    store = TaskStore(str(tmp_path))
+    reg = WorkerRegistry(heartbeat_timeout=10, now_fn=lambda: 100.0)
+    reg.register(make_info())
+    store.write(make_record("task-1", status="running"))
+
+    # Worker dies (time advances past timeout)
+    reg._now = lambda: 200.0
+    fake_disp = FakeDispatcher()
+    mgr = RetryManager(store, reg, fake_disp, now_fn=lambda: 200.0, ts_fn=lambda: "200")
+
+    result = mgr.sweep_once()
+    assert result["marked_lost"] == 1
+    assert store.get("task-1").status == "lost"
+
+
+def test_sweep_retries_eligible_lost_tasks(tmp_path):
+    store = TaskStore(str(tmp_path))
+    reg = WorkerRegistry(heartbeat_timeout=45, now_fn=lambda: 0.0)
+    reg.register(make_info())
+    store.write(make_record("task-1", status="lost", retry_count=0, max_retries=3))
+
+    fake_disp = FakeDispatcher()
+    mgr = RetryManager(store, reg, fake_disp, now_fn=lambda: 100.0, ts_fn=lambda: "100")
+
+    result = mgr.sweep_once()
+    assert result["retried"] == 1
+    assert len(fake_disp.calls) == 1
+    assert fake_disp.calls[0]["role"] == "executor"
+
+
+def test_sweep_retries_eligible_failed_tasks(tmp_path):
+    store = TaskStore(str(tmp_path))
+    reg = WorkerRegistry(heartbeat_timeout=45, now_fn=lambda: 0.0)
+    reg.register(make_info())
+    store.write(make_record("task-1", status="failed", retry_count=1, max_retries=3))
+
+    fake_disp = FakeDispatcher()
+    mgr = RetryManager(store, reg, fake_disp, now_fn=lambda: 100.0, ts_fn=lambda: "100")
+
+    result = mgr.sweep_once()
+    assert result["retried"] == 1
+    rec = store.get("task-1")
+    assert rec.retry_count == 2
+    assert rec.last_retry_at == "100"
+
+
+def test_sweep_skips_tasks_at_max_retries(tmp_path):
+    store = TaskStore(str(tmp_path))
+    reg = WorkerRegistry(heartbeat_timeout=45, now_fn=lambda: 0.0)
+    reg.register(make_info())
+    store.write(make_record("task-1", status="lost", retry_count=3, max_retries=3))
+
+    fake_disp = FakeDispatcher()
+    mgr = RetryManager(store, reg, fake_disp, now_fn=lambda: 100.0, ts_fn=lambda: "100")
+
+    result = mgr.sweep_once()
+    assert result["retried"] == 0
+    assert len(fake_disp.calls) == 0
+
+
+def test_sweep_respects_backoff(tmp_path):
+    store = TaskStore(str(tmp_path))
+    reg = WorkerRegistry(heartbeat_timeout=45, now_fn=lambda: 0.0)
+    reg.register(make_info())
+    # retry_count=1, base_delay=10 → need 10 * 2^1 = 20s elapsed
+    store.write(make_record("task-1", status="lost", retry_count=1, max_retries=3,
+                            last_retry_at="90"))
+
+    fake_disp = FakeDispatcher()
+    # Only 5s elapsed (now=95), need 20s
+    mgr = RetryManager(store, reg, fake_disp, retry_base_delay=10.0,
+                       now_fn=lambda: 95.0, ts_fn=lambda: "95")
+
+    result = mgr.sweep_once()
+    assert result["retried"] == 0
+
+    # Now advance time past backoff
+    mgr._now = lambda: 115.0
+    result = mgr.sweep_once()
+    assert result["retried"] == 1
+
+
+def test_sweep_skips_zero_max_retries(tmp_path):
+    """Tasks with max_retries=0 (default) should never be retried."""
+    store = TaskStore(str(tmp_path))
+    reg = WorkerRegistry(heartbeat_timeout=45, now_fn=lambda: 0.0)
+    reg.register(make_info())
+    store.write(make_record("task-1", status="lost", retry_count=0, max_retries=0))
+
+    fake_disp = FakeDispatcher()
+    mgr = RetryManager(store, reg, fake_disp, now_fn=lambda: 100.0, ts_fn=lambda: "100")
+
+    result = mgr.sweep_once()
+    assert result["retried"] == 0
+
+
+def test_check_worker_healing_redispatches_lost_tasks(tmp_path):
+    store = TaskStore(str(tmp_path))
+    reg = WorkerRegistry(heartbeat_timeout=45, now_fn=lambda: 0.0)
+    reg.register(make_info("worker-A"))
+    store.write(make_record("task-1", status="lost", worker_id="worker-A"))
+    store.write(make_record("task-2", status="done", worker_id="worker-A"))
+
+    fake_disp = FakeDispatcher()
+    mgr = RetryManager(store, reg, fake_disp, now_fn=lambda: 100.0, ts_fn=lambda: "100")
+
+    healed = mgr.check_worker_healing("worker-A")
+    assert healed == 1
+    assert len(fake_disp.calls) == 1
+    rec = store.get("task-1")
+    assert rec.status == "running"
+    assert rec.retry_count == 1
+
+
+def test_check_worker_healing_unknown_worker(tmp_path):
+    store = TaskStore(str(tmp_path))
+    reg = WorkerRegistry(heartbeat_timeout=45, now_fn=lambda: 0.0)
+    fake_disp = FakeDispatcher()
+    mgr = RetryManager(store, reg, fake_disp)
+
+    healed = mgr.check_worker_healing("unknown-worker")
+    assert healed == 0
+
+
+def test_sweep_no_dead_workers_no_retryable(tmp_path):
+    store = TaskStore(str(tmp_path))
+    reg = WorkerRegistry(heartbeat_timeout=45, now_fn=lambda: 0.0)
+    reg.register(make_info())
+    store.write(make_record("task-1", status="done"))
+
+    fake_disp = FakeDispatcher()
+    mgr = RetryManager(store, reg, fake_disp, now_fn=lambda: 10.0, ts_fn=lambda: "10")
+
+    result = mgr.sweep_once()
+    assert result["marked_lost"] == 0
+    assert result["retried"] == 0
+
+
+def test_sweep_multiple_dead_workers_and_tasks(tmp_path):
+    store = TaskStore(str(tmp_path))
+    reg = WorkerRegistry(heartbeat_timeout=10, now_fn=lambda: 100.0)
+    reg.register(make_info("worker-A"))
+    reg.register(make_info("worker-B"))
+    store.write(make_record("task-1", status="running", worker_id="worker-A"))
+    store.write(make_record("task-2", status="running", worker_id="worker-B"))
+    store.write(make_record("task-3", status="running", worker_id="worker-B"))
+
+    # Both workers die
+    reg._now = lambda: 200.0
+    fake_disp = FakeDispatcher()
+    mgr = RetryManager(store, reg, fake_disp, now_fn=lambda: 200.0, ts_fn=lambda: "200")
+
+    result = mgr.sweep_once()
+    assert result["marked_lost"] == 3
+    assert store.get("task-1").status == "lost"
+    assert store.get("task-2").status == "lost"
+    assert store.get("task-3").status == "lost"
+
+
+def test_start_and_stop(tmp_path):
+    store = TaskStore(str(tmp_path))
+    reg = WorkerRegistry(heartbeat_timeout=45, now_fn=lambda: 0.0)
+    fake_disp = FakeDispatcher()
+    mgr = RetryManager(store, reg, fake_disp, sweeper_interval=1)
+
+    mgr.start()
+    assert mgr._thread is not None
+    assert mgr._thread.daemon is True
+
+    mgr.stop()
+    mgr._thread.join(timeout=3)
+    assert not mgr._thread.is_alive()

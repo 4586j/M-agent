@@ -15,6 +15,7 @@ class TaskBody(BaseModel):
     prompt: str
     context_memory: str = ""
     model: str | None = None
+    callback_url: str | None = None
 
 
 def register_to_brain(cfg: WorkerConfig, http_post=None) -> bool:
@@ -60,6 +61,21 @@ def start_auto_heartbeat(cfg: WorkerConfig, interval: int | None = None,
     return t
 
 
+def _send_callback(callback_url: str, result: "TaskResult | None") -> None:
+    """任务完成后主动回调 Brain，通知结果。失败静默忽略。"""
+    if result is None:
+        return
+    import requests
+    payload = {
+        "status": result.status, "output": result.output,
+        "artifacts": result.artifacts, "error": result.error,
+    }
+    try:
+        requests.post(callback_url, json=payload, timeout=10)
+    except Exception:
+        pass
+
+
 def create_worker_app(runner: AgentRunner, cfg: WorkerConfig) -> FastAPI:
     app = FastAPI()
     state: dict[str, TaskResult] = {}
@@ -95,6 +111,8 @@ def create_worker_app(runner: AgentRunner, cfg: WorkerConfig) -> FastAPI:
                 with lock:
                     state[body.task_id] = TaskResult(
                         body.task_id, "failed", error=f"execute error: {e}")
+            if body.callback_url:
+                _send_callback(body.callback_url, state.get(body.task_id))
 
         threading.Thread(target=_bg, daemon=True, name=f"task-{body.task_id}").start()
         return {"task_id": body.task_id, "status": "accepted"}

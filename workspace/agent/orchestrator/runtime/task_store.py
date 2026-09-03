@@ -20,6 +20,9 @@ class TaskRecord:
     artifacts: list = field(default_factory=list)
     error: Any = None
     verdict: dict | None = None  # security-guard 产物裁决（done 时若命中规则则存在）
+    retry_count: int = 0
+    max_retries: int = 0
+    last_retry_at: str = ""
 
 
 class TaskStore:
@@ -65,6 +68,13 @@ class TaskStore:
 
     def list_by_status(self, status: str) -> list[TaskRecord]:
         return [r for r in self._all() if r.status == status]
+
+    def list_retryable(self) -> list[TaskRecord]:
+        """返回 lost 或 failed 且 retry_count < max_retries 的任务。"""
+        return [r for r in self._all()
+                if r.status in ("lost", "failed")
+                and r.max_retries > 0
+                and r.retry_count < r.max_retries]
 
     def _all(self) -> list[TaskRecord]:
         out = []

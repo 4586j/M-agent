@@ -8,6 +8,7 @@ from typing import Any, Callable
 
 from task_store import TaskStore, TaskRecord
 from worker_registry import WorkerRegistry
+from experience_store import ExperienceStore
 
 _POLL_MAX = 1000  # 轮询上限，防死循环
 
@@ -81,13 +82,17 @@ class RemoteDispatcher(Dispatcher):
     def __init__(self, task_store: TaskStore, registry: WorkerRegistry,
                  http_call: Callable[..., dict], now_fn: Callable[[], str] | None = None,
                  select_strategy: str = "round_robin",
-                 product_check: Callable[[str], dict] | None = None):
+                 product_check: Callable[[str], dict] | None = None,
+                 experience_store: ExperienceStore | None = None,
+                 max_retries: int = 0):
         self.task_store = task_store
         self.registry = registry
         self.http_call = http_call  # (method, url, **kwargs) -> {"status_code", "json"}
         self._now = now_fn or (lambda: str(int(time.time())))
         self.select_strategy = select_strategy
         self.product_check = product_check
+        self.experience_store = experience_store
+        self.max_retries = max_retries
 
     def dispatch(self, role: str, prompt: str,
                  context_memory: str | None = None, model: str | None = None) -> DispatchResult:
@@ -100,10 +105,12 @@ class RemoteDispatcher(Dispatcher):
             task_id=task_id, role=role, prompt=prompt, worker_id=worker.worker_id,
             status="pending", created_at=ts, updated_at=ts,
             output=None, artifacts=[], error=None,
+            max_retries=self.max_retries,
         ))
         base = f"http://{worker.host}:{worker.port}"
+        enriched_ctx = self._enrich_with_experience(prompt, role, context_memory)
         body = {"task_id": task_id, "prompt": prompt,
-                "context_memory": context_memory or ""}
+                "context_memory": enriched_ctx or ""}
         if model:
             body["model"] = model
         resp = self.http_call("POST", f"{base}/task", json=body)
@@ -126,6 +133,12 @@ class RemoteDispatcher(Dispatcher):
                     task_id, status=st, output=out,
                     artifacts=arts, error=data.get("error"), verdict=verdict,
                 )
+                if self.experience_store:
+                    self.experience_store.record_from_task(
+                        task_id=task_id, role=role, prompt=prompt,
+                        output=out, success=(st == "done"),
+                        verdict=verdict, artifacts=arts, created_at=ts,
+                    )
                 return DispatchResult(
                     task_id, st, out, arts, data.get("error"), verdict,
                 )
@@ -147,6 +160,24 @@ class RemoteDispatcher(Dispatcher):
             except Exception:
                 continue
         return self.product_check(combined)
+
+    def _enrich_with_experience(self, prompt: str, role: str,
+                                context_memory: str | None) -> str:
+        """检索相似历史经验，拼接到 context_memory 供 Worker 参考。"""
+        if not self.experience_store:
+            return context_memory or ""
+        similar = self.experience_store.search(prompt, role=role, successful_only=True, limit=3)
+        if not similar:
+            return context_memory or ""
+        exp_lines = ["[历史经验参考]"]
+        for i, exp in enumerate(similar, 1):
+            exp_lines.append(f"{i}. 任务: {exp.prompt[:100]}")
+            if exp.output_summary:
+                exp_lines.append(f"   产出: {exp.output_summary[:200]}")
+        exp_block = "\n".join(exp_lines)
+        if context_memory:
+            return f"{context_memory}\n\n{exp_block}"
+        return exp_block
 
     def redispatch(self, task_id: str, model: str | None = None) -> DispatchResult:
         rec = self.task_store.get(task_id)

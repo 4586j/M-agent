@@ -53,6 +53,15 @@ class WorkerRegistry:
         """全部在册 worker（含已超时未剔除的），供产物代理等查询。"""
         return list(self._workers.values())
 
+    def dead_workers(self) -> list[WorkerInfo]:
+        """返回心跳超时的 worker（在册但不在活跃列表中）。"""
+        alive_ids = {w.worker_id for w in self._alive()}
+        return [w for w in self._workers.values() if w.worker_id not in alive_ids]
+
+    def get_worker(self, worker_id: str) -> WorkerInfo | None:
+        """按 ID 查询 worker（不论是否存活）。"""
+        return self._workers.get(worker_id)
+
     def select_worker(self, role: str = "executor",
                       strategy: str = "round_robin") -> WorkerInfo | None:
         """选择 worker。strategy: round_robin（默认，兼容）| least_load（按 load 升序）。"""
