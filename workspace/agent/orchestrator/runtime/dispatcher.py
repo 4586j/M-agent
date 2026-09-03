@@ -3,23 +3,14 @@ import time
 import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any, Callable
 
+from dispatch_common import is_text_artifact, enrich_experience
 from task_store import TaskStore, TaskRecord
 from worker_registry import WorkerRegistry
 from experience_store import ExperienceStore
 
 _POLL_MAX = 1000  # 轮询上限，防死循环
-
-# 产物检验时拉取的文本类扩展名（二进制跳过，避免拉取巨大/无意义内容）
-_TEXT_ARTIFACT_EXT = {".md", ".txt", ".py", ".json", ".yaml", ".yml", ".sh",
-                      ".ts", ".tsx", ".js", ".jsx", ".csv", ".log", ".ini",
-                      ".toml", ".env", ".xml", ".html", ".css"}
-
-
-def _is_text_artifact(path: str) -> bool:
-    return Path(path).suffix.lower() in _TEXT_ARTIFACT_EXT
 
 
 @dataclass
@@ -151,7 +142,7 @@ class RemoteDispatcher(Dispatcher):
         """合并 output + 文本 artifacts 内容过产物检验；二进制产物跳过。"""
         combined = output or ""
         for art in artifacts or []:
-            if not _is_text_artifact(art):
+            if not is_text_artifact(art):
                 continue
             try:
                 ar = self.http_call("GET", f"{base}/artifact/{task_id}", params={"path": art})
@@ -163,21 +154,7 @@ class RemoteDispatcher(Dispatcher):
 
     def _enrich_with_experience(self, prompt: str, role: str,
                                 context_memory: str | None) -> str:
-        """检索相似历史经验，拼接到 context_memory 供 Worker 参考。"""
-        if not self.experience_store:
-            return context_memory or ""
-        similar = self.experience_store.search(prompt, role=role, successful_only=True, limit=3)
-        if not similar:
-            return context_memory or ""
-        exp_lines = ["[历史经验参考]"]
-        for i, exp in enumerate(similar, 1):
-            exp_lines.append(f"{i}. 任务: {exp.prompt[:100]}")
-            if exp.output_summary:
-                exp_lines.append(f"   产出: {exp.output_summary[:200]}")
-        exp_block = "\n".join(exp_lines)
-        if context_memory:
-            return f"{context_memory}\n\n{exp_block}"
-        return exp_block
+        return enrich_experience(self.experience_store, prompt, role, context_memory)
 
     def redispatch(self, task_id: str, model: str | None = None) -> DispatchResult:
         rec = self.task_store.get(task_id)

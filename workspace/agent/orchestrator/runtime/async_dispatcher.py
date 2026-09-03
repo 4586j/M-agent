@@ -8,32 +8,11 @@ from typing import Any, Awaitable, Callable
 from task_store import TaskStore, TaskRecord
 from worker_registry import WorkerRegistry
 from experience_store import ExperienceStore
-from dispatcher import _is_text_artifact
+from dispatch_common import is_text_artifact, enrich_experience
 
 log = logging.getLogger(__name__)
 
 AsyncHttpCall = Callable[..., Awaitable[dict]]
-
-
-def _enrich_experience(experience_store: ExperienceStore | None,
-                       prompt: str, role: str,
-                       context_memory: str | None) -> str:
-    """检索相似历史经验，拼接到 context_memory 供 Worker 参考。"""
-    if not experience_store:
-        return context_memory or ""
-    similar = experience_store.search(prompt, role=role,
-                                      successful_only=True, limit=3)
-    if not similar:
-        return context_memory or ""
-    exp_lines = ["[历史经验参考]"]
-    for i, exp in enumerate(similar, 1):
-        exp_lines.append(f"{i}. 任务: {exp.prompt[:100]}")
-        if exp.output_summary:
-            exp_lines.append(f"   产出: {exp.output_summary[:200]}")
-    exp_block = "\n".join(exp_lines)
-    if context_memory:
-        return f"{context_memory}\n\n{exp_block}"
-    return exp_block
 
 
 class AsyncRemoteDispatcher:
@@ -88,7 +67,7 @@ class AsyncRemoteDispatcher:
             max_retries=self.max_retries,
         ))
         base = f"http://{worker.host}:{worker.port}"
-        enriched = _enrich_experience(self.experience_store, prompt, role, context_memory)
+        enriched = enrich_experience(self.experience_store, prompt, role, context_memory)
         body: dict[str, Any] = {
             "task_id": task_id, "prompt": prompt,
             "context_memory": enriched or "",
@@ -184,7 +163,7 @@ async def _check_product_async(
     """拉取文本 artifact 内容，合并 output 过产物检验。"""
     combined = output or ""
     for art in artifacts or []:
-        if not _is_text_artifact(art):
+        if not is_text_artifact(art):
             continue
         try:
             ar = await async_http("GET", f"{base}/artifact/{task_id}",

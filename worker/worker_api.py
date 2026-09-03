@@ -1,4 +1,6 @@
 """worker HTTP 服务：接受任务、查询状态、回传产出文件；启动即向大脑注册并定期心跳。"""
+import os
+import sys
 import threading
 import time
 from pathlib import Path
@@ -8,6 +10,9 @@ from pydantic import BaseModel
 
 from agent_runner import AgentRunner, TaskRequest, TaskResult
 from worker_config import WorkerConfig
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "workspace" / "agent" / "orchestrator" / "runtime"))
+from auth import add_auth_middleware
 
 
 class TaskBody(BaseModel):
@@ -25,9 +30,10 @@ def register_to_brain(cfg: WorkerConfig, http_post=None) -> bool:
     url = f"{cfg.brain_url}/register"
     body = {"worker_id": cfg.worker_id, "role": cfg.role,
             "host": cfg.listen_host, "port": cfg.listen_port, "capabilities": {}}
+    headers = {"X-API-Key": cfg.api_key} if cfg.api_key else {}
     for _ in range(3):
         try:
-            r = http_post(url, json=body, timeout=5)
+            r = http_post(url, json=body, timeout=5, headers=headers)
             if getattr(r, "status_code", 0) == 200:
                 return True
         except Exception:
@@ -49,9 +55,11 @@ def start_auto_heartbeat(cfg: WorkerConfig, interval: int | None = None,
         post = http_post or requests.post
         register_to_brain(cfg, http_post=post)
         hb_url = f"{cfg.brain_url}/heartbeat"
+        headers = {"X-API-Key": cfg.api_key} if cfg.api_key else {}
         while not stop_event.is_set():
             try:
-                post(hb_url, json={"worker_id": cfg.worker_id, "load": 0}, timeout=5)
+                post(hb_url, json={"worker_id": cfg.worker_id, "load": 0},
+                     timeout=5, headers=headers)
             except Exception:
                 pass
             stop_event.wait(interval)
@@ -61,7 +69,8 @@ def start_auto_heartbeat(cfg: WorkerConfig, interval: int | None = None,
     return t
 
 
-def _send_callback(callback_url: str, result: "TaskResult | None") -> None:
+def _send_callback(callback_url: str, result: "TaskResult | None",
+                   api_key: str = "") -> None:
     """任务完成后主动回调 Brain，通知结果。失败静默忽略。"""
     if result is None:
         return
@@ -70,8 +79,9 @@ def _send_callback(callback_url: str, result: "TaskResult | None") -> None:
         "status": result.status, "output": result.output,
         "artifacts": result.artifacts, "error": result.error,
     }
+    headers = {"X-API-Key": api_key} if api_key else {}
     try:
-        requests.post(callback_url, json=payload, timeout=10)
+        requests.post(callback_url, json=payload, timeout=10, headers=headers)
     except Exception:
         pass
 
@@ -79,6 +89,7 @@ def _send_callback(callback_url: str, result: "TaskResult | None") -> None:
 def create_worker_app(runner: AgentRunner, cfg: WorkerConfig) -> FastAPI:
     app = FastAPI()
     state: dict[str, TaskResult] = {}
+    cancelled: set[str] = set()
     lock = threading.Lock()
 
     # CORS：开发期前端直连 worker 查任务/产物
@@ -90,6 +101,8 @@ def create_worker_app(runner: AgentRunner, cfg: WorkerConfig) -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
+    add_auth_middleware(app, cfg.api_key)
 
     def _execute(body: TaskBody):
         req = TaskRequest(body.task_id, body.prompt, body.context_memory, body.model)
@@ -111,11 +124,21 @@ def create_worker_app(runner: AgentRunner, cfg: WorkerConfig) -> FastAPI:
                 with lock:
                     state[body.task_id] = TaskResult(
                         body.task_id, "failed", error=f"execute error: {e}")
-            if body.callback_url:
-                _send_callback(body.callback_url, state.get(body.task_id))
+            if body.callback_url and body.task_id not in cancelled:
+                _send_callback(body.callback_url, state.get(body.task_id),
+                               api_key=cfg.api_key)
 
         threading.Thread(target=_bg, daemon=True, name=f"task-{body.task_id}").start()
         return {"task_id": body.task_id, "status": "accepted"}
+
+    @app.post("/task/{task_id}/cancel")
+    def cancel_task(task_id: str):
+        with lock:
+            cancelled.add(task_id)
+            res = state.get(task_id)
+            if res is not None:
+                state[task_id] = TaskResult(task_id, "cancelled")
+        return {"task_id": task_id, "status": "cancelled"}
 
     @app.get("/task/{task_id}")
     def get_task(task_id: str):

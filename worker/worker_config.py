@@ -28,6 +28,7 @@ class WorkerConfig:
     heartbeat_interval: int = 15
     permission_mode: str = "bypassPermissions"
     auto_register: bool = True
+    api_key: str = ""
 
 
 def load_worker_config() -> WorkerConfig:
@@ -42,4 +43,5 @@ def load_worker_config() -> WorkerConfig:
         heartbeat_interval=int(os.environ.get("ORCH_HEARTBEAT_INTERVAL", "15")),
         permission_mode=os.environ.get("ORCH_PERMISSION_MODE", "bypassPermissions"),
         auto_register=os.environ.get("ORCH_AUTO_REGISTER", "1") not in ("0", "false", "False"),
+        api_key=os.environ.get("ORCH_API_KEY", ""),
     )

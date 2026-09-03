@@ -4,6 +4,8 @@ import re
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
+from safe_id import validate_id
+
 
 @dataclass
 class ScheduleRecord:
@@ -24,15 +26,26 @@ class ScheduleStore:
     def __init__(self, store_dir: str):
         self.store_dir = Path(store_dir)
         self.store_dir.mkdir(parents=True, exist_ok=True)
+        self._cache: list[ScheduleRecord] | None = None
+
+    def _invalidate(self) -> None:
+        self._cache = None
 
     def _path(self, schedule_id: str) -> Path:
+        validate_id(schedule_id, "schedule_id")
         return self.store_dir / f"{schedule_id}.json"
 
     def write(self, record: ScheduleRecord) -> None:
         with open(self._path(record.schedule_id), "w", encoding="utf-8") as f:
             json.dump(asdict(record), f, ensure_ascii=False, indent=2)
+        self._invalidate()
 
     def get(self, schedule_id: str) -> ScheduleRecord | None:
+        if self._cache is not None:
+            for r in self._cache:
+                if r.schedule_id == schedule_id:
+                    return r
+            return None
         p = self._path(schedule_id)
         if not p.exists():
             return None
@@ -43,15 +56,19 @@ class ScheduleStore:
         p = self._path(schedule_id)
         if p.exists():
             p.unlink()
+            self._invalidate()
             return True
         return False
 
     def list_all(self) -> list[ScheduleRecord]:
+        if self._cache is not None:
+            return list(self._cache)
         out = []
         for p in sorted(self.store_dir.glob("*.json")):
             with open(p, encoding="utf-8") as f:
                 out.append(ScheduleRecord(**json.load(f)))
-        return out
+        self._cache = out
+        return list(out)
 
     def list_enabled(self) -> list[ScheduleRecord]:
         return [r for r in self.list_all() if r.enabled]

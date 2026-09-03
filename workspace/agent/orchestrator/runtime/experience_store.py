@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from embedding_model import EmbeddingModel, cosine_similarity_vec
+from safe_id import validate_id
 
 
 @dataclass
@@ -35,15 +36,26 @@ class ExperienceStore:
         self.store_dir = Path(store_dir)
         self.store_dir.mkdir(parents=True, exist_ok=True)
         self.embedding_model = embedding_model
+        self._cache: list[ExperienceRecord] | None = None
+
+    def _invalidate(self) -> None:
+        self._cache = None
 
     def _path(self, exp_id: str) -> Path:
+        validate_id(exp_id, "exp_id")
         return self.store_dir / f"{exp_id}.json"
 
     def write(self, record: ExperienceRecord) -> None:
         with open(self._path(record.exp_id), "w", encoding="utf-8") as f:
             json.dump(asdict(record), f, ensure_ascii=False, indent=2)
+        self._invalidate()
 
     def get(self, exp_id: str) -> ExperienceRecord | None:
+        if self._cache is not None:
+            for r in self._cache:
+                if r.exp_id == exp_id:
+                    return r
+            return None
         p = self._path(exp_id)
         if not p.exists():
             return None
@@ -54,15 +66,19 @@ class ExperienceStore:
         p = self._path(exp_id)
         if p.exists():
             p.unlink()
+            self._invalidate()
             return True
         return False
 
     def list_all(self) -> list[ExperienceRecord]:
+        if self._cache is not None:
+            return list(self._cache)
         out = []
         for p in sorted(self.store_dir.glob("*.json")):
             with open(p, encoding="utf-8") as f:
                 out.append(ExperienceRecord(**json.load(f)))
-        return out
+        self._cache = out
+        return list(out)
 
     def list_by_role(self, role: str) -> list[ExperienceRecord]:
         return [r for r in self.list_all() if r.role == role]

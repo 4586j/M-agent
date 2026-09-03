@@ -4,6 +4,8 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
+from safe_id import validate_id
+
 VALID_STATUSES = ("pending", "running", "done", "failed", "lost", "cancelled")
 
 
@@ -29,8 +31,13 @@ class TaskStore:
     def __init__(self, store_dir: str):
         self.store_dir = Path(store_dir)
         self.store_dir.mkdir(parents=True, exist_ok=True)
+        self._cache: list[TaskRecord] | None = None
+
+    def _invalidate(self) -> None:
+        self._cache = None
 
     def _path(self, task_id: str) -> Path:
+        validate_id(task_id, "task_id")
         return self.store_dir / f"{task_id}.json"
 
     def write(self, record: TaskRecord) -> None:
@@ -38,8 +45,14 @@ class TaskStore:
             raise ValueError(f"invalid status: {record.status}")
         with open(self._path(record.task_id), "w", encoding="utf-8") as f:
             json.dump(asdict(record), f, ensure_ascii=False, indent=2)
+        self._invalidate()
 
     def get(self, task_id: str) -> TaskRecord | None:
+        if self._cache is not None:
+            for r in self._cache:
+                if r.task_id == task_id:
+                    return r
+            return None
         p = self._path(task_id)
         if not p.exists():
             return None
@@ -77,8 +90,11 @@ class TaskStore:
                 and r.retry_count < r.max_retries]
 
     def _all(self) -> list[TaskRecord]:
+        if self._cache is not None:
+            return list(self._cache)
         out = []
         for p in sorted(self.store_dir.glob("*.json")):
             with open(p, encoding="utf-8") as f:
                 out.append(TaskRecord(**json.load(f)))
-        return out
+        self._cache = out
+        return list(out)

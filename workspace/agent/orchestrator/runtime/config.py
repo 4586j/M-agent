@@ -36,6 +36,7 @@ class Config:
     sweeper_interval: int = 15
     async_poll_interval: float = 1.0
     async_poll_max: int = 600
+    api_key: str = ""
 
 
 def load_config() -> Config:
@@ -56,4 +57,5 @@ def load_config() -> Config:
         sweeper_interval=int(os.environ.get("ORCH_SWEEPER_INTERVAL", "15")),
         async_poll_interval=float(os.environ.get("ORCH_ASYNC_POLL_INTERVAL", "1.0")),
         async_poll_max=int(os.environ.get("ORCH_ASYNC_POLL_MAX", "600")),
+        api_key=os.environ.get("ORCH_API_KEY", ""),
     )

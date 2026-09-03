@@ -63,7 +63,7 @@ def test_register_to_brain_success():
 
     calls = []
 
-    def fake_post(url, json=None, timeout=None):
+    def fake_post(url, json=None, timeout=None, headers=None):
         calls.append((url, json))
         return FakeResp()
 
@@ -80,7 +80,7 @@ def test_register_to_brain_retries_then_fails(monkeypatch):
     monkeypatch.setattr(worker_api.time, "sleep", lambda *a, **k: None)
     cfg = WorkerConfig(brain_url="http://brain", worker_id="w1")
 
-    def fake_post(url, json=None, timeout=None):
+    def fake_post(url, json=None, timeout=None, headers=None):
         raise ConnectionError("no brain")
 
     assert register_to_brain(cfg, http_post=fake_post) is False

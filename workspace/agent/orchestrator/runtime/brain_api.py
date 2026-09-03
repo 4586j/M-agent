@@ -19,6 +19,7 @@ from retry_manager import RetryManager
 from embedding_model import create_embedding_model
 from schedule_store import ScheduleStore, ScheduleRecord, compute_next_run
 from task_scheduler import TaskScheduler
+from auth import add_auth_middleware
 
 
 class RegisterReq(BaseModel):
@@ -81,9 +82,17 @@ def create_brain_app(registry: WorkerRegistry, task_store: TaskStore, cfg: Confi
                      retry_manager: RetryManager | None = None,
                      schedule_store: ScheduleStore | None = None,
                      task_scheduler: TaskScheduler | None = None,
-                     async_dispatcher: AsyncRemoteDispatcher | None = None) -> FastAPI:
+                     async_dispatcher: AsyncRemoteDispatcher | None = None,
+                     http_call=None) -> FastAPI:
     """dispatcher 可选：remote 模式传入 RemoteDispatcher，使派发与注册状态同进程。"""
     app = FastAPI()
+    if http_call is None:
+        http_call = _make_http_call(cfg.api_key)
+
+    @app.exception_handler(ValueError)
+    def _on_value_error(request, exc):
+        from fastapi.responses import JSONResponse
+        return JSONResponse(status_code=400, content={"detail": str(exc)})
 
     # CORS：开发期前端 5173，生产同源；可用 ORCH_CORS_ORIGINS 追加
     origins = os.environ.get("ORCH_CORS_ORIGINS", "http://localhost:5173")
@@ -94,6 +103,8 @@ def create_brain_app(registry: WorkerRegistry, task_store: TaskStore, cfg: Confi
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
+    add_auth_middleware(app, cfg.api_key)
 
     @app.post("/register")
     def register(req: RegisterReq):
@@ -140,6 +151,13 @@ def create_brain_app(registry: WorkerRegistry, task_store: TaskStore, cfg: Confi
             raise HTTPException(status_code=404, detail="task not found")
         if rec.status not in ("pending", "running"):
             raise HTTPException(status_code=400, detail=f"无法取消，任务当前状态为 {rec.status}")
+        if rec.worker_id:
+            w = registry.get_worker(rec.worker_id)
+            if w:
+                try:
+                    http_call("POST", f"http://{w.host}:{w.port}/task/{task_id}/cancel")
+                except Exception:
+                    pass
         return asdict(task_store.update(task_id, status="cancelled"))
 
     @app.post("/tasks/{task_id}/retry")
@@ -363,7 +381,7 @@ def create_brain_app(registry: WorkerRegistry, task_store: TaskStore, cfg: Confi
         if w is None:
             raise HTTPException(status_code=404, detail="worker not found")
         base = f"http://{w.host}:{w.port}"
-        resp = _http_call("GET", f"{base}/artifact/{task_id}", params={"path": path})
+        resp = http_call("GET", f"{base}/artifact/{task_id}", params={"path": path})
         if resp.get("status_code") != 200:
             raise HTTPException(status_code=502, detail=f"worker 返回: {resp}")
         return resp.get("json", {})
@@ -376,27 +394,41 @@ def create_brain_app(registry: WorkerRegistry, task_store: TaskStore, cfg: Confi
     return app
 
 
-def _http_call(method: str, url: str, **kwargs) -> dict:
-    """真实 HTTP 客户端，供 brain_api 内的 RemoteDispatcher 调 worker。"""
+def _make_http_call(api_key: str = ""):
+    """创建带 API Key 的同步 HTTP 客户端。"""
     import requests
-    resp = requests.request(method, url, timeout=30, **kwargs)
-    try:
-        body = resp.json()
-    except ValueError:
-        body = {"raw": resp.text}
-    return {"status_code": resp.status_code, "json": body}
 
-
-async def _async_http_call(method: str, url: str, **kwargs) -> dict:
-    """异步 HTTP 客户端，供 AsyncRemoteDispatcher 使用。"""
-    import httpx
-    async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.request(method, url, **kwargs)
+    def _http_call(method: str, url: str, **kwargs) -> dict:
+        headers = kwargs.pop("headers", {})
+        if api_key:
+            headers["X-API-Key"] = api_key
+        resp = requests.request(method, url, timeout=30, headers=headers, **kwargs)
         try:
             body = resp.json()
         except ValueError:
             body = {"raw": resp.text}
         return {"status_code": resp.status_code, "json": body}
+
+    return _http_call
+
+
+def _make_async_http_call(api_key: str = ""):
+    """创建带 API Key 的异步 HTTP 客户端。"""
+    import httpx
+
+    async def _async_http_call(method: str, url: str, **kwargs) -> dict:
+        headers = kwargs.pop("headers", {})
+        if api_key:
+            headers["X-API-Key"] = api_key
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.request(method, url, headers=headers, **kwargs)
+            try:
+                body = resp.json()
+            except ValueError:
+                body = {"raw": resp.text}
+            return {"status_code": resp.status_code, "json": body}
+
+    return _async_http_call
 
 
 def _build_app() -> FastAPI:
@@ -415,14 +447,16 @@ def _build_app() -> FastAPI:
     if cfg.mode == "remote":
         strategy = os.environ.get("ORCH_SELECT_STRATEGY", "round_robin")
         product_check = (lambda c: security_check(c, use_llm=cfg.security_llm))
+        http_call = _make_http_call(cfg.api_key)
+        async_http_call = _make_async_http_call(cfg.api_key)
         dispatcher = RemoteDispatcher(task_store=store, registry=registry,
-                                      http_call=_http_call, select_strategy=strategy,
+                                      http_call=http_call, select_strategy=strategy,
                                       product_check=product_check,
                                       experience_store=exp_store,
                                       max_retries=cfg.max_retries)
         async_disp = AsyncRemoteDispatcher(
             task_store=store, registry=registry,
-            async_http=_async_http_call, select_strategy=strategy,
+            async_http=async_http_call, select_strategy=strategy,
             product_check=product_check, experience_store=exp_store,
             max_retries=cfg.max_retries,
             poll_interval=cfg.async_poll_interval,
