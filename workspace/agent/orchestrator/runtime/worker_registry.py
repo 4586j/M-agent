@@ -1,5 +1,6 @@
 """worker 注册表：注册、心跳保活、按角色轮询/按负载选择。"""
 import itertools
+import threading
 import time
 from dataclasses import dataclass
 from typing import Callable
@@ -22,45 +23,55 @@ class WorkerRegistry:
         self._now = now_fn or time.time
         self._workers: dict[str, WorkerInfo] = {}
         self._rr: dict[str, itertools.cycle] = {}
+        # 注册/心跳/派发来自不同线程（FastAPI 线程池 + 后台 sweeper），用 RLock
+        # 因为 _alive 等内部方法会被持锁方法嵌套调用
+        self._lock = threading.RLock()
 
     def register(self, worker: WorkerInfo) -> None:
-        worker.last_heartbeat = self._now()
-        self._workers[worker.worker_id] = worker
-        self._rr.pop(worker.role, None)  # 重建轮询器
+        with self._lock:
+            worker.last_heartbeat = self._now()
+            self._workers[worker.worker_id] = worker
+            self._rr.pop(worker.role, None)  # 重建轮询器
 
     def unregister(self, worker_id: str) -> bool:
         """移除 worker；返回是否确实移除了一个。"""
-        w = self._workers.pop(worker_id, None)
-        if w is not None:
-            self._rr.pop(w.role, None)
-        return w is not None
+        with self._lock:
+            w = self._workers.pop(worker_id, None)
+            if w is not None:
+                self._rr.pop(w.role, None)
+            return w is not None
 
     def heartbeat(self, worker_id: str, load: int = 0) -> None:
-        w = self._workers.get(worker_id)
-        if w is None:
-            return
-        w.last_heartbeat = self._now()
-        w.load = load
+        with self._lock:
+            w = self._workers.get(worker_id)
+            if w is None:
+                return
+            w.last_heartbeat = self._now()
+            w.load = load
 
     def _alive(self) -> list[WorkerInfo]:
         now = self._now()
-        return [w for w in self._workers.values() if now - w.last_heartbeat <= self.heartbeat_timeout]
+        with self._lock:
+            return [w for w in self._workers.values() if now - w.last_heartbeat <= self.heartbeat_timeout]
 
     def active_workers(self) -> list[WorkerInfo]:
-        return list(self._alive())
+        return self._alive()
 
     def all_workers(self) -> list[WorkerInfo]:
         """全部在册 worker（含已超时未剔除的），供产物代理等查询。"""
-        return list(self._workers.values())
+        with self._lock:
+            return list(self._workers.values())
 
     def dead_workers(self) -> list[WorkerInfo]:
         """返回心跳超时的 worker（在册但不在活跃列表中）。"""
-        alive_ids = {w.worker_id for w in self._alive()}
-        return [w for w in self._workers.values() if w.worker_id not in alive_ids]
+        with self._lock:
+            alive_ids = {w.worker_id for w in self._alive()}
+            return [w for w in self._workers.values() if w.worker_id not in alive_ids]
 
     def get_worker(self, worker_id: str) -> WorkerInfo | None:
         """按 ID 查询 worker（不论是否存活）。"""
-        return self._workers.get(worker_id)
+        with self._lock:
+            return self._workers.get(worker_id)
 
     def select_worker(self, role: str = "executor",
                       strategy: str = "round_robin") -> WorkerInfo | None:
@@ -70,12 +81,13 @@ class WorkerRegistry:
             return None
         if strategy == "least_load":
             return min(alive, key=lambda w: (w.load, w.last_heartbeat))
-        if role not in self._rr:
-            self._rr[role] = itertools.cycle(alive)
-            return next(self._rr[role])
-        # 轮询但跳过已失联的
-        for _ in range(len(alive)):
-            cand = next(self._rr[role])
-            if cand in alive:
-                return cand
+        with self._lock:
+            if role not in self._rr:
+                self._rr[role] = itertools.cycle(alive)
+                return next(self._rr[role])
+            # 轮询但跳过已失联的
+            for _ in range(len(alive)):
+                cand = next(self._rr[role])
+                if cand in alive:
+                    return cand
         return alive[0]

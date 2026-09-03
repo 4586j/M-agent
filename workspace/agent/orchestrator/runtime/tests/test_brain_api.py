@@ -28,6 +28,55 @@ def test_register_worker(tmp_path):
     assert reg.select_worker("executor") is not None
 
 
+def test_register_hostname_worker(tmp_path):
+    client, _, _ = make_app(tmp_path)
+    r = client.post("/register", json={
+        "worker_id": "worker-B", "role": "executor",
+        "host": "worker-1.internal.corp", "port": 8000, "capabilities": {},
+    })
+    assert r.status_code == 200
+
+
+def test_register_rejects_bad_host(tmp_path):
+    client, reg, _ = make_app(tmp_path)
+    for host in ["http://evil.com", "evil.com:7000", "user@evil.com", "../etc", "0.0.0.0"]:
+        r = client.post("/register", json={
+            "worker_id": "worker-A", "role": "executor",
+            "host": host, "port": 8000, "capabilities": {},
+        })
+        assert r.status_code == 400, host
+    assert reg.all_workers() == []
+
+
+def test_register_rejects_bad_worker_id(tmp_path):
+    client, _, _ = make_app(tmp_path)
+    r = client.post("/register", json={
+        "worker_id": "../evil", "role": "executor",
+        "host": "127.0.0.1", "port": 8000, "capabilities": {},
+    })
+    assert r.status_code == 400
+
+
+def test_register_rejects_bad_port(tmp_path):
+    client, _, _ = make_app(tmp_path)
+    for port in [0, -1, 70000]:
+        r = client.post("/register", json={
+            "worker_id": "worker-A", "role": "executor",
+            "host": "127.0.0.1", "port": port, "capabilities": {},
+        })
+        assert r.status_code == 400, port
+
+
+def test_register_blocks_private_host_when_strict(tmp_path, monkeypatch):
+    monkeypatch.setenv("ORCH_BLOCK_PRIVATE_HOSTS", "1")
+    client, _, _ = make_app(tmp_path)
+    r = client.post("/register", json={
+        "worker_id": "worker-A", "role": "executor",
+        "host": "192.168.1.5", "port": 8000, "capabilities": {},
+    })
+    assert r.status_code == 400
+
+
 def test_heartbeat(tmp_path):
     client, reg, _ = make_app(tmp_path, now_fn=lambda: 100.0)
     client.post("/register", json={

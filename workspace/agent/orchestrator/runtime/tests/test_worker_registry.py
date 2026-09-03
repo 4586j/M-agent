@@ -1,4 +1,5 @@
 import sys
+import threading
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -83,4 +84,51 @@ def test_all_workers_includes_timed_out():
     times[0] = 1000.0  # 超时
     assert reg.active_workers() == []
     assert len(reg.all_workers()) == 1
+
+
+def test_concurrent_register_heartbeat_select():
+    """并发注册/心跳/选择不再触发 dict changed size / cycle 竞态。"""
+    reg = WorkerRegistry(heartbeat_timeout=45)
+    errors: list[Exception] = []
+
+    def spam_register():
+        try:
+            for i in range(200):
+                reg.register(make_info(f"w-{i}"))
+        except Exception as e:  # noqa: BLE001
+            errors.append(e)
+
+    def spam_unregister():
+        try:
+            for i in range(200):
+                reg.unregister(f"w-{i}")
+        except Exception as e:  # noqa: BLE001
+            errors.append(e)
+
+    def spam_heartbeat():
+        try:
+            for _ in range(200):
+                reg.heartbeat("w-0", load=1)
+                reg.get_worker("w-1")
+                reg.all_workers()
+                reg.dead_workers()
+        except Exception as e:  # noqa: BLE001
+            errors.append(e)
+
+    def spam_select():
+        try:
+            for _ in range(200):
+                reg.select_worker("executor")
+                reg.select_worker("executor", strategy="least_load")
+        except Exception as e:  # noqa: BLE001
+            errors.append(e)
+
+    threads = [threading.Thread(target=fn)
+               for fn in (spam_register, spam_unregister, spam_heartbeat, spam_select)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert errors == []
+
 

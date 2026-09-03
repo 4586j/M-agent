@@ -20,6 +20,7 @@ from embedding_model import create_embedding_model
 from schedule_store import ScheduleStore, ScheduleRecord, compute_next_run
 from task_scheduler import TaskScheduler
 from auth import add_auth_middleware
+from safe_id import validate_id, validate_host
 
 
 class RegisterReq(BaseModel):
@@ -108,6 +109,10 @@ def create_brain_app(registry: WorkerRegistry, task_store: TaskStore, cfg: Confi
 
     @app.post("/register")
     def register(req: RegisterReq):
+        validate_id(req.worker_id, "worker_id")
+        validate_host(req.host)
+        if not (1 <= req.port <= 65535):
+            raise ValueError(f"invalid port: {req.port}")
         registry.register(WorkerInfo(
             worker_id=req.worker_id, role=req.role, host=req.host, port=req.port,
             capabilities=req.capabilities, last_heartbeat=0.0,
