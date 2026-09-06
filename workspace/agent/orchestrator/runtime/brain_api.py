@@ -16,6 +16,7 @@ from config import Config
 from security_guard import check_with_llm as security_check
 from experience_store import ExperienceStore
 from memory_store import FileMemoryStore, MemoryStore
+from procedural_store import ProceduralStore
 from retry_manager import RetryManager
 from embedding_model import create_embedding_model
 from schedule_store import ScheduleStore, ScheduleRecord, compute_next_run
@@ -49,6 +50,19 @@ class DispatchReq(BaseModel):
 
 class MemoryWriteReq(BaseModel):
     content: str
+
+
+class ProceduralProposalReq(BaseModel):
+    target_path: str  # 相对项目根，限 skills/ 与 .claude/agents/ 白名单下既有文件
+    content: str  # 提议的新内容
+    reason: str
+    evidence_exp_ids: list[str] = []
+
+
+class ProceduralVoteReq(BaseModel):
+    voter: str  # brain | executor | security（security 由规则引擎自动投）
+    verdict: str  # pass | block
+    reason: str = ""
 
 
 class RedispatchReq(BaseModel):
@@ -88,6 +102,7 @@ def create_brain_app(registry: WorkerRegistry, task_store: TaskStore, cfg: Confi
                      dispatcher: Dispatcher | None = None,
                      experience_store: ExperienceStore | None = None,
                      memory_store: MemoryStore | None = None,
+                     procedural_store: ProceduralStore | None = None,
                      retry_manager: RetryManager | None = None,
                      schedule_store: ScheduleStore | None = None,
                      task_scheduler: TaskScheduler | None = None,
@@ -114,6 +129,22 @@ def create_brain_app(registry: WorkerRegistry, task_store: TaskStore, cfg: Confi
     )
 
     add_auth_middleware(app, cfg.api_key)
+
+    def _route_model(req: DispatchReq) -> str | None:
+        """启发式模型路由（ORCH_MODEL_ROUTING=heuristic 时启用，默认 off）。
+
+        简单 executor 任务（无技能标记、prompt 不超阈值）路由到便宜模型
+        （业界共识：轻量子任务用 Haiku 是最大降本杠杆之一）。
+        返回最终使用的 model；None = executor.md frontmatter 的默认模型。
+        """
+        if cfg.model_routing != "heuristic" or req.model or req.role != "executor":
+            return req.model
+        if any(tag in req.prompt for tag in
+               ("[web-expert]", "[back-expert]", "[data-expert]")):
+            return None  # 技能流程任务有质量约定，不降级
+        if len(req.prompt) <= cfg.route_max_prompt_chars:
+            return cfg.cheap_model
+        return None
 
     @app.post("/register")
     def register(req: RegisterReq):
@@ -225,15 +256,16 @@ def create_brain_app(registry: WorkerRegistry, task_store: TaskStore, cfg: Confi
         if memory_store is not None and req.context_task_ids:
             context = assemble_context(memory_store, context, req.context_task_ids)
         context = clamp_context(context, cfg.context_memory_max_chars)
+        model = _route_model(req)
         try:
             res = dispatcher.dispatch(role=req.role, prompt=req.prompt,
-                                      context_memory=context or None, model=req.model)
+                                      context_memory=context or None, model=model)
         except RuntimeError as e:
             return {"status": "failed", "error": str(e)}
         return {
             "task_id": res.task_id, "status": res.status,
             "output": res.output, "artifacts": res.artifacts, "error": res.error,
-            "product_verdict": res.verdict,
+            "product_verdict": res.verdict, "model": model,
         }
 
     @app.post("/dispatch/async")
@@ -248,14 +280,15 @@ def create_brain_app(registry: WorkerRegistry, task_store: TaskStore, cfg: Confi
         if memory_store is not None and req.context_task_ids:
             context = assemble_context(memory_store, context, req.context_task_ids)
         context = clamp_context(context, cfg.context_memory_max_chars)
+        model = _route_model(req)
         try:
             task_id = await async_dispatcher.dispatch_async(
                 role=req.role, prompt=req.prompt,
-                context_memory=context or None, model=req.model,
+                context_memory=context or None, model=model,
             )
         except RuntimeError as e:
             return {"status": "failed", "error": str(e)}
-        return {"status": "accepted", "task_id": task_id}
+        return {"status": "accepted", "task_id": task_id, "model": model}
 
     @app.get("/tasks/{task_id}/status")
     def task_status(task_id: str):
@@ -353,6 +386,70 @@ def create_brain_app(registry: WorkerRegistry, task_store: TaskStore, cfg: Confi
             raise HTTPException(status_code=400, detail="memory_store 未配置")
         archived = memory_store.delete_context(task_id)
         return {"status": "archived" if archived else "noop", "task_id": task_id}
+
+    # ---- 程序记忆演化（技能定义的提案-共识-应用，LangGraph Reflection 式） ----
+    @app.get("/memory/procedural/reflection")
+    def procedural_reflection(window: int = 50):
+        """近期经验的确定性反思聚合，供大脑起草技能定义修订提案。"""
+        if experience_store is None:
+            raise HTTPException(status_code=400, detail="experience_store 未配置")
+        recs = sorted(experience_store.list_all(),
+                      key=lambda r: r.created_at, reverse=True)
+        recent = recs[:max(0, window)]
+        by_role: dict[str, dict] = {}
+        for r in recent:
+            d = by_role.setdefault(r.role, {"total": 0, "success": 0})
+            d["total"] += 1
+            d["success"] += 1 if r.success else 0
+        return {
+            "window": window,
+            "total": len(recent),
+            "success": sum(1 for r in recent if r.success),
+            "by_role": by_role,
+            "failed_recent": [{"exp_id": r.exp_id, "prompt": r.prompt[:120]}
+                              for r in recent if not r.success][:10],
+            "most_hit": [{"exp_id": r.exp_id, "hits": r.hits,
+                          "prompt": r.prompt[:80]}
+                         for r in sorted(recent, key=lambda x: x.hits,
+                                         reverse=True)[:5] if r.hits > 0],
+        }
+
+    @app.post("/memory/procedural/proposals")
+    def create_procedural_proposal(req: ProceduralProposalReq):
+        if procedural_store is None:
+            raise HTTPException(status_code=400, detail="procedural_store 未配置")
+        try:
+            rec = procedural_store.propose(req.target_path, req.content,
+                                           req.reason, req.evidence_exp_ids)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        return asdict(rec)
+
+    @app.get("/memory/procedural/proposals")
+    def list_procedural_proposals(status: str | None = None):
+        if procedural_store is None:
+            raise HTTPException(status_code=400, detail="procedural_store 未配置")
+        return [asdict(r) for r in procedural_store.list_all(status)]
+
+    @app.post("/memory/procedural/proposals/{proposal_id}/vote")
+    def vote_procedural_proposal(proposal_id: str, req: ProceduralVoteReq):
+        if procedural_store is None:
+            raise HTTPException(status_code=400, detail="procedural_store 未配置")
+        try:
+            rec = procedural_store.vote(proposal_id, req.voter, req.verdict, req.reason)
+        except KeyError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        return asdict(rec)
+
+    @app.delete("/memory/procedural/proposals/{proposal_id}")
+    def delete_procedural_proposal(proposal_id: str):
+        if procedural_store is None:
+            raise HTTPException(status_code=400, detail="procedural_store 未配置")
+        if not procedural_store.delete(proposal_id):
+            raise HTTPException(status_code=404, detail="proposal not found")
+        return {"status": "deleted", "proposal_id": proposal_id}
 
     @app.get("/experiences")
     def list_experiences(role: str | None = None, successful_only: bool = True):
@@ -523,6 +620,14 @@ def _build_app() -> FastAPI:
                                 max_count=cfg.experience_max_count,
                                 ttl_days=cfg.experience_ttl_days)
     mem_store = FileMemoryStore(cfg.memory_core_dir, cfg.memory_context_dir)
+    proc_root = Path(__file__).resolve().parents[2]
+    proc_store = ProceduralStore(
+        store_dir=cfg.procedural_store_dir,
+        allowed_roots=[str(proc_root / "workspace" / "agent" / "skills"),
+                       str(proc_root / ".claude" / "agents")],
+        project_root=str(proc_root),
+        security_check=(lambda c: security_check(c, use_llm=cfg.security_llm)),
+    )
     dispatcher = None
     retry_mgr = None
     async_disp = None
@@ -538,13 +643,15 @@ def _build_app() -> FastAPI:
                                       product_check=product_check,
                                       experience_store=exp_store,
                                       memory_store=mem_store,
-                                      max_retries=cfg.max_retries)
+                                      max_retries=cfg.max_retries,
+                                      check_max_chars=cfg.security_check_max_chars)
         async_disp = AsyncRemoteDispatcher(
             task_store=store, registry=registry,
             async_http=async_http_call, select_strategy=strategy,
             product_check=product_check, experience_store=exp_store,
             memory_store=mem_store,
             max_retries=cfg.max_retries,
+            check_max_chars=cfg.security_check_max_chars,
             poll_interval=cfg.async_poll_interval,
             poll_max=cfg.async_poll_max,
             brain_url=cfg.brain_url,
@@ -559,6 +666,7 @@ def _build_app() -> FastAPI:
         scheduler.start()
     return create_brain_app(registry, store, cfg, dispatcher=dispatcher,
                             experience_store=exp_store, memory_store=mem_store,
+                            procedural_store=proc_store,
                             retry_manager=retry_mgr,
                             schedule_store=sched_store, task_scheduler=scheduler,
                             async_dispatcher=async_disp)

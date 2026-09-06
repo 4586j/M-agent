@@ -144,3 +144,67 @@ def test_sdk_runner_timeout(tmp_path, monkeypatch):
     res = runner.run(TaskRequest(task_id="task-slow", prompt="p", context_memory="", model=None))
     assert res.status == "failed"
     assert "timeout" in str(res.error)
+
+
+def test_sdk_runner_cost_controls_and_usage(tmp_path, monkeypatch):
+    captured = _install_fake_sdk(monkeypatch, [{
+        "result": "ok", "is_error": False, "num_turns": 2,
+        "usage": {"input_tokens": 100, "output_tokens": 50,
+                  "cache_read_input_tokens": 800,
+                  "cache_creation_input_tokens": 200},
+        "total_cost_usd": 0.012, "duration_ms": 4321,
+    }])
+    runner = SdkAgentRunner(work_dir=str(tmp_path),
+                            executor_def_path=str(Path(PROJECT_ROOT) / ".claude" / "agents" / "executor.md"),
+                            project_root=PROJECT_ROOT,
+                            max_turns=7, max_thinking_tokens=4096, task_budget_usd=0.5)
+    res = runner.run(TaskRequest(task_id="task-cost", prompt="p",
+                                 context_memory="", model=None))
+    assert res.status == "done"
+    # 成本控制项透传给 SDK options
+    assert captured["max_turns"] == 7
+    assert captured["max_thinking_tokens"] == 4096
+    assert captured["max_budget_usd"] == 0.5
+    # 用量与缓存指标进 meta（缓存命中率可观测的前提）
+    assert res.meta["usage"]["cache_read_input_tokens"] == 800
+    assert res.meta["usage"]["cache_creation_input_tokens"] == 200
+    assert res.meta["cost_usd"] == 0.012
+    assert res.meta["duration_ms"] == 4321
+
+
+def test_sdk_runner_cost_controls_disabled(tmp_path, monkeypatch):
+    captured = _install_fake_sdk(monkeypatch,
+                                 [{"result": "ok", "is_error": False, "num_turns": 1}])
+    runner = SdkAgentRunner(work_dir=str(tmp_path),
+                            executor_def_path=str(Path(PROJECT_ROOT) / ".claude" / "agents" / "executor.md"),
+                            project_root=PROJECT_ROOT,
+                            max_thinking_tokens=0, task_budget_usd=0)
+    runner.run(TaskRequest(task_id="task-nocost", prompt="p", context_memory="", model=None))
+    assert "max_thinking_tokens" not in captured
+    assert "max_budget_usd" not in captured
+
+
+def test_load_mcp_servers(tmp_path):
+    from agent_runner import load_mcp_servers
+    # 配置缺失/空路径
+    assert load_mcp_servers("") is None
+    assert load_mcp_servers(str(tmp_path / "no.json")) is None
+    # 正常配置：stdio + http 两种形状
+    cfg_file = tmp_path / "mcp.json"
+    cfg_file.write_text('{"mcpServers": {"fs": {"command": "npx", "args": ["-y", "x"]},'
+                        ' "figma": {"type": "http", "url": "http://127.0.0.1:3845/mcp"}},'
+                        ' "other": {"broken": true}}', encoding="utf-8")
+    servers = load_mcp_servers(str(cfg_file))
+    assert set(servers.keys()) == {"fs", "figma"}  # 缺 command/url 的条目被过滤
+    assert servers["fs"]["command"] == "npx"
+
+
+def test_sdk_runner_passes_mcp_servers(tmp_path, monkeypatch):
+    captured = _install_fake_sdk(monkeypatch,
+                                 [{"result": "ok", "is_error": False, "num_turns": 1}])
+    mcp_servers = {"fs": {"command": "npx", "args": ["-y", "x"]}}
+    runner = SdkAgentRunner(work_dir=str(tmp_path),
+                            executor_def_path=str(Path(PROJECT_ROOT) / ".claude" / "agents" / "executor.md"),
+                            project_root=PROJECT_ROOT, mcp_servers=mcp_servers)
+    runner.run(TaskRequest(task_id="task-mcp", prompt="p", context_memory="", model=None))
+    assert captured["mcp_servers"] == mcp_servers  # MCP 工具挂载进 SDK 会话

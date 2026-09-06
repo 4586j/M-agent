@@ -283,10 +283,29 @@ def test_ttl_purges_expired(tmp_path):
     assert "exp-new" in ids
 
 
-def test_search_tracks_hits(tmp_path):
+def _rec_by_id(store, exp_id):
+    return next(r for r in store.list_all() if r.exp_id == exp_id)
+
+
+def test_search_persists_hits(tmp_path):
     store = ExperienceStore(str(tmp_path))
     store.write(make_exp("exp-1", prompt="analyze data"))
     store.search("analyze data")
-    assert store._hits["exp-1"] == 1
+    rec = _rec_by_id(store, "exp-1")
+    assert rec.hits == 1 and rec.last_hit_at
     store.search("analyze data")
-    assert store._hits["exp-1"] == 2
+    assert _rec_by_id(store, "exp-1").hits == 2  # 持久化：命中计数落盘
+
+
+def test_write_bumps_version(tmp_path):
+    store = ExperienceStore(str(tmp_path))
+    rec = make_exp("exp-1", prompt="analyze data")
+    store.write(rec)
+    assert rec.version == 1
+    rec.output_summary = "updated"
+    store.write(rec)
+    assert rec.version == 2
+    # 命中计数不递增版本号
+    store.search("analyze data")
+    assert _rec_by_id(store, "exp-1").version == 2
+    assert _rec_by_id(store, "exp-1").hits == 1

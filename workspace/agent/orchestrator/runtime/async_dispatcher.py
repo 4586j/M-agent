@@ -34,6 +34,7 @@ class AsyncRemoteDispatcher:
         experience_store: ExperienceStore | None = None,
         memory_store: MemoryStore | None = None,
         max_retries: int = 0,
+        check_max_chars: int = 6000,
         poll_interval: float = 1.0,
         poll_max: int = 600,
         brain_url: str = "http://127.0.0.1:7000",
@@ -47,6 +48,7 @@ class AsyncRemoteDispatcher:
         self.experience_store = experience_store
         self.memory_store = memory_store
         self.max_retries = max_retries
+        self.check_max_chars = check_max_chars
         self.poll_interval = poll_interval
         self.poll_max = poll_max
         self.brain_url = brain_url
@@ -135,6 +137,7 @@ class AsyncRemoteDispatcher:
             verdict = await _check_product_async(
                 base, task_id, out, arts,
                 self.product_check, self.async_http,
+                max_chars=self.check_max_chars,
             )
         self.task_store.update(
             task_id, status=st, output=out,
@@ -163,8 +166,9 @@ async def _check_product_async(
     base: str, task_id: str, output: Any, artifacts: list,
     product_check: Callable[[str], dict],
     async_http: AsyncHttpCall,
+    max_chars: int = 6000,
 ) -> dict | None:
-    """拉取文本 artifact 内容，合并 output 过产物检验。"""
+    """拉取文本 artifact 内容，合并 output 过产物检验（输入截断到 max_chars）。"""
     combined = output or ""
     for art in artifacts or []:
         if not is_text_artifact(art):
@@ -177,4 +181,4 @@ async def _check_product_async(
                             ar.get("json", {}).get("content", "")
         except Exception:
             continue
-    return product_check(combined)
+    return product_check(combined[:max_chars])

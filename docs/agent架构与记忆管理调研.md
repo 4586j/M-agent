@@ -171,8 +171,8 @@
 3. **P1 — Compaction** ✅ 最轻量形式已实现：`ORCH_CONTEXT_MEMORY_MAX`（默认 8000 字符）对派发 context_memory 限幅，截断保头部并标注；经验注入本就截断（prompt 100 字/摘要 200 字）。SDK 会话内压缩受 SDK 限制，max_turns=50 仍是唯一护栏。
 4. **P1 — KV-cache 友好的 prompt 前缀** ✅ 已实现：worker 的 system prompt 只含跨任务稳定内容（executor.md + 技能环境块），任务工作目录移入用户消息开头——system prompt 前缀可跨任务复用。
 5. **P1 — 混合检索** ✅ 已实现：ExperienceStore.search 关键词与语义两路用 Reciprocal Rank Fusion 融合（分数尺度无关、结果确定）；无 embedding 记录仍可经关键词通道召回（旧版会被向量检索完全丢弃）。
-6. **P2 — Procedural 记忆演化**：待做。SKILL.md/executor.md 是程序记忆但纯手工维护；可借鉴 LangGraph Reflection——定期用近期任务反馈提议技能定义修订，仍走三方共识门控。
-7. **P2 — 经验条目的时效元数据** ⚙️ 部分实现：命中计数（内存态，支撑淘汰保护）已加；last_hit 持久化与 version 字段待做（当前避免检索路径的写放大）。
+6. **P2 — Procedural 记忆演化** ✅ 已实现：ProceduralStore「提案-共识-应用」——反思报告端点（近期经验确定性聚合）→ 提案（目标限 skills/ 与 .claude/agents/ 下既有文件，security 视角由规则引擎创建时自动裁决）→ brain/executor 投票 → 三票全 pass 自动写回；hash 乐观锁防目标漂移，原内容随提案归档。流程已写入大脑 SKILL.md 记忆层。
+7. **P2 — 经验条目的时效元数据** ✅ 已实现：hits/last_hit_at 随检索命中持久化落盘（淘汰保护跨重启生效），version 字段随显式 write 递增（命中计数不递增），供后续一致性检查。
 
 ---
 

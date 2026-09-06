@@ -231,10 +231,15 @@ def _build_app():
     cfg = load_worker_config()
     runner_kind = os.environ.get("ORCH_RUNNER", "fake").lower()
     if runner_kind == "sdk":
+        from agent_runner import load_mcp_servers
         runner = SdkAgentRunner(work_dir=cfg.work_dir, executor_def_path=cfg.executor_def_path,
                                 permission_mode=cfg.permission_mode,
                                 project_root=cfg.project_root,
-                                task_timeout=cfg.task_timeout)
+                                task_timeout=cfg.task_timeout,
+                                max_turns=cfg.max_turns,
+                                max_thinking_tokens=cfg.max_thinking_tokens or None,
+                                task_budget_usd=cfg.task_budget_usd or None,
+                                mcp_servers=load_mcp_servers(cfg.mcp_config_path))
     else:
         runner = FakeAgentRunner(work_dir=cfg.work_dir)
     app = create_worker_app(runner, cfg)

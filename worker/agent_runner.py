@@ -116,6 +116,37 @@ def build_env_block(project_root: str, skills: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def load_mcp_servers(path: str) -> dict | None:
+    """加载 MCP 服务器配置（ORCH_MCP_CONFIG 指向的 JSON）。
+
+    格式与 .mcp.json 一致：{"mcpServers": {"<名称>": {"command": ..., "args": [...],
+    "env": {...}}} 或 {"url": ..., "headers": {...}}}。返回
+    {名称: 配置dict}（即 SDK mcp_servers 形状）；文件缺失/为空/格式错返回 None，
+    不让 MCP 配置问题拖垮任务执行。
+    """
+    if not path:
+        return None
+    p = Path(path)
+    if not p.is_file():
+        return None
+    try:
+        import json
+        data = json.loads(p.read_text(encoding="utf-8"))
+        servers = data.get("mcpServers") or {}
+        if not isinstance(servers, dict) or not servers:
+            return None
+        cleaned = {}
+        for name, cfg in servers.items():
+            if not isinstance(cfg, dict):
+                continue
+            if not (cfg.get("command") or cfg.get("url")):
+                continue  # 缺 command/url 的条目跳过
+            cleaned[name] = cfg
+        return cleaned or None
+    except Exception:
+        return None
+
+
 class SdkAgentRunner(AgentRunner):
     """真实执行：用 claude-agent-sdk 起 executor 会话。
 
@@ -127,13 +158,21 @@ class SdkAgentRunner(AgentRunner):
     def __init__(self, work_dir: str, executor_def_path: str,
                  permission_mode: str = "bypassPermissions",
                  project_root: str | None = None,
-                 task_timeout: int = 900):
+                 task_timeout: int = 900,
+                 max_turns: int = 50,
+                 max_thinking_tokens: int | None = 10000,
+                 task_budget_usd: float | None = None,
+                 mcp_servers: dict | None = None):
         self.work_dir = Path(work_dir)
         self.work_dir.mkdir(parents=True, exist_ok=True)
         self.executor_def_path = executor_def_path
         self.permission_mode = permission_mode
         self.project_root = project_root or str(self.work_dir.parent)
         self.task_timeout = task_timeout
+        self.max_turns = max_turns
+        self.max_thinking_tokens = max_thinking_tokens
+        self.task_budget_usd = task_budget_usd
+        self.mcp_servers = mcp_servers
 
     def _parse_executor_def(self) -> dict:
         """解析 .claude/agents/executor.md 的 frontmatter + body。"""
@@ -167,13 +206,22 @@ class SdkAgentRunner(AgentRunner):
         full_prompt += f"\n\n[任务]\n{req.prompt}"
 
         env_block = build_env_block(self.project_root, scan_skills(self.project_root))
-        options = sdk.ClaudeAgentOptions(
+        option_kwargs = dict(
             cwd=str(task_dir),
             model=req.model or meta["model"],
             system_prompt=meta["prompt"] + env_block,
             permission_mode=self.permission_mode,
-            max_turns=50,
+            max_turns=self.max_turns,
         )
+        # 成本控制：思考 token 是最大成本项（业界实测限到 ~10k 可省 30-40%），
+        # max_budget_usd 是单任务硬预算熔断；0/None 表示不限制
+        if self.max_thinking_tokens:
+            option_kwargs["max_thinking_tokens"] = self.max_thinking_tokens
+        if self.task_budget_usd:
+            option_kwargs["max_budget_usd"] = self.task_budget_usd
+        if self.mcp_servers:
+            option_kwargs["mcp_servers"] = self.mcp_servers
+        options = sdk.ClaudeAgentOptions(**option_kwargs)
         if meta["tools"]:
             options.allowed_tools = [t.strip() for t in meta["tools"].split(",")]
 
@@ -181,21 +229,33 @@ class SdkAgentRunner(AgentRunner):
             outputs: list[str] = []
             turns = 0
             is_error = False
+            usage: dict | None = None
+            cost_usd: float | None = None
+            duration_ms = 0
             async for msg in sdk.query(prompt=full_prompt, options=options):
                 if isinstance(msg, sdk.ResultMessage):
                     outputs.append(msg.result or "")
                     turns = getattr(msg, "num_turns", None) or turns
                     is_error = bool(getattr(msg, "is_error", False))
+                    # 用量指标（ResultMessage 为累计值，取最后一条即可）
+                    u = getattr(msg, "usage", None)
+                    if isinstance(u, dict):
+                        usage = u
+                    c = getattr(msg, "total_cost_usd", None)
+                    if c is not None:
+                        cost_usd = c
+                    duration_ms = int(getattr(msg, "duration_ms", 0) or 0)
                 # 协作式取消：在消息边界检查，当前 turn 结束即停
                 if req.cancel_event is not None and req.cancel_event.is_set():
-                    return "\n".join(outputs), turns, is_error, True
-            return "\n".join(outputs), turns, is_error, False
+                    return "\n".join(outputs), turns, is_error, True, usage, cost_usd, duration_ms
+            return "\n".join(outputs), turns, is_error, False, usage, cost_usd, duration_ms
 
         async def _run_with_timeout():
             return await asyncio.wait_for(_run(), timeout=self.task_timeout)
 
         try:
-            output, turns, is_error, cancelled = _run_async(_run_with_timeout())
+            output, turns, is_error, cancelled, usage, cost_usd, duration_ms = \
+                _run_async(_run_with_timeout())
         except asyncio.TimeoutError:
             return TaskResult(req.task_id, "failed",
                               error=f"task timeout after {self.task_timeout}s",
@@ -203,16 +263,30 @@ class SdkAgentRunner(AgentRunner):
         except Exception as e:
             return TaskResult(req.task_id, "failed", error=f"sdk error: {e}")
 
+        def _base_meta(extra: dict) -> dict:
+            m = {"num_turns": turns, **extra}
+            if usage:
+                m["usage"] = {k: usage.get(k) for k in
+                              ("input_tokens", "output_tokens",
+                               "cache_read_input_tokens",
+                               "cache_creation_input_tokens") if k in usage}
+            if cost_usd is not None:
+                m["cost_usd"] = cost_usd
+            if duration_ms:
+                m["duration_ms"] = duration_ms
+            return m
+
         if cancelled:
             return TaskResult(req.task_id, "cancelled",
-                              output=output or None, error="cancelled by request")
+                              output=output or None, error="cancelled by request",
+                              meta=_base_meta({}))
         if is_error:
             return TaskResult(req.task_id, "failed", output=output or None,
                               error="sdk reported is_error",
-                              meta={"num_turns": turns})
+                              meta=_base_meta({}))
 
         artifacts = [str(p.relative_to(task_dir)) for p in task_dir.rglob("*") if p.is_file()]
         return TaskResult(req.task_id, "done", output=output or "(无输出)",
                           artifacts=artifacts, error=None,
-                          meta={"num_turns": turns})
+                          meta=_base_meta({}))
 

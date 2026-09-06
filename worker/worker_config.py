@@ -32,6 +32,10 @@ class WorkerConfig:
     work_dir: str = _default_work_dir()
     project_root: str = _default_project_root()
     task_timeout: int = 900
+    max_turns: int = 50  # 单任务最大轮次，防失控循环烧 token
+    max_thinking_tokens: int = 10000  # 思考 token 上限（最大成本项）；0=不限制
+    task_budget_usd: float = 0.0  # 单任务美元硬预算；0=不限制
+    mcp_config_path: str = ""  # MCP 服务器配置 JSON 路径；空=不挂载 MCP 工具
     heartbeat_interval: int = 15
     permission_mode: str = "bypassPermissions"
     auto_register: bool = True
@@ -50,6 +54,10 @@ def load_worker_config() -> WorkerConfig:
         work_dir=os.environ.get("ORCH_WORK_DIR", _default_work_dir()),
         project_root=os.environ.get("ORCH_PROJECT_ROOT", _default_project_root()),
         task_timeout=int(os.environ.get("ORCH_TASK_TIMEOUT", "900")),
+        max_turns=int(os.environ.get("ORCH_MAX_TURNS", "50")),
+        max_thinking_tokens=int(os.environ.get("ORCH_MAX_THINKING_TOKENS", "10000")),
+        task_budget_usd=float(os.environ.get("ORCH_TASK_BUDGET_USD", "0")),
+        mcp_config_path=os.environ.get("ORCH_MCP_CONFIG", ""),
         heartbeat_interval=int(os.environ.get("ORCH_HEARTBEAT_INTERVAL", "15")),
         permission_mode=os.environ.get("ORCH_PERMISSION_MODE", "bypassPermissions"),
         auto_register=os.environ.get("ORCH_AUTO_REGISTER", "1") not in ("0", "false", "False"),

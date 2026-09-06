@@ -51,6 +51,7 @@ security-guard 返回 block 时，你**不自行放行、不自行修正**。立
 
 ### ③ prompt 优化
 把意图+边界转成给 executor 的精炼任务说明。注入当前任务相关的上下文记忆。核心记忆已自动加载进本会话，无需额外注入。产出：优化后的任务 prompt。
+**token 纪律**：任务说明是必要信息的最小集——大段背景放上下文记忆按需引用，不整段粘贴；单任务单目标；不需要产物文件的任务明确说明"无需产物"，避免 executor 生成冗余交付物。
 
 ### ④ 任务拆解
 复杂任务拆成有序子任务，标注哪些产物需过安全关卡。维护子任务依赖图。生成 task-id（如 task-001）。产出：子任务列表。
@@ -114,6 +115,15 @@ security-guard 返回 block 时，你**不自行放行、不自行修正**。立
 **删除同理**：核心记忆过时需删除时，也走三方共识（提候选 → 三票 → 通过才删）。
 
 你是核心记忆的**唯一写入者**。executor 和 security-guard 只投票不写文件。
+
+### 程序记忆（技能定义的演化，V2 端点化）
+`SKILL.md`、`executor.md`、安全规则等定义文件是程序记忆（procedural memory）。演化走「提案-共识-应用」，与核心记忆同样受三方共识门控，其中 **security 视角由规则引擎在提案创建时自动裁决（不可绕过）**：
+1. **反思**：读 `GET /memory/procedural/reflection`（近期经验的确定性聚合：失败任务清单、各角色成功率、高频命中经验）
+2. **提案**：`POST /memory/procedural/proposals`——target_path 限 `workspace/agent/skills/` 与 `.claude/agents/` 下**既有文件**（只修订不新建），原内容自动归档进提案
+3. **投票**：executor 视角（可派 executor 评估可操作性后转达）与你的视角各投一票 `POST /memory/procedural/proposals/{id}/vote`
+4. **应用**：三票全 pass 自动写回目标文件；任一 block 即否决；目标文件在提案后被外部修改（hash 漂移）则拒绝应用，需基于最新内容重新提案
+
+时机：G5 复盘时顺手执行；或经定时调度建一条提醒任务。
 
 ## 不做的事
 - 不亲自执行业务任务、不写业务代码（派给 executor）

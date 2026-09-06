@@ -26,6 +26,10 @@ def _default_memory_dir() -> Path:
     return Path(__file__).resolve().parents[2] / "skills" / "orchestrator" / "memory"
 
 
+def _default_runtime_dir() -> Path:
+    return Path(__file__).resolve().parent
+
+
 @dataclass
 class Config:
     mode: str = "local"
@@ -35,12 +39,17 @@ class Config:
     task_store_dir: str = _default_task_store_dir()
     experience_store_dir: str = _default_experience_store_dir()
     schedule_store_dir: str = _default_schedule_store_dir()
+    procedural_store_dir: str = str(_default_runtime_dir() / ".procedural")
     memory_core_dir: str = str(_default_memory_dir() / "core")
     memory_context_dir: str = str(_default_memory_dir() / "context")
     experience_max_count: int = 500  # 经验库容量上限，超出按失败优先/命中少/最旧淘汰
     experience_ttl_days: int = 0  # 经验保留天数，0=不过期
     context_memory_max_chars: int = 8000  # 派发注入 context_memory 的限幅，防上下文膨胀
     security_llm: bool = False  # security-guard LLM 增强（需 brain 侧 claude-agent-sdk）
+    security_check_max_chars: int = 6000  # 产物检验合并输入限幅（LLM/规则输入封顶）
+    model_routing: str = "off"  # off | heuristic：简单 executor 任务路由到便宜模型
+    cheap_model: str = "haiku"  # 启发式命中的目标模型
+    route_max_prompt_chars: int = 400  # 启发式：prompt 不超过该长度视为简单任务
     max_retries: int = 3
     retry_base_delay: float = 1.0
     sweeper_interval: int = 15
@@ -61,12 +70,17 @@ def load_config() -> Config:
         task_store_dir=os.environ.get("ORCH_TASK_STORE_DIR", _default_task_store_dir()),
         experience_store_dir=os.environ.get("ORCH_EXPERIENCE_STORE_DIR", _default_experience_store_dir()),
         schedule_store_dir=os.environ.get("ORCH_SCHEDULE_STORE_DIR", _default_schedule_store_dir()),
+        procedural_store_dir=os.environ.get("ORCH_PROCEDURAL_STORE_DIR", str(_default_runtime_dir() / ".procedural")),
         memory_core_dir=os.environ.get("ORCH_MEMORY_CORE_DIR", str(_default_memory_dir() / "core")),
         memory_context_dir=os.environ.get("ORCH_MEMORY_CONTEXT_DIR", str(_default_memory_dir() / "context")),
         experience_max_count=int(os.environ.get("ORCH_EXPERIENCE_MAX", "500")),
         experience_ttl_days=int(os.environ.get("ORCH_EXPERIENCE_TTL_DAYS", "0")),
         context_memory_max_chars=int(os.environ.get("ORCH_CONTEXT_MEMORY_MAX", "8000")),
         security_llm=os.environ.get("ORCH_SECURITY_LLM", "0") in ("1", "true", "True"),
+        security_check_max_chars=int(os.environ.get("ORCH_SECURITY_CHECK_MAX_CHARS", "6000")),
+        model_routing=os.environ.get("ORCH_MODEL_ROUTING", "off"),
+        cheap_model=os.environ.get("ORCH_CHEAP_MODEL", "haiku"),
+        route_max_prompt_chars=int(os.environ.get("ORCH_ROUTE_MAX_PROMPT_CHARS", "400")),
         max_retries=int(os.environ.get("ORCH_MAX_RETRIES", "3")),
         retry_base_delay=float(os.environ.get("ORCH_RETRY_BASE_DELAY", "1.0")),
         sweeper_interval=int(os.environ.get("ORCH_SWEEPER_INTERVAL", "15")),

@@ -181,3 +181,89 @@ def test_dispatch_rejects_invalid_context_task_id(tmp_path):
         "context_task_ids": ["../evil"], "force": True,
     })
     assert r.status_code == 400
+
+
+# ---- token 成本优化：检验限幅与模型路由 ----
+
+def test_check_product_caps_combined_input():
+    from dispatcher import RemoteDispatcher
+    captured = {}
+
+    def product_check(content):
+        captured["len"] = len(content)
+        return {"verdict": "pass"}
+
+    def fake_http(method, url, **kw):
+        return {"status_code": 200, "json": {"content": "z" * 20000}}
+
+    d = RemoteDispatcher(task_store=None, registry=None, http_call=fake_http,
+                         product_check=product_check, check_max_chars=6000)
+    d._check_product("http://w", "task-x", "head", ["out.md"])
+    assert captured["len"] == 6000  # 全量产物不再整包送给 LLM 检验
+
+
+def make_routing_client(tmp_path, cfg_kwargs, dispatcher):
+    reg = WorkerRegistry(heartbeat_timeout=45, now_fn=lambda: 0.0)
+    store = TaskStore(str(tmp_path / "tasks"))
+    cfg = Config(mode="remote", task_store_dir=str(tmp_path / "tasks"), **cfg_kwargs)
+    app = create_brain_app(reg, store, cfg, dispatcher=dispatcher)
+    return TestClient(app)
+
+
+def test_model_routing_routes_simple_task(tmp_path):
+    class Cap(Dispatcher):
+        calls = []
+
+        def dispatch(self, role, prompt, context_memory=None, model=None):
+            Cap.calls.append(model)
+            return DispatchResult("task-r1", "done", output="ok", artifacts=[], error=None)
+
+        def redispatch(self, task_id, model=None):
+            raise KeyError(task_id)
+
+    disp = Cap()
+    client = make_routing_client(tmp_path, {"model_routing": "heuristic",
+                                            "cheap_model": "haiku"}, disp)
+    r = client.post("/dispatch", json={
+        "prompt": "修复 README 里的一个错别字", "role": "executor", "force": True})
+    assert disp.calls[-1] == "haiku"  # 短任务、无技能标记 → 便宜模型
+    assert r.json()["model"] == "haiku"
+
+
+def test_model_routing_skips_skill_and_long_tasks(tmp_path):
+    class Cap(Dispatcher):
+        calls = []
+
+        def dispatch(self, role, prompt, context_memory=None, model=None):
+            Cap.calls.append(model)
+            return DispatchResult("task-r2", "done", output="ok", artifacts=[], error=None)
+
+        def redispatch(self, task_id, model=None):
+            raise KeyError(task_id)
+
+    disp = Cap()
+    client = make_routing_client(tmp_path, {"model_routing": "heuristic"}, disp)
+    client.post("/dispatch", json={
+        "prompt": "[web-expert] 阶段：S0；任务：出 spec", "role": "executor", "force": True})
+    assert disp.calls[-1] is None  # 技能流程任务不降级
+    client.post("/dispatch", json={
+        "prompt": "长任务 " * 200, "role": "executor", "force": True})
+    assert disp.calls[-1] is None  # 超长 prompt 不降级
+
+
+def test_model_routing_respects_explicit_model(tmp_path):
+    class Cap(Dispatcher):
+        calls = []
+
+        def dispatch(self, role, prompt, context_memory=None, model=None):
+            Cap.calls.append(model)
+            return DispatchResult("task-r3", "done", output="ok", artifacts=[], error=None)
+
+        def redispatch(self, task_id, model=None):
+            raise KeyError(task_id)
+
+    disp = Cap()
+    client = make_routing_client(tmp_path, {"model_routing": "heuristic"}, disp)
+    client.post("/dispatch", json={
+        "prompt": "短任务", "role": "executor", "model": "sonnet", "force": True})
+    assert disp.calls[-1] == "sonnet"  # 显式指定优先

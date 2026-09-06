@@ -77,7 +77,8 @@ class RemoteDispatcher(Dispatcher):
                  product_check: Callable[[str], dict] | None = None,
                  experience_store: ExperienceStore | None = None,
                  memory_store: MemoryStore | None = None,
-                 max_retries: int = 0):
+                 max_retries: int = 0,
+                 check_max_chars: int = 6000):
         self.task_store = task_store
         self.registry = registry
         self.http_call = http_call  # (method, url, **kwargs) -> {"status_code", "json"}
@@ -87,6 +88,7 @@ class RemoteDispatcher(Dispatcher):
         self.experience_store = experience_store
         self.memory_store = memory_store
         self.max_retries = max_retries
+        self.check_max_chars = check_max_chars
 
     def dispatch(self, role: str, prompt: str,
                  context_memory: str | None = None, model: str | None = None) -> DispatchResult:
@@ -144,7 +146,11 @@ class RemoteDispatcher(Dispatcher):
 
     def _check_product(self, base: str, task_id: str, output: Any,
                        artifacts: list) -> dict | None:
-        """合并 output + 文本 artifacts 内容过产物检验；二进制产物跳过。"""
+        """合并 output + 文本 artifacts 内容过产物检验；二进制产物跳过。
+
+        合并输入截断到 check_max_chars：LLM 增强开启时这是直接烧钱点，
+        全量产物内容会让检验成本随产物大小线性膨胀。
+        """
         combined = output or ""
         for art in artifacts or []:
             if not is_text_artifact(art):
@@ -155,7 +161,7 @@ class RemoteDispatcher(Dispatcher):
                     combined += f"\n\n--- artifact: {art} ---\n" + ar.get("json", {}).get("content", "")
             except Exception:
                 continue
-        return self.product_check(combined)
+        return self.product_check(combined[:self.check_max_chars])
 
     def _enrich_with_experience(self, prompt: str, role: str,
                                 context_memory: str | None) -> str:

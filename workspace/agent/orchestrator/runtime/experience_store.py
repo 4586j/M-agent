@@ -28,6 +28,9 @@ class ExperienceRecord:
     created_at: str = ""
     tags: list[str] = field(default_factory=list)
     embedding: list[float] | None = None
+    hits: int = 0  # 被检索命中次数（持久化，支撑淘汰保护）
+    last_hit_at: str = ""  # 最近命中时间（epoch 秒字符串）
+    version: int = 0  # 内容修改版本号：显式 write 递增，命中计数不递增
 
 
 def _parse_ts(created_at: str) -> float:
@@ -70,7 +73,6 @@ class ExperienceStore:
         self.max_count = max_count
         self.ttl_days = ttl_days
         self._cache: list[ExperienceRecord] | None = None
-        self._hits: dict[str, int] = {}  # 内存命中计数：检索命中越多越不该被淘汰
 
     def _invalidate(self) -> None:
         self._cache = None
@@ -79,9 +81,14 @@ class ExperienceStore:
         validate_id(exp_id, "exp_id")
         return self.store_dir / f"{exp_id}.json"
 
-    def write(self, record: ExperienceRecord) -> None:
+    def _dump(self, record: ExperienceRecord) -> None:
+        """直接落盘单条记录。缓存内是同一对象，原地变更已同步，无需失效。"""
         with open(self._path(record.exp_id), "w", encoding="utf-8") as f:
             json.dump(asdict(record), f, ensure_ascii=False, indent=2)
+
+    def write(self, record: ExperienceRecord) -> None:
+        record.version = (record.version or 0) + 1
+        self._dump(record)
         self._invalidate()
         self._enforce_limits()
 
@@ -98,27 +105,36 @@ class ExperienceStore:
             expired = [r for r in recs if _parse_ts(r.created_at) < cutoff]
             for r in expired:
                 self.delete(r.exp_id)
-                self._hits.pop(r.exp_id, None)
             removed += len(expired)
             recs = [r for r in recs if r not in expired]
         if self.max_count > 0 and len(recs) > self.max_count:
             def evict_key(r: ExperienceRecord):
                 # 失败优先淘汰；同级别内命中少的先出，再按 created_at 旧的先出
                 return (0 if not r.success else 1,
-                        self._hits.get(r.exp_id, 0),
+                        r.hits,
                         _parse_ts(r.created_at))
             victims = sorted(recs, key=evict_key)[: len(recs) - self.max_count]
             for r in victims:
                 self.delete(r.exp_id)
-                self._hits.pop(r.exp_id, None)
             removed += len(victims)
         return removed
 
     def get(self, exp_id: str) -> ExperienceRecord | None:
         rec = self._get_raw(exp_id)
         if rec is not None:
-            self._hits[exp_id] = self._hits.get(exp_id, 0) + 1
+            self._touch_hits([rec])
         return rec
+
+    def _touch_hits(self, records: list[ExperienceRecord]) -> None:
+        """命中计数持久化：检索/读取命中即更新 hits 与 last_hit_at 并落盘。
+
+        淘汰策略据此保护高频经验；写入量小（每次检索 ≤ limit 条）。
+        """
+        now = str(int(time.time()))
+        for rec in records:
+            rec.hits = (rec.hits or 0) + 1
+            rec.last_hit_at = now
+            self._dump(rec)
 
     def _get_raw(self, exp_id: str) -> ExperienceRecord | None:
         if self._cache is not None:
@@ -162,7 +178,7 @@ class ExperienceStore:
 
         有 embedding_model 时两路分数用 Reciprocal Rank Fusion 融合
         （对分数尺度不敏感、实现确定）；否则降级为纯关键词。
-        命中记录累计内存命中计数，供淘汰策略保护高频经验。
+        命中记录累计持久化命中计数，供淘汰策略保护高频经验。
         """
         if not query:
             return []
@@ -181,8 +197,7 @@ class ExperienceStore:
         else:
             results = kw_ranked
         results = results[:limit]
-        for rec in results:
-            self._hits[rec.exp_id] = self._hits.get(rec.exp_id, 0) + 1
+        self._touch_hits(results)
         return results
 
     def _search_vector(self, query: str, candidates: list[ExperienceRecord],
