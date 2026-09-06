@@ -155,6 +155,79 @@ def test_running_count_reported_as_load(tmp_path):
     assert app.state.get_load() == 0
 
 
+def test_cancel_keeps_cancelled_status(tmp_path):
+    """取消竞态保护：执行体跑完后，终态保持 cancelled，不被 done 覆盖。"""
+    started = threading.Event()
+    release = threading.Event()
+
+    class SlowRunner(FakeAgentRunner):
+        def run(self, req):
+            started.set()
+            release.wait(5)
+            return super().run(req)
+
+    client = TestClient(create_worker_app(SlowRunner(work_dir=str(tmp_path)),
+                                          WorkerConfig(work_dir=str(tmp_path))))
+    client.post("/task", json={
+        "task_id": "task-1", "prompt": "p", "context_memory": "", "model": None})
+    assert started.wait(5)
+    client.post("/task/task-1/cancel")
+    release.set()
+    _wait_terminal(client, "task-1")
+    body = client.get("/task/task-1").json()
+    assert body["status"] == "cancelled"
+
+
+def test_cancel_event_propagates_to_runner(tmp_path):
+    """cancel 端点应 set runner 收到的 cancel_event（协作式退出信号）。"""
+    started = threading.Event()
+    release = threading.Event()
+    seen = {}
+
+    class EventRunner(FakeAgentRunner):
+        def run(self, req):
+            seen["event"] = req.cancel_event
+            started.set()
+            release.wait(5)
+            return super().run(req)
+
+    client = TestClient(create_worker_app(EventRunner(work_dir=str(tmp_path)),
+                                          WorkerConfig(work_dir=str(tmp_path))))
+    client.post("/task", json={
+        "task_id": "task-1", "prompt": "p", "context_memory": "", "model": None})
+    assert started.wait(5)
+    assert seen["event"] is not None and not seen["event"].is_set()
+    client.post("/task/task-1/cancel")
+    assert seen["event"].is_set()
+    release.set()
+    _wait_terminal(client, "task-1")
+
+
+def test_runner_cancelled_result_reported_as_is(tmp_path):
+    """runner 自身返回 cancelled（协作退出成功）时，状态如实上报。"""
+
+    class CoopRunner(FakeAgentRunner):
+        def run(self, req):
+            from agent_runner import TaskResult
+            return TaskResult(req.task_id, "cancelled", error="cancelled by request")
+
+    client = TestClient(create_worker_app(CoopRunner(work_dir=str(tmp_path)),
+                                          WorkerConfig(work_dir=str(tmp_path))))
+    client.post("/task", json={
+        "task_id": "task-1", "prompt": "p", "context_memory": "", "model": None})
+    _wait_terminal(client, "task-1")
+    assert client.get("/task/task-1").json()["status"] == "cancelled"
+
+
+def test_task_meta_returned(tmp_path):
+    client = make_client(tmp_path)
+    client.post("/task", json={
+        "task_id": "task-1", "prompt": "p", "context_memory": "", "model": None})
+    _wait_terminal(client, "task-1")
+    body = client.get("/task/task-1").json()
+    assert "meta" in body  # 新增的执行元信息字段（Fake 为空 dict）
+
+
 def test_register_to_brain_success():
     from worker_api import register_to_brain
     from worker_config import WorkerConfig

@@ -91,6 +91,7 @@ def create_worker_app(runner: AgentRunner, cfg: WorkerConfig) -> FastAPI:
     app = FastAPI()
     state: dict[str, TaskResult] = {}
     cancelled: set[str] = set()
+    cancel_events: dict[str, threading.Event] = {}
     lock = threading.Lock()
     state_max = int(os.environ.get("ORCH_WORKER_STATE_MAX", "1000"))
 
@@ -122,10 +123,20 @@ def create_worker_app(runner: AgentRunner, cfg: WorkerConfig) -> FastAPI:
             for tid in finished[:excess]:
                 del state[tid]
                 cancelled.discard(tid)
+                cancel_events.pop(tid, None)
 
     def _execute(body: TaskBody):
-        req = TaskRequest(body.task_id, body.prompt, body.context_memory, body.model)
+        event = threading.Event()
+        with lock:
+            cancel_events[body.task_id] = event
+        req = TaskRequest(body.task_id, body.prompt, body.context_memory,
+                          body.model, cancel_event=event)
         res = runner.run(req)
+        # cancel 竞态保护：执行期间被取消 → 终态保持 cancelled，
+        # 不被 runner 迟到的 done/failed 覆盖（产物/输出保留在 res 中备查）
+        with lock:
+            if body.task_id in cancelled:
+                res.status = "cancelled"
         _record(body.task_id, res)
 
     @app.post("/task")
@@ -157,6 +168,11 @@ def create_worker_app(runner: AgentRunner, cfg: WorkerConfig) -> FastAPI:
             res = state.get(task_id)
             if res is not None:
                 state[task_id] = TaskResult(task_id, "cancelled")
+        # 传播到执行体：runner 在消息/turn 边界协作退出
+        with lock:
+            ev = cancel_events.get(task_id)
+        if ev is not None:
+            ev.set()
         return {"task_id": task_id, "status": "cancelled"}
 
     @app.get("/task/{task_id}")
@@ -169,6 +185,7 @@ def create_worker_app(runner: AgentRunner, cfg: WorkerConfig) -> FastAPI:
             "task_id": res.task_id, "status": res.status,
             "output": res.output, "artifacts": res.artifacts,
             "error": res.error, "memory_candidates": res.memory_candidates,
+            "meta": res.meta,
         }
 
     @app.get("/artifact/{task_id}")
@@ -215,7 +232,9 @@ def _build_app():
     runner_kind = os.environ.get("ORCH_RUNNER", "fake").lower()
     if runner_kind == "sdk":
         runner = SdkAgentRunner(work_dir=cfg.work_dir, executor_def_path=cfg.executor_def_path,
-                                permission_mode=cfg.permission_mode)
+                                permission_mode=cfg.permission_mode,
+                                project_root=cfg.project_root,
+                                task_timeout=cfg.task_timeout)
     else:
         runner = FakeAgentRunner(work_dir=cfg.work_dir)
     app = create_worker_app(runner, cfg)

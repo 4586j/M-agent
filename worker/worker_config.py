@@ -16,6 +16,11 @@ def _default_executor_def() -> str:
     return str(_HERE.parent / ".claude" / "agents" / "executor.md")
 
 
+def _default_project_root() -> str:
+    """项目根（worker/ 的上一级），executor 据此定位 skills 等资产。"""
+    return str(_HERE.parent)
+
+
 @dataclass
 class WorkerConfig:
     brain_url: str = "http://127.0.0.1:7000"
@@ -25,6 +30,8 @@ class WorkerConfig:
     listen_port: int = 8000
     executor_def_path: str = _default_executor_def()
     work_dir: str = _default_work_dir()
+    project_root: str = _default_project_root()
+    task_timeout: int = 900
     heartbeat_interval: int = 15
     permission_mode: str = "bypassPermissions"
     auto_register: bool = True
@@ -41,6 +48,8 @@ def load_worker_config() -> WorkerConfig:
         listen_port=int(os.environ.get("ORCH_WORKER_PORT", "8000")),
         executor_def_path=os.environ.get("ORCH_EXECUTOR_DEF", _default_executor_def()),
         work_dir=os.environ.get("ORCH_WORK_DIR", _default_work_dir()),
+        project_root=os.environ.get("ORCH_PROJECT_ROOT", _default_project_root()),
+        task_timeout=int(os.environ.get("ORCH_TASK_TIMEOUT", "900")),
         heartbeat_interval=int(os.environ.get("ORCH_HEARTBEAT_INTERVAL", "15")),
         permission_mode=os.environ.get("ORCH_PERMISSION_MODE", "bypassPermissions"),
         auto_register=os.environ.get("ORCH_AUTO_REGISTER", "1") not in ("0", "false", "False"),
