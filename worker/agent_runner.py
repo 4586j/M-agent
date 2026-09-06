@@ -91,15 +91,20 @@ def scan_skills(project_root: str) -> list[dict]:
     return skills
 
 
-def build_env_block(task_dir: Path, project_root: str, skills: list[dict]) -> str:
-    """运行环境注入块：告诉 executor 它在哪、技能在哪（绝对路径）。
-    executor.md 中的相对路径从任务工作目录出发不可达，以本块为准。"""
+def build_env_block(project_root: str, skills: list[dict]) -> str:
+    """运行环境注入块：告诉 executor 项目根与技能位置（绝对路径）。
+
+    只含**跨任务稳定**的内容（技能清单不随任务变），拼在 system prompt
+    末尾可让前缀缓存跨任务复用；任务工作目录是每任务变化的信息，
+    必须放用户消息（见 run()），不能进 system prompt。
+    executor.md 中的相对路径从任务工作目录出发不可达，以本块为准。
+    """
     lines = [
         "",
         "---",
         "## 运行环境（worker 注入，路径以本块为准）",
-        f"- 当前工作目录（你的任务工作区，所有产物写到这里）：{task_dir.resolve()}",
         f"- 项目根（技能资产所在，只读）：{Path(project_root).resolve()}",
+        "- 当前任务的工作目录见任务消息开头的「任务工作目录」，所有产物写到那里",
     ]
     if skills:
         lines.append("- 可用技能（调用时一律用下列绝对路径）：")
@@ -156,12 +161,12 @@ class SdkAgentRunner(AgentRunner):
         task_dir = self.work_dir / req.task_id
         task_dir.mkdir(parents=True, exist_ok=True)
 
-        full_prompt = req.prompt
+        full_prompt = f"[任务工作目录（所有产物写到这里）]\n{task_dir.resolve()}"
         if req.context_memory:
-            full_prompt = f"[上下文记忆]\n{req.context_memory}\n\n[任务]\n{req.prompt}"
+            full_prompt += f"\n\n[上下文记忆]\n{req.context_memory}"
+        full_prompt += f"\n\n[任务]\n{req.prompt}"
 
-        env_block = build_env_block(task_dir, self.project_root,
-                                    scan_skills(self.project_root))
+        env_block = build_env_block(self.project_root, scan_skills(self.project_root))
         options = sdk.ClaudeAgentOptions(
             cwd=str(task_dir),
             model=req.model or meta["model"],

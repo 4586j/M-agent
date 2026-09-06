@@ -21,6 +21,11 @@ def _default_schedule_store_dir() -> str:
     return str(Path(__file__).resolve().parent / ".schedules")
 
 
+def _default_memory_dir() -> Path:
+    """定位框架约定的记忆目录（skills/orchestrator/memory/），与 V1 主会话共用一套。"""
+    return Path(__file__).resolve().parents[2] / "skills" / "orchestrator" / "memory"
+
+
 @dataclass
 class Config:
     mode: str = "local"
@@ -30,6 +35,11 @@ class Config:
     task_store_dir: str = _default_task_store_dir()
     experience_store_dir: str = _default_experience_store_dir()
     schedule_store_dir: str = _default_schedule_store_dir()
+    memory_core_dir: str = str(_default_memory_dir() / "core")
+    memory_context_dir: str = str(_default_memory_dir() / "context")
+    experience_max_count: int = 500  # 经验库容量上限，超出按失败优先/命中少/最旧淘汰
+    experience_ttl_days: int = 0  # 经验保留天数，0=不过期
+    context_memory_max_chars: int = 8000  # 派发注入 context_memory 的限幅，防上下文膨胀
     security_llm: bool = False  # security-guard LLM 增强（需 brain 侧 claude-agent-sdk）
     max_retries: int = 3
     retry_base_delay: float = 1.0
@@ -51,6 +61,11 @@ def load_config() -> Config:
         task_store_dir=os.environ.get("ORCH_TASK_STORE_DIR", _default_task_store_dir()),
         experience_store_dir=os.environ.get("ORCH_EXPERIENCE_STORE_DIR", _default_experience_store_dir()),
         schedule_store_dir=os.environ.get("ORCH_SCHEDULE_STORE_DIR", _default_schedule_store_dir()),
+        memory_core_dir=os.environ.get("ORCH_MEMORY_CORE_DIR", str(_default_memory_dir() / "core")),
+        memory_context_dir=os.environ.get("ORCH_MEMORY_CONTEXT_DIR", str(_default_memory_dir() / "context")),
+        experience_max_count=int(os.environ.get("ORCH_EXPERIENCE_MAX", "500")),
+        experience_ttl_days=int(os.environ.get("ORCH_EXPERIENCE_TTL_DAYS", "0")),
+        context_memory_max_chars=int(os.environ.get("ORCH_CONTEXT_MEMORY_MAX", "8000")),
         security_llm=os.environ.get("ORCH_SECURITY_LLM", "0") in ("1", "true", "True"),
         max_retries=int(os.environ.get("ORCH_MAX_RETRIES", "3")),
         retry_base_delay=float(os.environ.get("ORCH_RETRY_BASE_DELAY", "1.0")),

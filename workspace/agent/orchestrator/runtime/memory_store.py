@@ -17,6 +17,17 @@ class MemoryStore(ABC):
     @abstractmethod
     def write_context(self, task_id: str, key: str, value: str) -> None: ...
 
+    # 列举/归档为可选能力，默认空实现，便于自定义实现渐进接入
+    def list_core(self) -> list[str]:
+        return []
+
+    def list_context(self, task_id: str) -> list[str]:
+        return []
+
+    def delete_context(self, task_id: str) -> bool:
+        """归档清理整个任务的上下文记忆。返回是否有删除动作。"""
+        return False
+
 
 class FileMemoryStore(MemoryStore):
     def __init__(self, core_dir: str, context_dir: str):
@@ -56,3 +67,27 @@ class FileMemoryStore(MemoryStore):
         d = self.context_dir / task_id
         d.mkdir(parents=True, exist_ok=True)
         (d / f"{key}.md").write_text(value, encoding="utf-8")
+
+    def list_core(self) -> list[str]:
+        if not self.core_dir.is_dir():
+            return []
+        return sorted(p.stem for p in self.core_dir.glob("*.md"))
+
+    def list_context(self, task_id: str) -> list[str]:
+        validate_id(task_id, "task_id")
+        d = self.context_dir / task_id
+        if not d.is_dir():
+            return []
+        return sorted(p.stem for p in d.glob("*.md"))
+
+    def delete_context(self, task_id: str) -> bool:
+        """归档清理整个任务的上下文目录（任务结束约定）。"""
+        validate_id(task_id, "task_id")
+        d = self.context_dir / task_id
+        if not d.is_dir():
+            return False
+        for p in d.iterdir():
+            if p.is_file():
+                p.unlink()
+        d.rmdir()
+        return True

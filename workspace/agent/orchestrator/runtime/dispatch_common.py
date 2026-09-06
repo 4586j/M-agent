@@ -1,7 +1,9 @@
 """dispatcher 与 async_dispatcher 共享的工具函数。"""
 from pathlib import Path
+from typing import Any
 
 from experience_store import ExperienceStore
+from memory_store import MemoryStore
 
 _TEXT_ARTIFACT_EXT = {".md", ".txt", ".py", ".json", ".yaml", ".yml", ".sh",
                       ".ts", ".tsx", ".js", ".jsx", ".csv", ".log", ".ini",
@@ -10,6 +12,62 @@ _TEXT_ARTIFACT_EXT = {".md", ".txt", ".py", ".json", ".yaml", ".yml", ".sh",
 
 def is_text_artifact(path: str) -> bool:
     return Path(path).suffix.lower() in _TEXT_ARTIFACT_EXT
+
+
+def clamp_context(text: str | None, max_chars: int) -> str:
+    """context_memory 限幅：超长截断并标注。
+
+    上下文是注意力预算内的稀缺资源，无界注入会拖垮长任务召回
+    （context rot）并放大 token 成本；保头部（约定/规范类内容通常在前）。
+    """
+    if not text or max_chars <= 0 or len(text) <= max_chars:
+        return text or ""
+    return (f"{text[:max_chars]}\n\n"
+            f"[context_memory 已截断：原始 {len(text)} 字符，保留前 {max_chars}]")
+
+
+def write_result_note(memory_store: MemoryStore | None, task_id: str,
+                      status: str, output: Any, error: Any) -> None:
+    """任务终态时自动写入上下文记忆 result 笔记。
+
+    让 V2 的上下文记忆落库（此前只有 V1 主会话约定），后续任务可在
+    派发时按 task-id 引用这些过程信息。失败静默，不拖垮派发主流程。
+    """
+    if memory_store is None:
+        return
+    out_head = str(output)[:800] if output else ""
+    lines = [f"status: {status}"]
+    if out_head:
+        lines.append(f"output(前800字):\n{out_head}")
+    if error:
+        lines.append(f"error: {str(error)[:300]}")
+    try:
+        memory_store.write_context(task_id, "result", "\n".join(lines))
+    except Exception:
+        pass
+
+
+def assemble_context(memory_store: MemoryStore, base: str | None,
+                     task_ids: list[str], per_task_chars: int = 2000) -> str:
+    """把引用任务的上下文记忆笔记并入本次派发的 context_memory。
+
+    每个任务一个块，块内各笔记截断到 per_task_chars，整体再由
+    clamp_context 限幅。无效 task_id 抛 ValueError（由端点转 400）。
+    """
+    blocks: list[str] = []
+    for tid in task_ids:
+        keys = memory_store.list_context(tid)
+        if not keys:
+            continue
+        lines = [f"[历史任务上下文 {tid}]"]
+        for k in keys:
+            content = memory_store.read_context(tid, k) or ""
+            lines.append(f"- {k}: {content[:per_task_chars]}")
+        blocks.append("\n".join(lines))
+    if not blocks:
+        return base or ""
+    joined = "\n\n".join(blocks)
+    return f"{base}\n\n{joined}" if base else joined
 
 
 def enrich_experience(experience_store: ExperienceStore | None,

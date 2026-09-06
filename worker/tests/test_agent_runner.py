@@ -46,10 +46,10 @@ def test_scan_skills_empty_dir(tmp_path):
 
 def test_build_env_block_lists_skills_with_abs_paths(tmp_path):
     skills = scan_skills(PROJECT_ROOT)
-    block = build_env_block(tmp_path, PROJECT_ROOT, skills)
+    block = build_env_block(PROJECT_ROOT, skills)
     assert "运行环境" in block
-    assert str(tmp_path.resolve()) in block          # 任务工作区
     assert str(Path(PROJECT_ROOT).resolve()) in block  # 项目根
+    assert str(tmp_path) not in block  # 任务目录不得进 system prompt（KV-cache 稳定）
     for s in skills:
         assert s["name"] in block
         assert s["path"] in block
@@ -57,7 +57,7 @@ def test_build_env_block_lists_skills_with_abs_paths(tmp_path):
 
 def _install_fake_sdk(monkeypatch, results, delay=0.0):
     """注入假 claude_agent_sdk：results 为 ResultMessage 参数字典列表。
-    捕获传入的 options 供断言。返回捕获容器。"""
+    捕获传入的 prompt 与 options 供断言。返回捕获容器。"""
     captured = {}
 
     class ClaudeAgentOptions:
@@ -70,6 +70,8 @@ def _install_fake_sdk(monkeypatch, results, delay=0.0):
                 setattr(self, k, v)
 
     def query(prompt, options):
+        captured["prompt"] = prompt
+
         async def gen():
             import asyncio
             for i, _ in enumerate(results):
@@ -98,7 +100,12 @@ def test_sdk_runner_injects_env_block_into_system_prompt(tmp_path, monkeypatch):
     assert res.status == "done"
     assert "运行环境" in captured["system_prompt"]
     assert "web-expert" in captured["system_prompt"]
-    assert captured["cwd"] == str(tmp_path / "task-env")
+    task_dir = str(tmp_path / "task-env")
+    # KV-cache：任务目录是每任务变化的信息，只能进用户消息，不得进 system prompt
+    assert task_dir not in captured["system_prompt"]
+    assert task_dir in captured["prompt"]
+    assert "先读 tokens" in captured["prompt"]
+    assert captured["cwd"] == task_dir
 
 
 def test_sdk_runner_is_error_maps_to_failed(tmp_path, monkeypatch):

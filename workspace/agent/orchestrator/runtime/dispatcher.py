@@ -5,10 +5,11 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from dispatch_common import is_text_artifact, enrich_experience
+from dispatch_common import is_text_artifact, enrich_experience, write_result_note
 from task_store import TaskStore, TaskRecord
 from worker_registry import WorkerRegistry
 from experience_store import ExperienceStore
+from memory_store import MemoryStore
 
 _POLL_MAX = 1000  # 轮询上限，防死循环
 
@@ -75,6 +76,7 @@ class RemoteDispatcher(Dispatcher):
                  select_strategy: str = "round_robin",
                  product_check: Callable[[str], dict] | None = None,
                  experience_store: ExperienceStore | None = None,
+                 memory_store: MemoryStore | None = None,
                  max_retries: int = 0):
         self.task_store = task_store
         self.registry = registry
@@ -83,6 +85,7 @@ class RemoteDispatcher(Dispatcher):
         self.select_strategy = select_strategy
         self.product_check = product_check
         self.experience_store = experience_store
+        self.memory_store = memory_store
         self.max_retries = max_retries
 
     def dispatch(self, role: str, prompt: str,
@@ -130,6 +133,8 @@ class RemoteDispatcher(Dispatcher):
                         output=out, success=(st == "done"),
                         verdict=verdict, artifacts=arts, created_at=ts,
                     )
+                write_result_note(self.memory_store, task_id, st, out,
+                                  data.get("error"))
                 return DispatchResult(
                     task_id, st, out, arts, data.get("error"), verdict,
                 )

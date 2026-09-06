@@ -15,12 +15,14 @@ from async_dispatcher import AsyncRemoteDispatcher
 from config import Config
 from security_guard import check_with_llm as security_check
 from experience_store import ExperienceStore
+from memory_store import FileMemoryStore, MemoryStore
 from retry_manager import RetryManager
 from embedding_model import create_embedding_model
 from schedule_store import ScheduleStore, ScheduleRecord, compute_next_run
 from task_scheduler import TaskScheduler
 from auth import add_auth_middleware
 from safe_id import validate_id, validate_host
+from dispatch_common import clamp_context, assemble_context
 
 
 class RegisterReq(BaseModel):
@@ -42,6 +44,11 @@ class DispatchReq(BaseModel):
     context_memory: str | None = None
     model: str | None = None
     force: bool = False  # 跳过 security-guard 检验，用于放行 block 指令
+    context_task_ids: list[str] = []  # 引用历史任务的上下文记忆笔记，并入本次派发
+
+
+class MemoryWriteReq(BaseModel):
+    content: str
 
 
 class RedispatchReq(BaseModel):
@@ -80,6 +87,7 @@ def _default_web_dist() -> str:
 def create_brain_app(registry: WorkerRegistry, task_store: TaskStore, cfg: Config,
                      dispatcher: Dispatcher | None = None,
                      experience_store: ExperienceStore | None = None,
+                     memory_store: MemoryStore | None = None,
                      retry_manager: RetryManager | None = None,
                      schedule_store: ScheduleStore | None = None,
                      task_scheduler: TaskScheduler | None = None,
@@ -213,9 +221,13 @@ def create_brain_app(registry: WorkerRegistry, task_store: TaskStore, cfg: Confi
             if v["verdict"] == "block":
                 return {"status": "blocked", "verdict": v, "task_id": None,
                         "output": None, "artifacts": [], "error": None}
+        context = req.context_memory
+        if memory_store is not None and req.context_task_ids:
+            context = assemble_context(memory_store, context, req.context_task_ids)
+        context = clamp_context(context, cfg.context_memory_max_chars)
         try:
             res = dispatcher.dispatch(role=req.role, prompt=req.prompt,
-                                      context_memory=req.context_memory, model=req.model)
+                                      context_memory=context or None, model=req.model)
         except RuntimeError as e:
             return {"status": "failed", "error": str(e)}
         return {
@@ -232,10 +244,14 @@ def create_brain_app(registry: WorkerRegistry, task_store: TaskStore, cfg: Confi
             v = security_check(req.prompt, use_llm=cfg.security_llm)
             if v["verdict"] == "block":
                 return {"status": "blocked", "verdict": v, "task_id": None}
+        context = req.context_memory
+        if memory_store is not None and req.context_task_ids:
+            context = assemble_context(memory_store, context, req.context_task_ids)
+        context = clamp_context(context, cfg.context_memory_max_chars)
         try:
             task_id = await async_dispatcher.dispatch_async(
                 role=req.role, prompt=req.prompt,
-                context_memory=req.context_memory, model=req.model,
+                context_memory=context or None, model=req.model,
             )
         except RuntimeError as e:
             return {"status": "failed", "error": str(e)}
@@ -281,6 +297,62 @@ def create_brain_app(registry: WorkerRegistry, task_store: TaskStore, cfg: Confi
             "experience_total": exp_count,
             "recent_tasks": [asdict(r) for r in recent],
         }
+
+    # ---- 记忆管理（V2 接线：此前 MemoryStore 只有抽象无调用方） ----
+    # core 为持久记忆（写入门控由大脑流程负责：V1 三方共识 / 用户显式操作）
+    @app.get("/memory/core")
+    def list_core_memories():
+        if memory_store is None:
+            raise HTTPException(status_code=400, detail="memory_store 未配置")
+        names = memory_store.list_core()
+        return {"memories": [{"name": n, "content": memory_store.read_core(n)}
+                             for n in names]}
+
+    @app.get("/memory/core/{name}")
+    def get_core_memory(name: str):
+        if memory_store is None:
+            raise HTTPException(status_code=400, detail="memory_store 未配置")
+        content = memory_store.read_core(name)
+        if content is None:
+            raise HTTPException(status_code=404, detail="memory not found")
+        return {"name": name, "content": content}
+
+    @app.put("/memory/core/{name}")
+    def put_core_memory(name: str, req: MemoryWriteReq):
+        if memory_store is None:
+            raise HTTPException(status_code=400, detail="memory_store 未配置")
+        memory_store.write_core(name, req.content)
+        return {"status": "written", "name": name}
+
+    @app.delete("/memory/core/{name}")
+    def delete_core_memory(name: str):
+        if memory_store is None:
+            raise HTTPException(status_code=400, detail="memory_store 未配置")
+        memory_store.delete_core(name)
+        return {"status": "deleted", "name": name}
+
+    @app.get("/memory/context/{task_id}")
+    def get_context_memory(task_id: str):
+        if memory_store is None:
+            raise HTTPException(status_code=400, detail="memory_store 未配置")
+        notes = {k: memory_store.read_context(task_id, k)
+                 for k in memory_store.list_context(task_id)}
+        return {"task_id": task_id, "notes": notes}
+
+    @app.put("/memory/context/{task_id}/{key}")
+    def put_context_memory(task_id: str, key: str, req: MemoryWriteReq):
+        if memory_store is None:
+            raise HTTPException(status_code=400, detail="memory_store 未配置")
+        memory_store.write_context(task_id, key, req.content)
+        return {"status": "written", "task_id": task_id, "key": key}
+
+    @app.delete("/memory/context/{task_id}")
+    def archive_context_memory(task_id: str):
+        """任务结束归档清理该任务的全部上下文记忆。"""
+        if memory_store is None:
+            raise HTTPException(status_code=400, detail="memory_store 未配置")
+        archived = memory_store.delete_context(task_id)
+        return {"status": "archived" if archived else "noop", "task_id": task_id}
 
     @app.get("/experiences")
     def list_experiences(role: str | None = None, successful_only: bool = True):
@@ -447,7 +519,10 @@ def _build_app() -> FastAPI:
     registry = WorkerRegistry(heartbeat_timeout=cfg.heartbeat_timeout)
     store = TaskStore(cfg.task_store_dir)
     emb_model = create_embedding_model()
-    exp_store = ExperienceStore(cfg.experience_store_dir, embedding_model=emb_model)
+    exp_store = ExperienceStore(cfg.experience_store_dir, embedding_model=emb_model,
+                                max_count=cfg.experience_max_count,
+                                ttl_days=cfg.experience_ttl_days)
+    mem_store = FileMemoryStore(cfg.memory_core_dir, cfg.memory_context_dir)
     dispatcher = None
     retry_mgr = None
     async_disp = None
@@ -462,11 +537,13 @@ def _build_app() -> FastAPI:
                                       http_call=http_call, select_strategy=strategy,
                                       product_check=product_check,
                                       experience_store=exp_store,
+                                      memory_store=mem_store,
                                       max_retries=cfg.max_retries)
         async_disp = AsyncRemoteDispatcher(
             task_store=store, registry=registry,
             async_http=async_http_call, select_strategy=strategy,
             product_check=product_check, experience_store=exp_store,
+            memory_store=mem_store,
             max_retries=cfg.max_retries,
             poll_interval=cfg.async_poll_interval,
             poll_max=cfg.async_poll_max,
@@ -481,7 +558,8 @@ def _build_app() -> FastAPI:
         scheduler = TaskScheduler(schedule_store=sched_store, dispatcher=dispatcher)
         scheduler.start()
     return create_brain_app(registry, store, cfg, dispatcher=dispatcher,
-                            experience_store=exp_store, retry_manager=retry_mgr,
+                            experience_store=exp_store, memory_store=mem_store,
+                            retry_manager=retry_mgr,
                             schedule_store=sched_store, task_scheduler=scheduler,
                             async_dispatcher=async_disp)
 

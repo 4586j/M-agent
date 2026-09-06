@@ -242,5 +242,51 @@ def test_vector_search_skips_records_without_embedding(tmp_path):
     store.write(rec1)
 
     results = store.search("analyze data")
-    assert len(results) == 1
+    # 混合检索语义：exp-1 双通道命中 RRF 排名最高；exp-2 无向量仍可经关键词通道召回
     assert results[0].exp_id == "exp-1"
+    assert {r.exp_id for r in results} == {"exp-1", "exp-2"}
+
+
+def test_capacity_eviction_failed_first(tmp_path):
+    store = ExperienceStore(str(tmp_path), max_count=2)
+    store.write(make_exp("exp-f1", prompt="f1", success=False))
+    store.write(make_exp("exp-s1", prompt="s1"))
+    store.write(make_exp("exp-s2", prompt="s2"))  # 触发淘汰
+    ids = {r.exp_id for r in store.list_all()}
+    assert "exp-f1" not in ids  # 失败经验最先被淘汰
+    assert {"exp-s1", "exp-s2"} <= ids
+
+
+def test_capacity_eviction_protects_hit_records(tmp_path):
+    store = ExperienceStore(str(tmp_path), max_count=2)
+    store.write(make_exp("exp-hot", prompt="hot topic data"))
+    store.write(make_exp("exp-cold", prompt="cold topic data"))
+    store.search("hot unique")  # 仅命中 exp-hot（cold 共享 topic/data 会误命中）
+    store.write(make_exp("exp-new", prompt="new topic data"))  # 触发淘汰
+    ids = {r.exp_id for r in store.list_all()}
+    assert len(ids) == 2
+    assert "exp-hot" in ids  # 命中多的被保护
+    assert "exp-cold" not in ids
+
+
+def test_ttl_purges_expired(tmp_path):
+    import time as _t
+    store = ExperienceStore(str(tmp_path), ttl_days=1)
+    old = make_exp("exp-old", prompt="old")
+    old.created_at = str(int(_t.time()) - 2 * 86400)  # 两天前
+    store.write(old)
+    fresh = make_exp("exp-new", prompt="new")
+    fresh.created_at = str(int(_t.time()))  # make_exp 默认 t0 会被视为 1970 过期
+    store.write(fresh)
+    ids = {r.exp_id for r in store.list_all()}
+    assert "exp-old" not in ids
+    assert "exp-new" in ids
+
+
+def test_search_tracks_hits(tmp_path):
+    store = ExperienceStore(str(tmp_path))
+    store.write(make_exp("exp-1", prompt="analyze data"))
+    store.search("analyze data")
+    assert store._hits["exp-1"] == 1
+    store.search("analyze data")
+    assert store._hits["exp-1"] == 2

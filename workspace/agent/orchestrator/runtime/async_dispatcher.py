@@ -8,7 +8,8 @@ from typing import Any, Awaitable, Callable
 from task_store import TaskStore, TaskRecord
 from worker_registry import WorkerRegistry
 from experience_store import ExperienceStore
-from dispatch_common import is_text_artifact, enrich_experience
+from memory_store import MemoryStore
+from dispatch_common import is_text_artifact, enrich_experience, write_result_note
 
 log = logging.getLogger(__name__)
 
@@ -31,6 +32,7 @@ class AsyncRemoteDispatcher:
         select_strategy: str = "round_robin",
         product_check: Callable[[str], dict] | None = None,
         experience_store: ExperienceStore | None = None,
+        memory_store: MemoryStore | None = None,
         max_retries: int = 0,
         poll_interval: float = 1.0,
         poll_max: int = 600,
@@ -43,6 +45,7 @@ class AsyncRemoteDispatcher:
         self.select_strategy = select_strategy
         self.product_check = product_check
         self.experience_store = experience_store
+        self.memory_store = memory_store
         self.max_retries = max_retries
         self.poll_interval = poll_interval
         self.poll_max = poll_max
@@ -143,6 +146,7 @@ class AsyncRemoteDispatcher:
                 output=out, success=(st == "done"),
                 verdict=verdict, artifacts=arts, created_at=ts,
             )
+        write_result_note(self.memory_store, task_id, st, out, err)
         self._tasks.pop(task_id, None)
 
     def _worker_base(self, worker_id: str) -> str:
