@@ -1,6 +1,6 @@
 ---
 name: executor
-description: 执行 agent。完成大脑下发的子任务，产出代码/文件/结论。可调用 data-expert 等技能。
+description: 执行 agent。完成大脑下发的子任务，产出代码/文件/结论。可调用 data-expert、web-expert、back-expert 等技能。
 model: sonnet
 ---
 
@@ -13,8 +13,17 @@ model: sonnet
 
 ## 可用能力
 - 全部工具（Read/Write/Edit/Bash/Glob/Grep 等）
+- **路径约定**：V2 worker 派发时，system prompt 末尾带「运行环境」块（worker 注入），列出任务工作区与各技能的**绝对路径**——技能调用一律以该块为准；V1 本地模式则以项目根的相对路径为准（下同）
 - 数据分析任务：优先调用 data-expert 技能；若技能调用不可用，直接运行：
   `python workspace/agent/skills/data-expert/run_analysis.py --file <路径>`
+- 前端页面任务（大脑派发 prompt 带 `[web-expert]` 标记）：按 web-expert 技能执行——先读
+  `workspace/agent/skills/web-expert/SKILL.md` 与 `AGENTS.md`，再按 `workflow/pipeline.md`
+  当前阶段工作、对照 `workflow/gates.md` 卡点自检；产出写 `web-expert/output/<项目名>/`；
+  任务收尾按 AGENTS.md 第 4 节回写 `knowledge/` 积累池
+- 后端服务任务（大脑派发 prompt 带 `[back-expert]` 标记）：按 back-expert 技能执行——先读
+  `workspace/agent/skills/back-expert/SKILL.md` 与 `AGENTS.md`，再按 `workflow/pipeline.md`
+  当前阶段工作、对照 `workflow/gates.md` 卡点自检；契约冻结后变更必走记录；
+  产出写 `back-expert/output/<项目名>/`；任务收尾按 AGENTS.md 第 4 节回写 `knowledge/` 积累池
 
 ## 工作要求
 - 严格按大脑下发的任务说明执行，不自行扩大范围

@@ -1,0 +1,209 @@
+{
+  "$comment": "机读工具清单。AI 选型时按任务所处流水线阶段(stages: S0-S5)过滤 categories[].tools[]。新增工具必须登记到对应分类并注明 when 与 ai_access。标 [可选] 的条目按团队技术栈裁剪。",
+  "version": "2026-09-05",
+  "categories": [
+    {
+      "id": "research-model",
+      "name": "调研与建模",
+      "stages": ["S0", "S1"],
+      "tools": [
+        {
+          "name": "WebSearch / WebFetch",
+          "when": "宪法 P11：spec/架构/契约产出前的外部调研（同类系统、选型证据、已知坑）",
+          "ai_access": "AI 直接执行，发现落盘 knowledge/research/",
+          "alternatives": [],
+          "notes": "调研笔记必须被后续产出引用才有效"
+        },
+        {
+          "name": "Mermaid / Excalidraw",
+          "when": "S1 架构图、时序图、领域模型图",
+          "ai_access": "AI 生成文本图表直接入 02-架构说明.md",
+          "alternatives": ["draw.io", "ProcessOn"],
+          "notes": "文本化图表可进版本库，优先于截图"
+        }
+      ]
+    },
+    {
+      "id": "api-design",
+      "name": "API 契约设计与 Mock",
+      "stages": ["S2"],
+      "tools": [
+        {
+          "name": "OpenAPI 3.x（YAML/JSON）",
+          "when": "S2 接口契约的标准格式；契约冻结后是前后端的法律合同（API-First）",
+          "ai_access": "AI 按 contract-from-spec.md 模板生成；可用 swagger-cli/ajv 校验",
+          "alternatives": ["Markdown 契约表（小项目简化方案，结构仍按 03-契约定义 要求）"],
+          "notes": "G2b 卡点依赖：响应结构必须与 conventions 一致"
+        },
+        {
+          "name": "Prism / MSW",
+          "when": "契约冻结后立刻给前端提供 Mock 服务，前后端并行开发",
+          "ai_access": "AI 用 OpenAPI 文件启动 Prism：prism mock openapi.yaml",
+          "alternatives": ["Apifox Mock", "Postman Mock Server"],
+          "notes": "API-First 并行开发收益的关键执行手段"
+        },
+        {
+          "name": "Postman / Apifox",
+          "when": "接口调试、集合管理、S4 联调与自动化用例",
+          "ai_access": "集合可导入导出；配合 MCP 可让 AI 直接调用",
+          "alternatives": ["Hoppscotch（轻量开源）", "curl + http 文件"],
+          "notes": "用例集合入版本库，回归复用"
+        }
+      ]
+    },
+    {
+      "id": "framework",
+      "name": "后端框架",
+      "stages": ["S1", "S3"],
+      "tools": [
+        {
+          "name": "Node.js：NestJS / Express / Fastify",
+          "when": "默认栈（与前端工作流同语言，AI 生成质量稳定）；NestJS 适合中大型（自带分层与 DI）",
+          "ai_access": "AI 直接生成与维护",
+          "alternatives": [],
+          "notes": "[可选] 新项目默认 NestJS（分层清晰利于 P2/P5），轻量工具类服务用 Fastify"
+        },
+        {
+          "name": "Go：Gin / Echo",
+          "when": "高并发、资源敏感服务",
+          "ai_access": "AI 直接生成与维护",
+          "alternatives": [],
+          "notes": "[可选] 用户指定或性能需求明确时选"
+        },
+        {
+          "name": "Java：Spring Boot",
+          "when": "企业级、团队已有 Java 生态",
+          "ai_access": "AI 直接生成与维护",
+          "alternatives": ["Python：FastAPI（AI/数据向服务）"],
+          "notes": "[可选] 按团队既有生态选，不强制统一"
+        }
+      ]
+    },
+    {
+      "id": "client-engine",
+      "name": "客户端与游戏引擎",
+      "stages": ["S1", "S3"],
+      "tools": [
+        {
+          "name": "Cocos Creator 3.8.x LTS",
+          "when": "跨端 2D 游戏/互动应用：一套 TypeScript 工程构建到 Web Mobile / Web Desktop / 微信小游戏 / Android / iOS；需要 canvas 渲染、帧动画、图集合批、分层换装时优先",
+          "ai_access": "AI 直接生成与维护 assets/scripts 下的 TypeScript 业务代码；场景与预制体的可视化编辑需人工在编辑器完成，AI 侧以可在浏览器预览中核对的行为断言验收",
+          "alternatives": ["Taro / uni-app（UI 组件驱动，适合小程序而非游戏）", "Phaser / PixiJS（Web-only 轻量渲染）", "Unity（重型，WebGL 包体大）"],
+          "notes": "构建面板配置是平台相关的，切平台必须重新核对；微信小游戏主包 4MB 限制靠功能裁剪 + 分离引擎 + 初始场景分包 + 远程资源解决；真机必须 wss + ICP 备案域名（IP 不可用）。登记自 pet-game 项目（ADR-003）"
+        }
+      ]
+    },
+    {
+      "id": "database",
+      "name": "数据库与迁移",
+      "stages": ["S1", "S2", "S3"],
+      "tools": [
+        {
+          "name": "PostgreSQL",
+          "when": "默认主数据库（事务/JSONB/全文检索兼顾）",
+          "ai_access": "AI 生成 schema 与迁移；可经 Postgres MCP 直连查询验证",
+          "alternatives": ["MySQL（团队已有运维经验时）", "SQLite（本地原型/单机小工具）"],
+          "notes": "决策示例见 decisions/TEMPLATE.md"
+        },
+        {
+          "name": "迁移工具（Prisma / TypeORM migrations / Flyway / golang-migrate）",
+          "when": "所有表结构变更走脚本（G3/G4 检查项），禁止手工改表",
+          "ai_access": "AI 生成迁移脚本并验证可重放",
+          "alternatives": [],
+          "notes": "选型随框架定，登记进 ADR"
+        },
+        {
+          "name": "Redis",
+          "when": "缓存/分布式锁/限速（patterns 第 5 组与幂等场景）",
+          "ai_access": "AI 生成客户端封装并登记进 registry",
+          "alternatives": [],
+          "notes": "[可选] 确有需要再引入，避免过早优化"
+        }
+      ]
+    },
+    {
+      "id": "quality",
+      "name": "测试与走查",
+      "stages": ["S3", "S4"],
+      "tools": [
+        {
+          "name": "测试框架（Jest/Vitest、pytest、JUnit+Mockito）",
+          "when": "S3 测试先行（TDD）与 G3 单测卡点",
+          "ai_access": "AI 编写并执行测试，输出作为完成定义证据",
+          "alternatives": [],
+          "notes": "随框架选型；覆盖率目标：核心业务逻辑 100% 有测试"
+        },
+        {
+          "name": "Testcontainers / Docker Compose",
+          "when": "S4 集成测试：真实数据库/中间件环境跑完整链路",
+          "ai_access": "AI 编写 compose 与测试夹具",
+          "alternatives": ["内存数据库替身（仅单测用）"],
+          "notes": "G4 集成测试项的执行手段"
+        },
+        {
+          "name": "k6 / JMeter",
+          "when": "S4 性能走查：P99 压测（宪法 P7）",
+          "ai_access": "AI 编写压测脚本并解读结果",
+          "alternatives": ["autocannon / wrk（快速基准）"],
+          "notes": "结果写入 04-走查报告 性能小节"
+        },
+        {
+          "name": "OWASP ZAP / Semgrep",
+          "when": "S4 安全扫描（注入/越权/配置缺陷）",
+          "ai_access": "CLI 可自动化，结果入走查报告",
+          "alternatives": [],
+          "notes": "[可选] 安全敏感项目必开；一般场景先人工过 backend-qa 第 1 组"
+        },
+        {
+          "name": "ESLint/Prettier（或各栈等价物：gofmt、Ruff、Checkstyle）",
+          "when": "G3 代码规范卡点",
+          "ai_access": "AI 运行修复",
+          "alternatives": [],
+          "notes": "随框架选型配置"
+        }
+      ]
+    },
+    {
+      "id": "deploy",
+      "name": "部署与运维",
+      "stages": ["S5"],
+      "tools": [
+        {
+          "name": "Docker + Docker Compose",
+          "when": "环境一致性：本地/测试/生产同一镜像",
+          "ai_access": "AI 编写 Dockerfile 与 compose",
+          "alternatives": [],
+          "notes": "S5 交付物默认容器化"
+        },
+        {
+          "name": "GitHub Actions / GitLab CI",
+          "when": "CI/CD 流水线：提交即跑测试，过卡点才能部署（调研结论：部署频率与失败率显著改善）",
+          "ai_access": "AI 编写 workflow 配置",
+          "alternatives": ["云厂商托管流水线"],
+          "notes": "流水线即 G3/G4 检查项的自动化实例"
+        },
+        {
+          "name": "日志与监控（结构化日志 + 云平台监控 / Prometheus）",
+          "when": "上线后可观测（backend-qa 第 4 组）",
+          "ai_access": "AI 配置日志格式与告警规则",
+          "alternatives": [],
+          "notes": "[可选] 小项目先用云平台自带日志，规模上来再补"
+        }
+      ]
+    },
+    {
+      "id": "workflow",
+      "name": "协作与版本管理",
+      "stages": ["S0", "S3", "S5"],
+      "tools": [
+        {
+          "name": "Git + GitHub/GitLab",
+          "when": "全程版本管理；workflow/、knowledge/、tools/ 入版本库，任务产物 output/ 不入 Git（见 .gitignore）",
+          "ai_access": "AI 执行提交（用户要求时）；PR 即代码评审卡点",
+          "alternatives": [],
+          "notes": "积累池的价值依赖版本历史，务必入 Git"
+        }
+      ]
+    }
+  ]
+}

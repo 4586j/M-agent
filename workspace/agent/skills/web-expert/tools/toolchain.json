@@ -1,0 +1,181 @@
+{
+  "$comment": "机读工具清单。AI 选型时按任务所处流水线阶段(stage: S0-S5)过滤 categories[].tools[]。新增工具必须登记到对应分类并注明 when 与 ai_access。标 [可选] 的条目按团队技术栈裁剪。",
+  "version": "2026-08-30",
+  "categories": [
+    {
+      "id": "design",
+      "name": "设计与原型",
+      "stages": ["S1", "S2"],
+      "tools": [
+        {
+          "name": "Figma",
+          "when": "高保真视觉设计与组件库维护",
+          "ai_access": "Dev Mode MCP Server 可让 AI 直接读取设计稿结构与变量",
+          "alternatives": ["MasterGo（国内协作/交付体验好）", "即时设计（国产，免费额度高）", "Pixso"],
+          "notes": "团队已有任一工具即沿用；不强制迁移"
+        },
+        {
+          "name": "Excalidraw / draw.io",
+          "when": "S1 快速结构草图与流程图",
+          "ai_access": "可让 AI 生成 .excalidraw / XML 文本直接打开",
+          "alternatives": ["ProcessOn"],
+          "notes": "[可选] 轻量场景用文本生成草图即可，不必开重型工具"
+        },
+        {
+          "name": "Mobbin / Page Flows / UI-Patterns.com",
+          "when": "S0/S1 参考真实产品的交互流与页面模式，配合 knowledge/patterns/page-patterns.md 使用",
+          "ai_access": "网页浏览；AI 可检索汇总，无法直接抓取时由用户提供截图",
+          "alternatives": ["Good UI（有 A/B 依据的模式）", "Dribbble/Behance（视觉灵感，注意区分可落地性）"],
+          "notes": "先查本仓库模式库再查外部库，避免重复收集"
+        }
+      ]
+    },
+    {
+      "id": "ai-gen",
+      "name": "AI 页面生成（Vibe Coding）",
+      "stages": ["S1", "S3"],
+      "tools": [
+        {
+          "name": "v0.dev",
+          "when": "对话式生成 React + Tailwind 页面首版",
+          "ai_access": "网页对话；产出可下载代码并入仓",
+          "alternatives": ["Lovable（全栈应用向）", "bolt.new（浏览器内全栈预览）", "Google Stitch（设计稿向）"],
+          "notes": "生成结果一律走 S3 的人工审核与走查卡点，不直接交付"
+        },
+        {
+          "name": "ZCode / Cursor / Claude Code",
+          "when": "在真实仓库内按模板生成与改造页面代码",
+          "ai_access": "读本仓库 AGENTS.md 后在仓库内直接工作",
+          "alternatives": [],
+          "notes": "首选路径：产出直接进 output/ 并遵守积累规则"
+        }
+      ]
+    },
+    {
+      "id": "handoff",
+      "name": "设计到代码交接",
+      "stages": ["S2", "S3"],
+      "tools": [
+        {
+          "name": "Figma Dev Mode + MCP Server",
+          "when": "AI 读取设计稿的布局/间距/变量并生成代码",
+          "ai_access": "MCP；接入步骤见 mcp-setup.md",
+          "alternatives": ["MasterGo 标注交付", "蓝湖"],
+          "notes": "覆盖约 90% 标注/切图交接需求"
+        },
+        {
+          "name": "Design Tokens（DTCG 格式）+ Style Dictionary",
+          "when": "Figma 变量与代码样式变量双向同步",
+          "ai_access": "tokens.json 即本仓库 knowledge/design-tokens/tokens.json，代码构建时消费",
+          "alternatives": ["Tokens Studio 插件导出"],
+          "notes": "单一事实源：颜色/间距/字号只认 tokens"
+        },
+        {
+          "name": "Storybook",
+          "when": "组件文档化与视觉回归，把组件说明挂回设计稿",
+          "ai_access": "[可选] 配合 Code Connect / MCP 向 AI 暴露组件用法",
+          "alternatives": [],
+          "notes": "组件数量 >20 后建议引入"
+        }
+      ]
+    },
+    {
+      "id": "dev",
+      "name": "开发框架与组件库",
+      "stages": ["S3"],
+      "tools": [
+        {
+          "name": "Vite + React/Next.js",
+          "when": "默认前端栈（SaaS/中后台/官网通用）",
+          "ai_access": "AI 直接生成与维护",
+          "alternatives": ["Vue 3 + Nuxt（团队偏好 Vue 时）", "Astro（内容型官网）"],
+          "notes": "[可选] 新项目默认 React + Vite，除非用户指定"
+        },
+        {
+          "name": "Tailwind CSS",
+          "when": "样式方案；tokens 通过 CSS variables / @theme 注入",
+          "ai_access": "AI 直接生成",
+          "alternatives": ["Ant Design / Element Plus 内置样式体系"],
+          "notes": "组件库与 Tailwind 二选一为主，避免样式体系打架"
+        },
+        {
+          "name": "shadcn/ui",
+          "when": "React 栈高质量组件基座（源码进仓、可改）",
+          "ai_access": "AI 添加组件 CLI；登记入 registry.md",
+          "alternatives": ["Ant Design（中后台重表格表单）", "Element Plus（Vue 栈）", "radix-ui（只要行为不要样式）", "Arco Design（字节跳动，企业级完整方案）", "Semi Design（抖音，易定制、现代风格）"],
+          "notes": "开源组件库打底是 2026 共识：不从零造轮子"
+        },
+        {
+          "name": "ESLint + Prettier + TypeScript",
+          "when": "S3 代码规范与类型安全（G3 卡点依赖）",
+          "ai_access": "AI 运行修复",
+          "alternatives": [],
+          "notes": "G3 勾选项的执行手段"
+        }
+      ]
+    },
+    {
+      "id": "quality",
+      "name": "走查与质量",
+      "stages": ["S4", "S5"],
+      "tools": [
+        {
+          "name": "Copixel / PixelSnap 类截图叠对比",
+          "when": "S4 像素级还原度走查：设计稿叠在前端页面上比对",
+          "ai_access": "浏览器自动化截图 + 叠加对比亦可替代",
+          "alternatives": ["Playwright 截图 + 图像对比脚本（AI 可全自动执行）"],
+          "notes": "量化'还原度'，产出写入 04-走查报告.md"
+        },
+        {
+          "name": "Playwright",
+          "when": "交互流回归、多视口截图、控制台报错扫描",
+          "ai_access": "AI 编写并执行脚本",
+          "alternatives": ["Cypress"],
+          "notes": "G4 边界情况验证的主要执行手段"
+        },
+        {
+          "name": "Lighthouse / axe-core",
+          "when": "性能与可访问性基线检查",
+          "ai_access": "CLI 可自动化，结果入走查报告",
+          "alternatives": [],
+          "notes": "可访问性是 G4 勾选项"
+        },
+        {
+          "name": "Chromatic / Percy",
+          "when": "[可选] 组件视觉回归持续化（Storybook 配套）",
+          "ai_access": "CI 集成",
+          "alternatives": [],
+          "notes": "组件库成熟后再引入"
+        }
+      ]
+    },
+    {
+      "id": "workflow",
+      "name": "协作与发布",
+      "stages": ["S0", "S5"],
+      "tools": [
+        {
+          "name": "Git + GitHub/GitLab",
+          "when": "全程版本管理；output/ 与 knowledge/ 均入版本库",
+          "ai_access": "AI 执行提交（用户要求时）",
+          "alternatives": [],
+          "notes": "积累池的价值依赖版本历史，务必入 Git"
+        },
+        {
+          "name": "GitHub Actions / CI",
+          "when": "S5 构建、部署、自动化检查",
+          "ai_access": "AI 编写 workflow 配置",
+          "alternatives": ["Vercel / Netlify（官网与演示页最快路径）"],
+          "notes": "[可选] 简单项目可直接 Vercel 部署"
+        },
+        {
+          "name": "飞书项目 / Linear / Jira",
+          "when": "[可选] 多人协作时承载 G1 需求卡点与角色权限",
+          "ai_access": "按平台 API/MCP 接入",
+          "alternatives": ["单人项目直接用本仓库 gates.md 勾选即可"],
+          "notes": "单人 + AI 协作场景可完全不引入"
+        }
+      ]
+    }
+  ]
+}

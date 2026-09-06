@@ -1,0 +1,75 @@
+{
+  "$comment": "后端单一事实源（宪法 P1）：所有接口的响应包裹格式、错误码字典、命名规范只认本文件。代码中出现本文件之外的响应结构/错误码 = G3 不过。修改本文件属于规范变更，须在变更记录注明并同步走查既有接口。",
+  "version": "2026-09-05",
+  "response_envelope": {
+    "$comment": "统一响应包裹。所有 HTTP 接口（含错误）都返回此结构，业务数据只放 data 字段。",
+    "schema": {
+      "code": "string，业务码。成功固定 '0'，失败见 error_codes",
+      "message": "string，面向开发者的可读信息（生产环境不得包含堆栈/SQL/内部细节）",
+      "data": "object|array|null，业务数据；失败时为 null",
+      "trace_id": "string，链路追踪 ID，从请求头透传或自动生成"
+    },
+    "example_success": { "code": "0", "message": "ok", "data": {}, "trace_id": "a1b2c3" },
+    "example_error": { "code": "AUTH_001", "message": "登录已过期，请重新登录", "data": null, "trace_id": "a1b2c3" }
+  },
+  "http_status_policy": {
+    "$comment": "HTTP 状态码与业务码的关系：状态码表达传输层语义，业务码表达业务语义。",
+    "200": "请求已正确处理（含业务失败，业务失败用 code 区分）",
+    "400": "请求格式非法（无法解析/缺少必要头）",
+    "401": "未认证",
+    "403": "已认证但无权限",
+    "404": "资源路径不存在",
+    "429": "限流",
+    "500": "服务端未捕获异常（必须同时告警）"
+  },
+  "error_codes": {
+    "$comment": "错误码字典：格式为 领域前缀_三位序号。新增错误码必须在此登记后才能使用。",
+    "AUTH_001": "未登录或登录过期",
+    "AUTH_002": "凭证错误（账号或密码不对）",
+    "AUTH_003": "无权限访问该资源",
+    "PARAM_001": "参数校验失败（message 附字段级明细）",
+    "PARAM_002": "参数类型非法",
+    "RESOURCE_001": "资源不存在",
+    "RESOURCE_002": "资源状态冲突（如重复提交、已删除）",
+    "BIZ_001": "通用业务规则不满足（尽量细化为具体码）",
+    "DEPEND_001": "依赖服务不可用或超时",
+    "DEPEND_002": "邮件发送失败，请稍后重试",
+    "RATE_001": "请求过于频繁",
+    "RATE_002": "当日发送次数已达上限",
+    "RATE_003": "当日操作次数已达上限",
+    "CAPTCHA_001": "验证码不存在或已过期",
+    "CAPTCHA_002": "验证码错误",
+    "CAPTCHA_003": "验证尝试次数超限，已临时锁定",
+    "PARTNER_001": "已有生效的绑定/监护关系，不可重复建立",
+    "PARTNER_002": "邀请码无效或已过期",
+    "PARTNER_003": "目标资源的协作槽位已满（如宠物已有两位监护人）",
+    "ITEM_001": "未拥有该道具/部件",
+    "ITEM_002": "道具/部件与目标槽位不匹配",
+    "PET_001": "互动动作冷却中（服务端 CD 未结束）",
+    "PET_002": "体力不足，无法执行该互动",
+    "SYSTEM_001": "系统内部错误"
+  },
+  "naming": {
+    "$comment": "命名规范（宪法 P1 单一事实源的一部分）。",
+    "api_path": "kebab-case 复数名词，如 /api/v1/order-items；版本号放路径前缀",
+    "db_table": "snake_case 单数名词，如 order_item",
+    "db_field": "snake_case；时间字段统一 _at 后缀（UTC 存储）；金额用最小单位整数 + _cents 后缀",
+    "code": "随技术栈惯例（如 Java camelCase / Go PascalCase 导出），DTO 字段与接口契约一致",
+    "boolean_field": "is_/has_/can_ 前缀，如 is_deleted"
+  },
+  "pagination": {
+    "$comment": "列表接口统一分页契约（宪法 P7：列表必分页）。",
+    "request": { "page": "int，从 1 开始", "page_size": "int，默认 20，上限 100", "sort": "string，可选，字段名+方向，如 created_at:desc" },
+    "response": { "list": "array，当前页数据", "total": "int，总条数", "page": "int", "page_size": "int" }
+  },
+  "time_and_ids": {
+    "time_format": "ISO 8601 UTC，如 2026-09-01T08:00:00Z；存储用 UTC，展示层转换时区",
+    "id_strategy": "主键优先自增/雪花；对外暴露的 ID 若需防枚举，使用不透明 ID 或加签名"
+  },
+  "changelog": [
+    "2026-09-05 v1.3：新增 PARTNER_001/002/003（双人绑定域）、ITEM_001/002（道具装扮域）、PET_001/002（宠物互动域）——登记自 pet-game 项目 03-契约定义；并发数值冲突复用既有 RESOURCE_002、频率类复用 RATE_003，未自造。微信登录相关错误码待小游戏端启动时再登记（当期范围不含微信端）",
+    "2026-09-01 v1.2：新增 RATE_003（每日操作上限，点歌/留言防刷）——登记自 blog-backend 项目 spec v2",
+    "2026-09-01 v1.1：新增 CAPTCHA_001/002/003（验证码域）、RATE_002（每日发送上限）、DEPEND_002（邮件发送失败）——登记自 blog-backend 项目 01-spec",
+    "2026-09-01 v1.0：初版（来源：前端 tokens.json 的单一事实源思想 + 调研结论中统一响应/错误码/分页惯例）"
+  ]
+}

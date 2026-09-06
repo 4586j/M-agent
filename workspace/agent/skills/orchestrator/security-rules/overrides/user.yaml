@@ -11,3 +11,8 @@ rules:
     description: 禁止删除 reports 目录下的报告文件
     pattern: 'rm\s+.*reports/'
     severity: block
+  - id: R-USER-02
+    category: dangerous_command
+    description: 禁止直接执行破坏性数据库操作（DROP/TRUNCATE，back-expert 宪法 P6：须停给用户确认）
+    pattern: '(?i:drop\s+(table|database)|truncate\s+table)'
+    severity: block

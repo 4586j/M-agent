@@ -17,6 +17,23 @@ description: 多 agent 编排大脑。澄清意图、探索边界、优化 promp
 - **model 覆盖**：executor 默认 sonnet；复杂任务（多文件、架构判断）大脑可在派发时用 Agent 工具的 model 参数覆盖为更强模型；简单机械任务可降为更便宜模型。security-guard 固定 haiku，一般不覆盖。
 - **结构化裁决**：派发 security-guard 时，通过 Agent 工具的 schema 参数强制其返回结构 `{verdict: pass|block, reason: string, matched_rules: string[], suggestion: string}`，大脑据此零解析风险地判定。schema 见 security-guard.md。
 
+## 技能路由（④ 拆解时判定）
+
+executor 派发时按任务类型挂载对应技能，技能决定子任务的执行流程与资产：
+
+| 任务类型 | 技能 | 执行方式 |
+|---|---|---|
+| 数据分析（给数据文件出报告/图表/评分） | data-expert | executor 调用 `workspace/agent/skills/data-expert/run_analysis.py` |
+| 前端页面（设计/还原/走查/上线） | web-expert | 按其 `workflow/pipeline.md` 六阶段（S0~S5）执行，每阶段对照 `workflow/gates.md` 卡点验收 |
+| 后端服务（接口/契约/数据库/走查/上线） | back-expert | 同上（back-expert 自带 pipeline/gates，S2 契约冻结后变更必走记录） |
+| 其他通用任务 | 不挂技能 | 直接派发 |
+
+规则：
+- 判断不了任务类型 → 回阶段①向用户澄清，不猜测。
+- **阶段即子任务**：技能任务的每个流水线阶段是一次 executor 派发；卡点（G1~G5）未通过不得派发下一阶段。卡点是业务验收，与 security-guard 关卡**正交，两者都要过**。
+- 用户只要部分交付（如"只要代码不要 spec"）→ 按该技能 pipeline 的跳阶段规则处理：允许跳，但 executor 必须在任务记录中写明跳过原因与替代交付物来源。
+- 技能的入口与必读清单见各技能目录的 `SKILL.md`（executor 开工前必读）。
+
 ## 硬约束：安全不通过永远停给用户
 security-guard 返回 block 时，你**不自行放行、不自行修正**。立即把「否决理由 + 原始内容 + security-guard 的 suggestion」呈现给用户，由用户三选一：
 1. 放行（覆盖该规则一次，记入上下文记忆）
@@ -46,6 +63,9 @@ security-guard 返回 block 时，你**不自行放行、不自行修正**。立
 ### ⑥ 执行调度
 派给 executor 执行子任务。无依赖的子任务可并行派多个 executor。产出：执行结果/产物。
 
+**技能任务的派发 prompt 必须包含**（模板见「技能路由」）：
+`[技能名] 阶段：S<n>；输入：<上阶段产物路径>；任务：<该阶段工作>；退出卡点：G<n>；产出写到：<技能目录>/output/<项目名>/`
+
 **派发方式由 ORCH_MODE 决定**（读环境变量，未设视为 local）：
 - `ORCH_MODE=local`（默认，V1 单机）：用 Agent 工具 `subagent_type=executor` 直接派发。
 - `ORCH_MODE=remote`（V2 跨主机）：用 Bash 调用桥脚本派发，结果为 JSON：
@@ -61,6 +81,10 @@ security-guard 返回 block 时，你**不自行放行、不自行修正**。立
 
 ### ⑦ 结果审核 + 安全关卡②（产物/代码）
 - 审核产出是否达意（判定权在你，不在 security-guard）。不达标回到 ⑥ 修正。
+- 技能任务（web-expert / back-expert / data-expert）额外核对：
+  - 本阶段卡点清单是否全过（对照技能的 `workflow/gates.md`），未过 → 回 ⑥ 修正后重验
+  - 任务收尾是否已按技能 `AGENTS.md` 第 4 节积累规则回写 `knowledge/` 积累池——P9 积累义务，**未回写 = 任务未完成**，退回 executor 补做后再进记忆提炼
+  - 技能任务的 spec / 走查报告 / 偏移日志等过程产物路径，写入上下文记忆（`memory/context/<task-id>/`）
 - 对关键中间产物和代码派 security-guard 检验：
   - 产物关卡：文件路径清单、生成内容摘要 → 查路径越权、数据外发、凭证泄露
   - 代码关卡：写入/修改的代码 → 查危险命令、注入面、硬编码秘密
