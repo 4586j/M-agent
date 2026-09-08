@@ -73,8 +73,36 @@ class ExperienceStore:
         self.max_count = max_count
         self.ttl_days = ttl_days
         self._cache: list[ExperienceRecord] | None = None
+        # 命中计数批量刷盘：内存即时更新，磁盘落盘延后到阈值批量执行，消除写放大
+        self._pending_dump: dict[str, ExperienceRecord] = {}
+        self._hits_counter = 0
+        self._HITS_FLUSH_THRESHOLD = 100  # 每累计 100 次命中批量落盘一次
+
+    def _flush_hits(self) -> None:
+        """把待刷盘的命中记录一次性写回磁盘（pending 内即缓存同一对象）。"""
+        if not self._pending_dump:
+            self._hits_counter = 0
+            return
+        for rec in self._pending_dump.values():
+            self._dump(rec)
+        self._pending_dump.clear()
+        self._hits_counter = 0
+
+    def _sync_pending_to_cache(self) -> None:
+        """把尚未刷盘的命中增量同步到刚从磁盘加载的缓存对象，保持读写一致。"""
+        if not self._pending_dump or self._cache is None:
+            return
+        by_id = {r.exp_id: r for r in self._cache}
+        for eid, pending_rec in list(self._pending_dump.items()):
+            cached = by_id.get(eid)
+            if cached is not None and cached is not pending_rec:
+                cached.hits = pending_rec.hits
+                cached.last_hit_at = pending_rec.last_hit_at
+                self._pending_dump[eid] = cached
 
     def _invalidate(self) -> None:
+        # 失效缓存前先落盘待写入的命中计数，避免随后从磁盘重读丢失增量
+        self._flush_hits()
         self._cache = None
 
     def _path(self, exp_id: str) -> Path:
@@ -126,15 +154,19 @@ class ExperienceStore:
         return rec
 
     def _touch_hits(self, records: list[ExperienceRecord]) -> None:
-        """命中计数持久化：检索/读取命中即更新 hits 与 last_hit_at 并落盘。
+        """命中计数：检索/读取命中即更新内存 hits 与 last_hit_at，磁盘落盘延后批量执行。
 
-        淘汰策略据此保护高频经验；写入量小（每次检索 ≤ limit 条）。
+        内存即时更新保证淘汰策略与后续读取立刻看到最新命中；磁盘写入改为累积
+        到阈值再批量 flush，消除高频检索下每条命中都全量重写 JSON 的写放大。
         """
         now = str(int(time.time()))
         for rec in records:
             rec.hits = (rec.hits or 0) + 1
             rec.last_hit_at = now
-            self._dump(rec)
+            self._pending_dump[rec.exp_id] = rec
+            self._hits_counter += 1
+        if self._hits_counter >= self._HITS_FLUSH_THRESHOLD:
+            self._flush_hits()
 
     def _get_raw(self, exp_id: str) -> ExperienceRecord | None:
         if self._cache is not None:
@@ -151,6 +183,8 @@ class ExperienceStore:
     def delete(self, exp_id: str) -> bool:
         p = self._path(exp_id)
         if p.exists():
+            # 先丢弃该记录待刷盘的命中，避免 _invalidate 的 flush 把已删文件又写回
+            self._pending_dump.pop(exp_id, None)
             p.unlink()
             self._invalidate()
             return True
@@ -164,6 +198,7 @@ class ExperienceStore:
             with open(p, encoding="utf-8") as f:
                 out.append(ExperienceRecord(**json.load(f)))
         self._cache = out
+        self._sync_pending_to_cache()
         return list(out)
 
     def list_by_role(self, role: str) -> list[ExperienceRecord]:

@@ -1,6 +1,7 @@
 """异步派发器：asyncio + httpx，立即返回 task_id，后台轮询或回调写入结果。"""
 import asyncio
 import logging
+import os
 import time
 import uuid
 from typing import Any, Awaitable, Callable
@@ -53,6 +54,9 @@ class AsyncRemoteDispatcher:
         self.poll_max = poll_max
         self.brain_url = brain_url
         self._tasks: dict[str, asyncio.Task] = {}
+        # 后台轮询并发限流：避免海量异步任务同时轮询打满连接/线程资源
+        max_concurrent = int(os.environ.get("ORCH_ASYNC_MAX_CONCURRENT", "20"))
+        self._semaphore = asyncio.Semaphore(max_concurrent)
 
     async def dispatch_async(
         self, role: str, prompt: str,
@@ -87,7 +91,7 @@ class AsyncRemoteDispatcher:
             return task_id
         self.task_store.update(task_id, status="running")
         poll_task = asyncio.create_task(
-            self._poll_worker(task_id, base, worker.worker_id, role, prompt, ts),
+            self._limited_poll(task_id, base, worker.worker_id, role, prompt, ts),
         )
         self._tasks[task_id] = poll_task
         return task_id
@@ -100,6 +104,12 @@ class AsyncRemoteDispatcher:
         await self._finalize(task_id, rec.worker_id, rec.role, rec.prompt,
                              rec.created_at, data)
         return True
+
+    async def _limited_poll(self, task_id: str, base: str, worker_id: str,
+                            role: str, prompt: str, ts: str) -> None:
+        """在并发信号量限制下轮询 worker，控制同时运行的后台轮询数量。"""
+        async with self._semaphore:
+            await self._poll_worker(task_id, base, worker_id, role, prompt, ts)
 
     async def _poll_worker(self, task_id: str, base: str, worker_id: str,
                            role: str, prompt: str, ts: str) -> None:

@@ -32,6 +32,8 @@ class BrainClient:
         self.api_key = api_key if api_key is not None else os.environ.get("ORCH_API_KEY", "")
         self.timeout = timeout
         self._http = http  # (method, url, json_body, params) -> dict，测试注入
+        # 复用 requests.Session：连接池 keep-alive，避免每次调用重建 TCP/TLS 连接
+        self._session = requests.Session()
 
     def call(self, method: str, path: str, json_body: dict | None = None,
              params: dict | None = None) -> Any:
@@ -39,9 +41,9 @@ class BrainClient:
             return self._http(method, self.brain_url + path, json_body, params)
         headers = {"X-API-Key": self.api_key} if self.api_key else {}
         try:
-            resp = requests.request(method, self.brain_url + path, json=json_body,
-                                    params=params, timeout=self.timeout,
-                                    headers=headers)
+            resp = self._session.request(method, self.brain_url + path, json=json_body,
+                                         params=params, timeout=self.timeout,
+                                         headers=headers)
         except Exception as e:
             return {"status": "error", "detail": f"brain 不可达: {e}"}
         try:

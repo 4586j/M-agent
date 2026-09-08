@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agent-core"
+version = "0.1.0"
+description = "统一 Agent 内核：单机CLI/本地服务/集群worker共用"
+requires-python = ">=3.11"
+dependencies = [
+    "claude-agent-sdk>=0.2",
+    "pyyaml>=6.0",
+    "httpx>=0.24",
+    "rich>=13.0",
+    "prompt_toolkit>=3.0",
+]
+
+[project.optional-dependencies]
+service = ["fastapi>=0.100", "uvicorn>=0.20"]
+dev = ["pytest>=7.0"]
+
+[project.scripts]
+agent = "agent_core.cli:main"
+agent-cli = "agent_core.cli:main"
+
+[tool.setuptools]
+# 扁平布局：项目根目录（pyproject.toml 所在处）本身就是 agent_core 包（含 __init__.py）。
+# 不能用 packages.find（它只扫「子目录」，此处无 agent_core/agent_core/，会得到空列表，
+# 导致 editable 安装的 finder MAPPING 为空、`agent` 命令 ModuleNotFoundError）。
+# 改用显式 package-dir 映射：包 agent_core -> "."，子包 agent_core.tests -> "./tests"。
+package-dir = { "agent_core" = "." }
+packages = [ "agent_core", "agent_core.tests" ]

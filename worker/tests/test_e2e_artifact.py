@@ -29,6 +29,8 @@ KEY = "test-key-123"
 @pytest.fixture(scope="module")
 def e2e(tmp_path_factory):
     work_dir = str(tmp_path_factory.mktemp("e2e_work"))
+    # 保存旧值，teardown 时恢复，避免环境变量泄露到其他测试模块
+    _saved = {k: os.environ.get(k) for k in ("ORCH_API_KEY", "ORCH_MODE", "ORCH_WORK_DIR")}
     os.environ["ORCH_API_KEY"] = KEY
     os.environ["ORCH_MODE"] = "remote"
     os.environ["ORCH_WORK_DIR"] = work_dir
@@ -78,7 +80,13 @@ def e2e(tmp_path_factory):
             f"http://127.0.0.1:{BRAIN_PORT}/proxy/artifact"
             f"?worker_id=w-e2e&task_id={task_id}&path={path}", headers=headers)
 
-    return {"proxy": proxy, "binary": binary}
+    yield {"proxy": proxy, "binary": binary}
+
+    for k, v in _saved.items():
+        if v is None:
+            os.environ.pop(k, None)
+        else:
+            os.environ[k] = v
 
 
 def test_e2e_text_artifact(e2e):
