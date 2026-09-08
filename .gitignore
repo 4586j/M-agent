@@ -1,6 +1,7 @@
 # Python
 __pycache__/
 *.py[cod]
+*.egg-info/
 
 # Web
 web/node_modules/
@@ -10,4 +11,11 @@ web/dist/
 .playwright-mcp/
 workspace/agent/orchestrator/runtime/.tasks/
 worker/.worker_work/
+# 经验库落盘产物（测试/运行散落到仓库根，正常应在 runtime/.experiences/）
+/exp-local-*.json
 
+.orch_session
+# 规划/进度产物
+.orch_progress/
+.agent_progress/
+.agent_session
