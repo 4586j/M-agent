@@ -35,3 +35,6 @@ _e2e/
 # 经验库运行时落盘（与 .tasks 同性质，属于运行时数据）
 workspace/agent/orchestrator/runtime/.experiences/
 workspace/agent/orchestrator/runtime/audit/
+
+# 真实任务运行产物目录
+result/
