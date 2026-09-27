@@ -1,12 +1,27 @@
 import type {
   WorkerInfo, TaskRecord, DispatchResult, Stats, RegisterBody, DispatchBody,
+  RecommendBody, RecommendResponse, TranslateBody, TranslateResponse,
 } from '../types'
 
-// 相对路径：dev 走 vite proxy，prod 同源直调
+// 相对路径：dev 走 vite proxy，prod 同源直调。
+// 鉴权：配置了 ORCH_API_KEY 的部署要求所有非 public 请求携带 X-API-Key 头，
+// 否则 /stats /tasks approve/reject 等全部 401。取值与 sseUrl() 同源
+// （localStorage.orch_api_key）；key 为空时不发头，本机无 key 部署行为不变
+export function getApiKey(): string {
+  try {
+    return localStorage.getItem('orch_api_key') || ''
+  } catch {
+    return ''
+  }
+}
+
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' }
+  const key = getApiKey()
+  if (key) headers['X-API-Key'] = key
   const r = await fetch(url, {
-    headers: { 'Content-Type': 'application/json' },
     ...init,
+    headers,
   })
   if (!r.ok) {
     let detail = r.statusText
@@ -45,12 +60,39 @@ export const api = {
     request<DispatchResult>(`/tasks/${encodeURIComponent(id)}/redispatch`, {
       method: 'POST', body: JSON.stringify({ model: model || null }),
     }),
+  // 审批：修订 prompt 非空时重过 security_guard；不传则按原指令人工放行
+  approveTask: (id: string, prompt?: string) =>
+    request<DispatchResult>(`/tasks/${encodeURIComponent(id)}/approve`, {
+      method: 'POST', body: JSON.stringify({ prompt: prompt || null }),
+    }),
+  // 拒绝：任务终态 failed，写审计并广播事件
+  rejectTask: (id: string, reason?: string) =>
+    request<TaskRecord>(`/tasks/${encodeURIComponent(id)}/reject`, {
+      method: 'POST', body: JSON.stringify({ reason: reason || null }),
+    }),
 
   dispatch: (body: DispatchBody) =>
     request<DispatchResult>('/dispatch', { method: 'POST', body: JSON.stringify(body) }),
+
+  // AI 推荐/解释顾问（独立上下文，不污染任务上下文）
+  recommend: (body: RecommendBody) =>
+    request<RecommendResponse>('/recommend', { method: 'POST', body: JSON.stringify(body) }),
+
+  // 结果翻译（独立上下文，思考英文/结果中文）
+  translate: (body: TranslateBody) =>
+    request<TranslateResponse>('/translate', { method: 'POST', body: JSON.stringify(body) }),
 
   artifact: (workerId: string, taskId: string, path: string) =>
     request<{ content: string; encoding?: string; size?: number }>(
       `/proxy/artifact?worker_id=${encodeURIComponent(workerId)}&task_id=${encodeURIComponent(taskId)}&path=${encodeURIComponent(path)}`,
     ),
+}
+
+// SSE 实时事件流地址。EventSource 无法携带自定义 header，
+// 部署了 api_key 时从 localStorage.orch_api_key 读取并走 ?api_key= 查询参数
+// （brain 的 auth 中间件同时接受 X-API-Key 头与查询参数；未设 key 的部署无需配置）
+export function sseUrl(taskId: string): string {
+  const key = getApiKey()
+  const q = key ? `?api_key=${encodeURIComponent(key)}` : ''
+  return `/tasks/${encodeURIComponent(taskId)}/events${q}`
 }

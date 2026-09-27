@@ -10,7 +10,25 @@ export interface WorkerInfo {
   load: number
 }
 
-export type TaskStatus = 'pending' | 'running' | 'done' | 'failed' | 'lost' | 'cancelled'
+// awaiting_approval：安全拦截后等待人工审批（非终态，不参与重试/回收）
+export type TaskStatus = 'pending' | 'running' | 'done' | 'failed' | 'lost' | 'cancelled' | 'awaiting_approval'
+
+/** worker 回传的 token 明细（口径与 eval/run_eval 一致） */
+export interface TaskUsage {
+  input_tokens?: number
+  output_tokens?: number
+  cache_read_input_tokens?: number
+  cache_creation_input_tokens?: number
+}
+
+/** worker callback 带回的执行元数据（brain 终态化时入库） */
+export interface TaskMeta {
+  model?: string
+  num_turns?: number
+  cost_usd?: number
+  usage?: TaskUsage
+  [key: string]: unknown
+}
 
 export interface TaskRecord {
   task_id: string
@@ -24,6 +42,18 @@ export interface TaskRecord {
   artifacts: string[]
   error: unknown
   verdict?: SecurityVerdict
+  trace_id?: string | null  // 链路追踪 ID（brain 派发时生成，旧任务为 null）
+  meta?: TaskMeta  // 执行元数据（worker 回传 / 审批详情）
+}
+
+/** meta.approval：安全拦截后挂起任务的审批详情 */
+export interface ApprovalMeta {
+  status?: 'pending' | 'approved' | 'rejected'
+  verdict?: SecurityVerdict
+  original_prompt?: string
+  requested_by?: string | null
+  rejected_by?: string | null
+  reject_reason?: string
 }
 
 export interface SecurityVerdict {
@@ -39,8 +69,27 @@ export interface DispatchResult {
   output: unknown
   artifacts: string[]
   error: unknown
-  verdict?: SecurityVerdict  // status=='blocked' 时存在（指令拦截）
+  verdict?: SecurityVerdict  // status=='blocked'/'awaiting_approval' 时存在（指令拦截）；approve 修订重过检失败时也可能带回
   product_verdict?: SecurityVerdict  // status=='done' 时可能存在（产物拦截）
+  dispatched_task_id?: string  // approve 放行后新派发的任务 ID
+  // approve 端点返回：仅 approved===true 视为放行成功；失败体可能无该字段，
+  // 形如 {status: "failed", error: "..."}，须同时按 status/error 判定
+  approved?: boolean
+}
+
+/** 成本聚合桶（tokens/cost 无数据时为 null） */
+export interface CostBucket {
+  tasks: number
+  tokens: number | null
+  cost_usd: number | null
+}
+
+/** /stats.cost：按日近 7 天 / 按 role / 按 model 聚合 */
+export interface CostStats {
+  total: CostBucket
+  by_day: (CostBucket & { date: string })[]
+  by_role: Record<string, CostBucket>
+  by_model: Record<string, CostBucket>
 }
 
 export interface Stats {
@@ -52,6 +101,7 @@ export interface Stats {
   task_total: number
   task_status: Record<string, number>
   recent_tasks: TaskRecord[]
+  cost?: CostStats  // 成本聚合（无 meta 数据时字段仍存在，数值为 null）
 }
 
 export interface RegisterBody {
@@ -68,4 +118,70 @@ export interface DispatchBody {
   context_memory: string | null
   model: string | null
   force?: boolean
+  // 子代理派发每次请求覆盖：null/省略=跟随全局；true/false=本次强制启用/禁用
+  enable_subagents?: boolean | null
+}
+
+/** 顾问拆解计划的单个步骤 */
+export interface AdvisorPlanStep {
+  id: number | string | null
+  action: string
+  depends_on: (number | string)[]
+}
+
+/** AI 推荐/解释顾问的结构化建议（运行于独立上下文，不污染任务上下文） */
+export interface AdvisorResult {
+  should_dispatch: boolean
+  roles: string[]
+  plan: AdvisorPlanStep[]
+  explanation: string
+  risks: string[]
+  mode?: string
+}
+
+/** auto-apply 时顾问建议被采纳后派发的任务条目 */
+export interface AdvisorDispatched {
+  role: string
+  task_id?: string
+  status?: string
+  output?: unknown
+  artifacts?: string[]
+  error?: unknown
+  reason?: string
+}
+
+export interface RecommendBody {
+  task: string
+  mode?: 'pre_flight' | 'plan' | 'explain' | 'all'
+  finished_output?: string | null
+  enable_subagents?: boolean | null
+  auto_apply?: boolean | null
+}
+
+export interface RecommendResponse {
+  status: string
+  error?: string
+  recommendation?: AdvisorResult
+  auto_applied?: boolean
+  dispatched?: AdvisorDispatched[]
+}
+
+/** 结果翻译（运行于独立上下文，不污染任务上下文；思考英文/结果中文） */
+export interface TranslationResult {
+  translated: string
+  target_lang: string
+  changed: boolean
+  skipped?: string  // "empty" | "already_target_lang"
+  error?: string
+}
+
+export interface TranslateBody {
+  text: string
+  target_lang?: string | null
+}
+
+export interface TranslateResponse {
+  status: string
+  error?: string
+  translation?: TranslationResult
 }
