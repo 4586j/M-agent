@@ -1,6 +1,8 @@
 import type {
-  WorkerInfo, TaskRecord, DispatchResult, Stats, RegisterBody, DispatchBody,
+  WorkerInfo, TaskRecord, DispatchResult, DispatchAsyncResponse, Stats, RegisterBody, DispatchBody,
   RecommendBody, RecommendResponse, TranslateBody, TranslateResponse,
+  MemoryCoreItem, ContextNotesResponse, ExperienceRecord, ExperienceSearchBody,
+  ProposalRecord, ReflectionReport,
 } from '../types'
 
 // 相对路径：dev 走 vite proxy，prod 同源直调。
@@ -73,6 +75,60 @@ export const api = {
 
   dispatch: (body: DispatchBody) =>
     request<DispatchResult>('/dispatch', { method: 'POST', body: JSON.stringify(body) }),
+
+  // 异步派发：立即返回 task_id，状态经 /tasks/{id} 或 SSE 跟踪（长任务/流程型技能）
+  dispatchAsync: (body: DispatchBody) =>
+    request<DispatchAsyncResponse>('/dispatch/async', { method: 'POST', body: JSON.stringify(body) }),
+
+  // ---- 记忆系统（二期） ----
+
+  memoryCore: () => request<{ memories: MemoryCoreItem[] }>('/memory/core'),
+  memoryCorePut: (name: string, content: string) =>
+    request<{ status: string; name: string }>(`/memory/core/${encodeURIComponent(name)}`, {
+      method: 'PUT', body: JSON.stringify({ content }),
+    }),
+  memoryCoreDelete: (name: string) =>
+    request<{ status: string }>(`/memory/core/${encodeURIComponent(name)}`, { method: 'DELETE' }),
+
+  taskContext: (taskId: string) =>
+    request<ContextNotesResponse>(`/memory/context/${encodeURIComponent(taskId)}`),
+  taskContextPut: (taskId: string, key: string, content: string) =>
+    request<{ status: string }>(
+      `/memory/context/${encodeURIComponent(taskId)}/${encodeURIComponent(key)}`,
+      { method: 'PUT', body: JSON.stringify({ content }) },
+    ),
+  taskContextArchive: (taskId: string) =>
+    request<{ status: string }>(`/memory/context/${encodeURIComponent(taskId)}`, { method: 'DELETE' }),
+
+  experiences: () => request<ExperienceRecord[]>('/experiences'),
+  searchExperiences: (body: ExperienceSearchBody) =>
+    request<ExperienceRecord[]>('/experiences/search', { method: 'POST', body: JSON.stringify(body) }),
+  deleteExperience: (id: string) =>
+    request<{ status: string }>(`/experiences/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+  reindexExperiences: () =>
+    request<{ status: string; reindexed: number }>('/experiences/reindex', { method: 'POST' }),
+
+  // ---- 程序记忆演化（提案-共识-应用） ----
+
+  reflection: (window = 50) =>
+    request<ReflectionReport>(`/memory/procedural/reflection?window=${window}`),
+  proposals: (status?: string) =>
+    request<ProposalRecord[]>(
+      `/memory/procedural/proposals${status ? `?status=${encodeURIComponent(status)}` : ''}`,
+    ),
+  propose: (body: {
+    target_path: string; content: string; reason: string; evidence_exp_ids?: string[]
+  }) => request<ProposalRecord>('/memory/procedural/proposals', {
+    method: 'POST', body: JSON.stringify(body),
+  }),
+  voteProposal: (id: string, voter: string, verdict: 'pass' | 'block', reason = '') =>
+    request<ProposalRecord>(`/memory/procedural/proposals/${encodeURIComponent(id)}/vote`, {
+      method: 'POST', body: JSON.stringify({ voter, verdict, reason }),
+    }),
+  deleteProposal: (id: string) =>
+    request<{ status: string }>(`/memory/procedural/proposals/${encodeURIComponent(id)}`, {
+      method: 'DELETE',
+    }),
 
   // AI 推荐/解释顾问（独立上下文，不污染任务上下文）
   recommend: (body: RecommendBody) =>

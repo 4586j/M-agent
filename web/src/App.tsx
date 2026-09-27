@@ -6,6 +6,7 @@ import Dashboard from './views/Dashboard'
 import Tasks from './views/Tasks'
 import NodeManage from './views/NodeManage'
 import Command from './views/Command'
+import Memory from './views/Memory'
 import ConnectionSettings from './components/ConnectionSettings'
 
 const NAV = [
@@ -29,7 +30,7 @@ export default function App() {
           <Route path="/tasks" element={<Tasks />} />
           <Route path="/nodes" element={<NodeManage />} />
           <Route path="/command" element={<Command />} />
-          <Route path="/memory" element={<Placeholder title="记忆" phase="二期：核心记忆/任务上下文/经验库/演化提案 四层资产库" />} />
+          <Route path="/memory" element={<Memory />} />
           <Route path="/schedules" element={<Placeholder title="调度" phase="三期：cron 定时任务管理" />} />
           <Route path="/audit" element={<Placeholder title="审计" phase="三期：安全裁决流水（依赖 GET /audit 只读端点）" />} />
         </Routes>

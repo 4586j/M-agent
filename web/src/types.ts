@@ -120,6 +120,8 @@ export interface DispatchBody {
   force?: boolean
   // 子代理派发每次请求覆盖：null/省略=跟随全局；true/false=本次强制启用/禁用
   enable_subagents?: boolean | null
+  // 引用历史任务的上下文记忆笔记并入本次派发（续做任务）
+  context_task_ids?: string[]
 }
 
 /** 顾问拆解计划的单个步骤 */
@@ -184,4 +186,82 @@ export interface TranslateResponse {
   status: string
   error?: string
   translation?: TranslationResult
+}
+
+// ---- 记忆系统（二期：/memory/* /experiences /dispatch async） ----
+
+/** 核心记忆条目（GET /memory/core） */
+export interface MemoryCoreItem {
+  name: string
+  content: string | null
+}
+
+/** 任务上下文笔记（GET /memory/context/{task_id}） */
+export interface ContextNotesResponse {
+  task_id: string
+  notes: Record<string, string | null>
+}
+
+/** 历史任务经验记录（/experiences；embedding 字段过大，前端忽略不展示） */
+export interface ExperienceRecord {
+  exp_id: string
+  role: string
+  prompt: string
+  output_summary: string
+  success: boolean
+  verdict?: SecurityVerdict | null
+  artifacts: string[]
+  created_at: string
+  tags: string[]
+  hits?: number
+  last_hit_at?: string
+  version?: number
+}
+
+export interface ExperienceSearchBody {
+  query: string
+  role?: string | null
+  successful_only?: boolean
+  limit?: number
+}
+
+/** 程序记忆演化：单视角投票 */
+export interface ProceduralVote {
+  verdict: 'pass' | 'block'
+  reason: string
+  at: string
+}
+
+/** 演化提案（原内容随提案归档，支撑 diff 对比） */
+export interface ProposalRecord {
+  proposal_id: string
+  target_path: string
+  original_content: string
+  original_hash: string
+  content: string
+  reason: string
+  evidence_exp_ids: string[]
+  votes: Record<string, ProceduralVote>
+  status: 'pending' | 'applied' | 'rejected'
+  reject_reason: string
+  created_at: string
+  applied_at: string
+}
+
+/** 反思报告（近期经验确定性聚合，提案的证据面板） */
+export interface ReflectionReport {
+  window: number
+  total: number
+  success: number
+  by_role: Record<string, { total: number; success: number }>
+  failed_recent: { exp_id: string; prompt: string }[]
+  most_hit: { exp_id: string; hits: number; prompt: string }[]
+}
+
+/** 异步派发响应（POST /dispatch/async） */
+export interface DispatchAsyncResponse {
+  status: string
+  task_id: string
+  model?: string | null
+  error?: string | null
 }

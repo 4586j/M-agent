@@ -1,6 +1,6 @@
-import { useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { api } from '../api/client'
-import type { ApprovalMeta, DispatchResult, TaskRecord, RecommendResponse, TranslateResponse } from '../types'
+import type { ApprovalMeta, DispatchAsyncResponse, DispatchResult, ExperienceRecord, TaskRecord, RecommendResponse, TranslateResponse } from '../types'
 import { usePolling } from '../hooks/usePolling'
 import { formatTime, timeAgo } from '../utils'
 import StatusBadge from '../components/StatusBadge'
@@ -12,6 +12,15 @@ export default function Command() {
   const [ctx, setCtx] = useState('')
   const [result, setResult] = useState<DispatchResult | null>(null)
   const [busy, setBusy] = useState(false)
+
+  // 二期：同步阻塞 / 异步+SSE 两种派发模式（异步适合 web-expert/back-expert 长流程）
+  const [mode, setMode] = useState<'sync' | 'async'>('sync')
+  const [asyncRes, setAsyncRes] = useState<DispatchAsyncResponse | null>(null)
+  // 二期：引用历史任务上下文（context_task_ids 随派发并入 context_memory）
+  const [ctxTaskIds, setCtxTaskIds] = useState<string[]>([])
+  // 二期：检索相似经验一键填充
+  const [expResults, setExpResults] = useState<ExperienceRecord[] | null>(null)
+  const [expSearching, setExpSearching] = useState(false)
 
   // 子代理派发开关（tri-state：null=跟随全局）与 AI 推荐/解释顾问
   const [enableSubagents, setEnableSubagents] = useState<boolean | null>(null)
@@ -38,16 +47,25 @@ export default function Command() {
     setBusy(true)
     setResult(null)
     setTranslation(null)
+    setAsyncRes(null)
     try {
-      const res = await api.dispatch({
+      const body = {
         prompt, role,
         context_memory: ctx || null,
         model: model || null,
         force,
         enable_subagents: enableSubagents,
-      })
-      setResult(res)
-      if (res.status !== 'blocked') refresh()
+        context_task_ids: ctxTaskIds.length > 0 ? ctxTaskIds : undefined,
+      }
+      if (mode === 'async') {
+        const res = await api.dispatchAsync(body)
+        setAsyncRes(res)
+        if (res.status === 'accepted') refresh()
+      } else {
+        const res = await api.dispatch(body)
+        setResult(res)
+        if (res.status !== 'blocked') refresh()
+      }
     } catch (e) {
       setResult({
         task_id: '', status: 'failed', output: null, artifacts: [],
@@ -56,6 +74,25 @@ export default function Command() {
     } finally {
       setBusy(false)
     }
+  }
+
+  // 二期：检索相似经验（混合检索 top-3 成功经验），一键附加为上下文记忆
+  const searchExperiences = async () => {
+    if (!prompt.trim()) return
+    setExpSearching(true)
+    try {
+      setExpResults(await api.searchExperiences({ query: prompt, successful_only: true, limit: 3 }))
+    } catch {
+      setExpResults([])
+    } finally {
+      setExpSearching(false)
+    }
+  }
+
+  const attachExperience = (r: ExperienceRecord) => {
+    const block = `[历史经验参考] ${r.exp_id}（${r.success ? '成功' : '失败'}）\n任务: ${r.prompt}\n产出: ${r.output_summary}`
+    setCtx((prev) => (prev ? `${prev}\n\n${block}` : block))
+    setExpResults(null)
   }
 
   // AI 推荐/解释：调独立上下文顾问（不污染任务上下文）；auto-apply 时后端会经安全关卡派发
@@ -169,14 +206,77 @@ export default function Command() {
               placeholder="sonnet" />
           </label>
         </div>
-        <label className="text-xs text-slate-500 mt-2 block">上下文记忆（可选）</label>
+        <div className="mt-2 flex items-center justify-between">
+          <label className="text-xs text-slate-500">上下文记忆（可选）</label>
+          <button onClick={searchExperiences} disabled={expSearching || !prompt.trim()}
+            className="text-xs text-mint-700 hover:underline font-medium disabled:opacity-40">
+            {expSearching ? '检索相似经验…' : '↸ 检索相似经验并附加'}
+          </button>
+        </div>
         <textarea value={ctx} onChange={(e) => setCtx(e.target.value)} rows={2}
           className="mt-1 w-full px-2 py-1 text-sm border border-slate-300 rounded"
           placeholder="用户偏好 / 前置上下文" />
-        <button onClick={() => send(false)} disabled={busy || !prompt.trim()}
-          className="mt-3 px-4 py-1.5 text-sm rounded bg-sky-600 text-white hover:bg-sky-700 disabled:opacity-40">
-          {busy ? '派发中…（大脑正在执行，请稍候）' : '派发'}
-        </button>
+        {expResults && (
+          <div className="mt-1.5 space-y-1">
+            {expResults.length === 0 && (
+              <div className="text-xs text-slate-400">没有相似的成功经验</div>
+            )}
+            {expResults.map((r) => (
+              <div key={r.exp_id} className="flex items-center gap-2 bg-mint-50/60 border border-mint-100 rounded-lg px-2 py-1.5">
+                <StatusBadge status={r.success ? 'done' : 'failed'} />
+                <span className="text-xs text-slate-600 truncate flex-1" title={r.output_summary}>
+                  {r.prompt.length > 50 ? r.prompt.slice(0, 50) + '…' : r.prompt}
+                </span>
+                <button onClick={() => attachExperience(r)}
+                  className="px-2 py-0.5 text-xs rounded bg-mint-600 text-white hover:bg-mint-500 shrink-0">附加</button>
+              </div>
+            ))}
+            <button onClick={() => setExpResults(null)} className="text-[11px] text-slate-400 hover:underline">收起</button>
+          </div>
+        )}
+
+        {/* 引用历史任务上下文（context_task_ids） */}
+        <div className="mt-2">
+          <label className="text-xs text-slate-500">引用历史任务上下文（续做任务时勾选，笔记将并入本次派发）</label>
+          <div className="mt-1 flex flex-wrap gap-1">
+            {(tasks ?? []).slice(0, 8).map((t) => {
+              const on = ctxTaskIds.includes(t.task_id)
+              return (
+                <button key={t.task_id}
+                  onClick={() => setCtxTaskIds((prev) => on ? prev.filter((x) => x !== t.task_id) : [...prev, t.task_id])}
+                  className={`px-2 py-0.5 text-xs rounded-full font-mono transition ${
+                    on ? 'bg-mint-600 text-white shadow-sm' : 'bg-slate-100 text-slate-500 hover:bg-mint-50 hover:text-mint-700'
+                  }`}>
+                  {t.task_id}
+                </button>
+              )
+            })}
+            {(tasks ?? []).length === 0 && <span className="text-xs text-slate-400">暂无历史任务</span>}
+          </div>
+        </div>
+
+        <div className="mt-3 flex items-center gap-2">
+          {/* 模式切换：同步阻塞 / 异步+SSE */}
+          <div className="inline-flex p-0.5 bg-slate-100 rounded-lg text-xs" role="group" aria-label="派发模式">
+            {(['sync', 'async'] as const).map((m) => (
+              <button key={m} onClick={() => setMode(m)}
+                className={`px-3 py-1 rounded-md transition ${
+                  mode === m ? 'bg-white shadow-sm font-semibold text-mint-700' : 'text-slate-500 hover:text-slate-700'
+                }`}>
+                {m === 'sync' ? '同步阻塞' : '异步+SSE'}
+              </button>
+            ))}
+          </div>
+          <button onClick={() => send(false)} disabled={busy || !prompt.trim()}
+            className={`px-5 py-1.5 text-sm rounded-lg text-white font-semibold shadow-sm transition disabled:opacity-40 ${
+              mode === 'async' ? 'bg-mint-600 hover:bg-mint-500' : 'bg-sky-600 hover:bg-sky-700'
+            }`}>
+            {busy ? '派发中…' : mode === 'async' ? '异步派发' : '派发'}
+          </button>
+          <span className="text-[11px] text-slate-400">
+            {mode === 'async' ? '立即返回 task_id，下方卡片实时跟踪' : '等待大脑执行完成返回'}
+          </span>
+        </div>
 
         <div className="mt-3 flex flex-wrap items-center gap-3 text-xs text-slate-600">
           <label className="flex items-center gap-1">
@@ -285,6 +385,18 @@ export default function Command() {
                   </div>
                 )}
               </>
+            )}
+          </div>
+        )}
+
+        {asyncRes && (
+          <div className="mt-4 border-t border-slate-100 pt-3">
+            {asyncRes.status !== 'accepted' ? (
+              <pre className="bg-rose-50 rounded p-2 text-sm whitespace-pre-wrap">
+                异步派发失败：{asyncRes.error || asyncRes.status}
+              </pre>
+            ) : (
+              <AsyncTaskCard taskId={asyncRes.task_id} onFinished={refresh} />
             )}
           </div>
         )}
@@ -405,6 +517,70 @@ export default function Command() {
             })}
           </div>
         </section>
+      )}
+    </div>
+  )
+}
+
+/** 异步派发的实时跟踪卡：2s 轮询任务状态，终态展示结果与用量 */
+function AsyncTaskCard({ taskId, onFinished }: { taskId: string; onFinished?: () => void }) {
+  const [task, setTask] = useState<TaskRecord | null>(null)
+  const [error, setError] = useState<string | null>(null)
+  const finishedRef = useRef(false)
+  const terminal = task ? ['done', 'failed', 'lost', 'cancelled', 'awaiting_approval'].includes(task.status) : false
+
+  useEffect(() => {
+    let alive = true
+    let timer: number | null = null
+    const tick = async () => {
+      try {
+        const t = await api.task(taskId)
+        if (!alive) return
+        setTask(t)
+        if (['done', 'failed', 'lost', 'cancelled'].includes(t.status) && !finishedRef.current) {
+          finishedRef.current = true
+          onFinished?.()
+        }
+        if (t.status !== 'done') timer = window.setTimeout(tick, 2000)
+        // awaiting_approval 停止轮询（等人工处理，可在任务页跟踪）
+      } catch (e) {
+        if (!alive) return
+        setError(e instanceof Error ? e.message : String(e))
+        timer = window.setTimeout(tick, 5000)
+      }
+    }
+    tick()
+    return () => {
+      alive = false
+      if (timer !== null) clearTimeout(timer)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [taskId])
+
+  return (
+    <div>
+      <div className="flex items-center gap-2 mb-2">
+        <span className="text-xs text-slate-500">异步任务</span>
+        {task ? <StatusBadge status={task.status} /> : <span className="text-xs text-slate-400">查询中…</span>}
+        <span className="font-mono text-xs">{taskId}</span>
+        {task?.meta?.cost_usd != null && (
+          <span className="text-xs text-mint-700">${task.meta.cost_usd.toFixed(4)}</span>
+        )}
+      </div>
+      {error && <div className="text-xs text-rose-600">{error}</div>}
+      {task?.output != null && (
+        <pre className="bg-slate-50 rounded p-2 text-sm whitespace-pre-wrap max-h-60 overflow-auto">{String(task.output)}</pre>
+      )}
+      {task?.error != null && (
+        <pre className="bg-rose-50 rounded p-2 text-sm whitespace-pre-wrap">{String(task.error)}</pre>
+      )}
+      {task?.status === 'awaiting_approval' && (
+        <div className="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded p-2">
+          ⏸ 任务被安全拦截挂起，请到「总览待办中心」或任务页处理
+        </div>
+      )}
+      {!terminal && !error && (
+        <div className="text-[11px] text-slate-400 mt-1">实时跟踪中（2s 轮询）…</div>
       )}
     </div>
   )
