@@ -95,9 +95,32 @@ def build_system_prompt(project_root: Path) -> str:
     return "\n\n".join(parts)
 
 
+def _subagents_enabled_default() -> bool:
+    """子代理派发全局默认（env ORCH_/AGENT_SUBAGENTS_ENABLED，缺省 True=行为不变）。"""
+    for name in ("ORCH_SUBAGENTS_ENABLED", "AGENT_SUBAGENTS_ENABLED"):
+        raw = os.environ.get(name)
+        if raw is not None and raw.strip() != "":
+            return raw.strip().lower() in ("1", "true", "yes", "on")
+    return True
+
+
+def _auto_apply_default() -> bool:
+    """顾问 auto-apply 全局默认（env ORCH_/AGENT_ADVISOR_AUTO_APPLY，缺省 False=仅建议）。"""
+    for name in ("ORCH_ADVISOR_AUTO_APPLY", "AGENT_ADVISOR_AUTO_APPLY"):
+        raw = os.environ.get(name)
+        if raw is not None and raw.strip() != "":
+            return raw.strip().lower() in ("1", "true", "yes", "on")
+    return False
+
+
 def build_options(project_root: Path, model: str | None, max_turns: int,
-                  permission_mode: str, resume_session_id: str | None = None):
-    """构造 SDK options：大脑提示 + 子 agent + MCP（可选）+ 会话续连。"""
+                  permission_mode: str, resume_session_id: str | None = None,
+                  enable_subagents: bool | None = None):
+    """构造 SDK options：大脑提示 + 子 agent（可开关）+ MCP（可选）+ 会话续连。
+
+    enable_subagents：本次运行覆盖子代理派发开关；None=跟随全局默认
+    （ORCH_/AGENT_SUBAGENTS_ENABLED）。关闭时不挂 agents → 大脑不会派生 SDK 子代理。
+    """
     import claude_agent_sdk as sdk
 
     option_kwargs: dict = {
@@ -105,8 +128,13 @@ def build_options(project_root: Path, model: str | None, max_turns: int,
         "system_prompt": build_system_prompt(project_root),
         "max_turns": max_turns,
         "permission_mode": permission_mode,
-        "agents": parse_subagents(project_root / ".claude" / "agents"),
     }
+    effective_subagents = (enable_subagents if enable_subagents is not None
+                           else _subagents_enabled_default())
+    if effective_subagents:
+        agents = parse_subagents(project_root / ".claude" / "agents")
+        if agents:
+            option_kwargs["agents"] = agents
     if model:
         option_kwargs["model"] = model
     mcp_servers = load_mcp_servers(os.environ.get("ORCH_MCP_CONFIG", ""))
@@ -142,6 +170,84 @@ def _dim_enabled() -> bool:
 
 def dim(text: str) -> str:
     return f"\033[2m{text}\033[0m" if _dim_enabled() else text
+
+
+_ADVISOR = None
+
+
+def _get_advisor():
+    """惰性构造 CLI 用的独立上下文顾问（AdvisorService，绝不污染任务上下文）。"""
+    global _ADVISOR
+    if _ADVISOR is None:
+        from agent_core.advisor import AdvisorService
+        from agent_core.config import load_agent_config
+        cfg = load_agent_config(project_root=str(_PROJECT_ROOT))
+        _ADVISOR = AdvisorService(
+            cfg, persona_dir=str(_PROJECT_ROOT / ".claude" / "agents"))
+    return _ADVISOR
+
+
+def _print_advice(result) -> None:
+    """把 AdvisorResult 渲染为 CLI 文本（弱化样式）。"""
+    should = bool(getattr(result, "should_dispatch", False))
+    verdict = "建议派发子代理" if should else "不建议派发子代理（单 agent 即可完成）"
+    print(f"\n推荐：{verdict}")
+    roles = getattr(result, "roles", None) or []
+    if roles:
+        print(dim(f"  角色：{', '.join(str(r) for r in roles)}"))
+    plan = getattr(result, "plan", None) or []
+    if plan:
+        print(dim("  拆解计划："))
+        for step in plan:
+            if isinstance(step, dict):
+                sid = step.get("id", "?")
+                action = step.get("action", "")
+                deps = step.get("depends_on", []) or []
+                dep = f"（依赖 {deps}）" if deps else ""
+                print(dim(f"    {sid}. {action}{dep}"))
+            else:
+                print(dim(f"    - {step}"))
+    explanation = getattr(result, "explanation", "") or ""
+    if explanation:
+        print(f"  解释：{explanation}")
+    risks = getattr(result, "risks", None) or []
+    if risks:
+        print(dim("  风险："))
+        for r in risks:
+            print(dim(f"    - {r}"))
+    print(dim("  （顾问运行于独立上下文，未触碰本任务会话/记忆/经验）"))
+
+
+_TRANSLATOR = None
+
+
+def _get_translator():
+    """惰性构造 CLI 用的独立上下文翻译服务（TranslatorService，绝不污染任务上下文）。"""
+    global _TRANSLATOR
+    if _TRANSLATOR is None:
+        from agent_core.config import load_agent_config
+        from agent_core.translator import TranslatorService
+        cfg = load_agent_config(project_root=str(_PROJECT_ROOT))
+        _TRANSLATOR = TranslatorService(
+            cfg, persona_dir=str(_PROJECT_ROOT / ".claude" / "agents"))
+    return _TRANSLATOR
+
+
+def _print_translation(result) -> None:
+    """把 TranslationResult 渲染为 CLI 文本（弱化样式）。"""
+    if getattr(result, "error", ""):
+        print(f"[翻译失败] {result.error}")
+        return
+    skipped = getattr(result, "skipped", "")
+    if skipped == "already_target_lang":
+        print(dim(f"· 文本已是目标语言（{getattr(result, 'target_lang', 'zh')}），无需翻译"))
+        return
+    if skipped == "empty":
+        print(dim("· 待翻译文本为空"))
+        return
+    print(f"\n译文（{getattr(result, 'target_lang', 'zh')}）：")
+    print(getattr(result, "translated", "") or "")
+    print(dim("  （翻译运行于独立上下文，未触碰本任务会话/记忆/经验）"))
 
 
 def run_turn(prompt: str, options) -> dict:
@@ -180,10 +286,12 @@ def run_turn(prompt: str, options) -> dict:
 # ---- 会话状态与命令注册表（borrowed: Aider slash 体系 / Claude Code /cost） ----
 
 class Session:
-    def __init__(self, model: str | None, max_turns: int, permission_mode: str):
+    def __init__(self, model: str | None, max_turns: int, permission_mode: str,
+                 enable_subagents: bool | None = None):
         self.model = model
         self.max_turns = max_turns
         self.permission_mode = permission_mode
+        self.enable_subagents = enable_subagents  # None=跟随全局默认
         self.session_id: str | None = None
         self.total_turns = 0
         self.total_cost = 0.0
@@ -210,8 +318,49 @@ def handle_command(text: str, session: Session) -> bool:
         print(dim(f"本轮会话累计：turns={session.total_turns} "
                   f"cost=${session.total_cost:.4f}"))
         return True
+    if cmd == "/recommend":
+        task = text[len("/recommend"):].strip()
+        if not task:
+            print(dim("· 用法：/recommend <任务描述>（独立上下文，仅建议不执行）"))
+            return True
+        try:
+            result = _get_advisor().recommend(task, mode="all")
+        except Exception as e:  # noqa: BLE001 - 顾问异常不拖垮 REPL
+            print(f"[顾问异常] {e}")
+            return True
+        _print_advice(result)
+        return True
+    if cmd == "/translate":
+        payload = text[len("/translate"):].strip()
+        if not payload:
+            print(dim("· 用法：/translate <要翻译的文本>（独立上下文，思考英文/结果中文）"))
+            return True
+        try:
+            tr = _get_translator().translate(payload)
+        except Exception as e:  # noqa: BLE001 - 翻译异常不拖垮 REPL
+            print(f"[翻译异常] {e}")
+            return True
+        _print_translation(tr)
+        return True
+    if cmd == "/subagents":
+        parts = text.split()
+        arg = (parts[1] if len(parts) > 1 else "").lower()
+        if arg in ("on", "1", "true", "yes"):
+            session.enable_subagents = True
+        elif arg in ("off", "0", "false", "no"):
+            session.enable_subagents = False
+        elif arg in ("default", "auto", ""):
+            session.enable_subagents = None
+        else:
+            print(dim("· 用法：/subagents on|off|default"))
+            return True
+        state = {True: "开", False: "关", None: "跟随全局默认"}[session.enable_subagents]
+        print(dim(f"· 子代理派发：{state}（下一轮生效）"))
+        return True
     if cmd == "/help":
         print("命令：/new 新会话 | /memory 查看核心记忆 | /cost 累计用量 | /exit 退出")
+        print("      /recommend <任务> 让顾问推荐并解释（独立上下文） | /subagents on|off|default 子代理派发开关")
+        print("      /translate <文本> 把结果翻译成中文（独立上下文，思考英文/结果中文）")
         print("其余输入都是给大脑的任务；长对话由 Claude Code 内核自动压缩。")
         return True
     print(dim(f"· 未知命令 {cmd}（未发送；/help 查看命令）"))
@@ -252,7 +401,8 @@ def repl(session: Session, resume: bool = False) -> None:
         try:
             options = build_options(_PROJECT_ROOT, session.model, session.max_turns,
                                     session.permission_mode,
-                                    resume_session_id=session.session_id)
+                                    resume_session_id=session.session_id,
+                                    enable_subagents=session.enable_subagents)
             info = run_turn(text, options)
         except KeyboardInterrupt:
             print(dim("\n[已中断本轮]"))
@@ -278,16 +428,49 @@ def main() -> None:
     parser.add_argument("--max-turns", type=int,
                         default=int(os.environ.get("ORCH_MAX_TURNS", "100")))
     parser.add_argument("--permission-mode",
-                        default=os.environ.get("ORCH_PERMISSION_MODE", "bypassPermissions"))
+                        default=os.environ.get("ORCH_PERMISSION_MODE", "default"))
+    # 子代理派发开关（互斥；缺省 None=跟随 ORCH_/AGENT_SUBAGENTS_ENABLED）
+    sub = parser.add_mutually_exclusive_group()
+    sub.add_argument("--subagents", dest="subagents", action="store_true",
+                     default=None, help="本次运行启用子代理派发")
+    sub.add_argument("--no-subagents", dest="subagents", action="store_false",
+                     help="本次运行禁用子代理派发")
+    # AI 推荐/解释顾问（独立上下文）
+    parser.add_argument("--recommend", action="store_true",
+                        help="只让顾问推荐并解释（独立上下文，默认不执行任务）")
+    parser.add_argument("--advisor-mode",
+                        default=os.environ.get("ORCH_ADVISOR_MODE", "all"),
+                        choices=["pre_flight", "plan", "explain", "all"],
+                        help="顾问模式（pre_flight/plan/explain/all）")
+    parser.add_argument("--auto-apply", dest="auto_apply", action="store_true",
+                        default=None,
+                        help="顾问建议派发后自动执行（缺省跟随 ORCH_/AGENT_ADVISOR_AUTO_APPLY）")
     args = parser.parse_args()
 
-    session = Session(args.model, args.max_turns, args.permission_mode)
+    session = Session(args.model, args.max_turns, args.permission_mode,
+                      enable_subagents=args.subagents)
     if args.resume:
         session.session_id = load_session()
+
+    # --recommend：先跑独立上下文顾问，打印建议；仅当 auto-apply 且建议派发时才继续执行
+    if args.prompt and args.recommend:
+        try:
+            result = _get_advisor().recommend(args.prompt, mode=args.advisor_mode)
+        except Exception as e:  # noqa: BLE001 - 顾问异常不阻断主流程
+            print(f"[顾问异常] {e}")
+            return
+        _print_advice(result)
+        auto_apply = (args.auto_apply if args.auto_apply is not None
+                      else _auto_apply_default())
+        if not (auto_apply and getattr(result, "should_dispatch", False)):
+            return
+        print(dim("· auto-apply：按建议执行任务"))
+
     if args.prompt:
         options = build_options(_PROJECT_ROOT, session.model, session.max_turns,
                                 session.permission_mode,
-                                resume_session_id=session.session_id)
+                                resume_session_id=session.session_id,
+                                enable_subagents=args.subagents)
         info = run_turn(args.prompt, options)
         session.total_turns = info.get("num_turns") or 0
         if info.get("cost_usd") is not None:

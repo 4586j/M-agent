@@ -309,3 +309,54 @@ def test_write_bumps_version(tmp_path):
     store.search("analyze data")
     assert _rec_by_id(store, "exp-1").version == 2
     assert _rec_by_id(store, "exp-1").hits == 1
+
+
+# ── embedding 注入（阶段四记忆修复：ExperienceStore 接入 embedding_model）──
+
+class _FakeEmbedding:
+    """确定性假 embedding：文本含关键词则返回对应单位向量。"""
+
+    def __init__(self, mapping):
+        self.mapping = mapping
+
+    def encode(self, text):
+        for kw, vec in self.mapping.items():
+            if kw in text:
+                return list(vec)
+        return [0.0] * len(next(iter(self.mapping.values())))
+
+
+def test_search_with_embedding_model_fuses_semantic(tmp_path):
+    store = ExperienceStore(str(tmp_path), embedding_model=_FakeEmbedding({
+        "python": [1.0, 0.0],
+        "rust": [0.0, 1.0],
+    }))
+    store.write(ExperienceRecord(exp_id="exp-py", role="executor",
+                                 prompt="python 脚本任务", output_summary="完成",
+                                 success=True, embedding=[1.0, 0.0]))
+    store.write(ExperienceRecord(exp_id="exp-rs", role="executor",
+                                 prompt="rust 工具任务", output_summary="完成",
+                                 success=True, embedding=[0.0, 1.0]))
+    # 语义向量路与关键词路 RRF 融合：python 查询命中 python 记录
+    hits = store.search("python 开发", successful_only=False)
+    assert hits and hits[0].exp_id == "exp-py"
+
+
+def test_reindex_fills_missing_embeddings(tmp_path):
+    store = ExperienceStore(str(tmp_path), embedding_model=_FakeEmbedding({
+        "python": [1.0, 0.0],
+    }))
+    store.write(ExperienceRecord(exp_id="exp-1", role="executor",
+                                 prompt="python 任务", output_summary="",
+                                 success=True))
+    assert store.reindex() == 1            # 为缺向量的记录补齐
+    assert store.get("exp-1").embedding == [1.0, 0.0]
+    assert store.reindex() == 0            # 第二次全量已齐，无更新
+
+
+def test_reindex_without_model_is_noop(tmp_path):
+    store = ExperienceStore(str(tmp_path))
+    store.write(ExperienceRecord(exp_id="exp-2", role="executor",
+                                 prompt="x", output_summary="", success=True))
+    assert store.reindex() == 0
+    assert store.get("exp-2").embedding is None

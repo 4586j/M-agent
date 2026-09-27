@@ -56,12 +56,14 @@ class TaskScheduler:
             if now < next_ts:
                 continue
             try:
-                self.dispatcher.dispatch(
+                res = self.dispatcher.dispatch(
                     role=rec.role, prompt=rec.prompt,
                     context_memory=rec.context_memory, model=rec.model,
                 )
                 self.schedule_store.update_last_run(rec.schedule_id, self._ts())
                 self._update_next_run(rec)
+                log.info("[trace=%s] schedule=%s dispatched task=%s",
+                         res.trace_id, rec.schedule_id, res.task_id)
                 triggered.append(rec.schedule_id)
             except Exception:
                 log.exception("scheduled dispatch failed for %s", rec.schedule_id)
@@ -92,12 +94,14 @@ class TaskScheduler:
         if rec is None:
             return False
         try:
-            self.dispatcher.dispatch(
+            res = self.dispatcher.dispatch(
                 role=rec.role, prompt=rec.prompt,
                 context_memory=rec.context_memory, model=rec.model,
             )
             self.schedule_store.update_last_run(schedule_id, self._ts())
             self._update_next_run(rec)
+            log.info("[trace=%s] schedule=%s manual trigger dispatched task=%s",
+                     res.trace_id, schedule_id, res.task_id)
             return True
         except Exception:
             log.exception("manual trigger failed for %s", schedule_id)

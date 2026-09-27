@@ -261,3 +261,40 @@ def test_register_to_brain_retries_then_fails(monkeypatch):
 
     assert register_to_brain(cfg, http_post=fake_post) is False
 
+
+def test_trace_id_flows_to_runner_and_callback(tmp_path, monkeypatch):
+    """brain 下发 trace_id：透传给 runner，callback 时作为顶层字段带回（含 meta）。"""
+    import requests
+    captured = {}
+
+    class TraceRunner(FakeAgentRunner):
+        def run(self, req):
+            captured["req_trace"] = req.trace_id
+            return super().run(req)
+
+    class FakeResp:
+        status_code = 200
+
+    def fake_post(url, json=None, timeout=None, headers=None):
+        captured["url"] = url
+        captured["payload"] = json
+        return FakeResp()
+
+    monkeypatch.setattr(requests, "post", fake_post)
+    client = TestClient(create_worker_app(TraceRunner(work_dir=str(tmp_path)),
+                                          WorkerConfig(work_dir=str(tmp_path))))
+    r = client.post("/task", json={
+        "task_id": "task-1", "prompt": "p", "context_memory": "", "model": None,
+        "trace_id": "trc-abc123",
+        "callback_url": "http://brain:7000/tasks/task-1/callback"})
+    assert r.status_code == 200
+    _wait_terminal(client, "task-1")
+    # callback 在后台线程发出，轮询等待其到达
+    deadline = time.time() + 5
+    while "payload" not in captured and time.time() < deadline:
+        time.sleep(0.02)
+    assert captured.get("req_trace") == "trc-abc123"
+    payload = captured.get("payload") or {}
+    assert payload.get("trace_id") == "trc-abc123"
+    assert "meta" in payload
+

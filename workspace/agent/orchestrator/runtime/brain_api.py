@@ -1,14 +1,24 @@
-"""大脑 HTTP 服务：接收 worker 注册/心跳，查询任务与 worker，并代理派发。"""
+"""大脑 HTTP 服务：接收 worker 注册/心跳，查询任务与 worker，并代理派发。
+
+阶段三可观测性：GET /tasks/{id}/events 提供 SSE 实时事件流（status/callback/done，
+鉴权同时接受 X-API-Key 头与 ?api_key= 查询参数，适配 EventSource 无法带 header）;
+GET /stats 附带 cost 成本聚合（按日近 7 天 / 按 role / 按 model，源自 TaskRecord.meta）
+与 quality 输出质量聚合（按 model 统计退化任务数与比率）。
+"""
+import asyncio
 import os
 import time
+import uuid
 from dataclasses import asdict
+from datetime import datetime
 from pathlib import Path
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from task_store import TaskStore
+from task_store import TaskStore, TaskRecord, new_trace_id
 from worker_registry import WorkerRegistry, WorkerInfo
 from dispatcher import Dispatcher, RemoteDispatcher, DispatchResult
 from async_dispatcher import AsyncRemoteDispatcher
@@ -24,6 +34,8 @@ from task_scheduler import TaskScheduler
 from auth import add_auth_middleware
 from safe_id import validate_id, validate_host
 from dispatch_common import clamp_context, assemble_context
+from audit_log import record_security_event
+from event_bus import TaskEvent, TaskEventBus, TERMINAL_STATUSES, publish_task_event
 
 
 class RegisterReq(BaseModel):
@@ -46,6 +58,27 @@ class DispatchReq(BaseModel):
     model: str | None = None
     force: bool = False  # 跳过 security-guard 检验，用于放行 block 指令
     context_task_ids: list[str] = []  # 引用历史任务的上下文记忆笔记，并入本次派发
+    # 评测消融硬关：默认 True（行为不变）；置 False 时派发层不检索/不注入
+    # 历史经验（读关）且不沉淀经验（写关），供「无经验」对照组 A/B 评测。
+    use_experience: bool = True
+    # 子代理派发每次请求覆盖：None=跟随全局 AGENT_/ORCH_SUBAGENTS_ENABLED；
+    # True/False=本次派发强制启用/禁用子代理（单机本地执行生效；远程受全局闸）。
+    enable_subagents: bool | None = None
+
+
+class AdvisorReq(BaseModel):
+    """AI 推荐/解释顾问请求。顾问运行于独立上下文，绝不污染任务上下文。"""
+    task: str
+    mode: str = "all"  # pre_flight | plan | explain | all
+    finished_output: str | None = None  # explain 模式附上已完成产出
+    enable_subagents: bool | None = None  # auto-apply 派发时透传的每次请求覆盖
+    auto_apply: bool | None = None  # None=跟随全局 advisor_auto_apply
+
+
+class TranslateReq(BaseModel):
+    """结果翻译请求。翻译运行于独立上下文，绝不污染任务上下文。"""
+    text: str
+    target_lang: str | None = None  # None=跟随全局 translate_target_lang（默认 zh）
 
 
 class MemoryWriteReq(BaseModel):
@@ -67,6 +100,15 @@ class ProceduralVoteReq(BaseModel):
 
 class RedispatchReq(BaseModel):
     model: str | None = None
+
+
+class ApproveReq(BaseModel):
+    # 修订后的 prompt；缺省=按原拦截指令人工放行（不再重检）
+    prompt: str | None = None
+
+
+class RejectReq(BaseModel):
+    reason: str = ""
 
 
 class ExperienceSearchReq(BaseModel):
@@ -98,6 +140,111 @@ def _default_web_dist() -> str:
     return "web/dist"
 
 
+def _request_operator(request: Request) -> str | None:
+    """尽力还原请求来源（审计 operator 字段）：优先 X-Operator 头，其次客户端 host。"""
+    op = request.headers.get("X-Operator")
+    if op:
+        return op
+    client = request.client
+    return client.host if client else None
+
+
+_USAGE_KEYS = ("input_tokens", "output_tokens",
+               "cache_read_input_tokens", "cache_creation_input_tokens")
+_COST_DAY_WINDOW = 7 * 86400  # 按日聚合窗口：近 7 天
+
+
+def _usage_tokens(usage) -> int | None:
+    """usage dict -> 总 token 数；无有效数值时返回 None（口径与 eval/run_eval 一致）。"""
+    if not isinstance(usage, dict):
+        return None
+    nums = [usage[k] for k in _USAGE_KEYS if isinstance(usage.get(k), (int, float))]
+    return int(sum(nums)) if nums else None
+
+
+def _aggregate_costs(tasks: list) -> dict:
+    """从 TaskRecord.meta 聚合 token 与成本：按日（近 7 天）/ 按 role / 按 model。
+
+    数据源为 dispatcher 终态化时入库的 worker callback meta（阶段三新增）；
+    无 meta 的任务仍计入 tasks 计数，tokens/cost_usd 缺失时置 null。
+    """
+    now = time.time()
+
+    def _new_bucket() -> dict:
+        return {"tasks": 0, "tokens": 0, "cost_usd": 0.0,
+                "_has_tokens": False, "_has_cost": False}
+
+    def _acc(b: dict, tokens: int | None, cost: float | None) -> None:
+        b["tasks"] += 1
+        if tokens is not None:
+            b["tokens"] += tokens
+            b["_has_tokens"] = True
+        if cost is not None:
+            b["cost_usd"] += cost
+            b["_has_cost"] = True
+
+    by_day: dict[str, dict] = {}
+    by_role: dict[str, dict] = {}
+    by_model: dict[str, dict] = {}
+    total = _new_bucket()
+    for t in tasks:
+        meta = t.meta if isinstance(t.meta, dict) else {}
+        tokens = _usage_tokens(meta.get("usage"))
+        cost = meta.get("cost_usd")
+        cost = cost if isinstance(cost, (int, float)) else None
+        model = meta.get("model")
+        _acc(total, tokens, cost)
+        ts = None
+        try:
+            ts = float(t.updated_at)
+        except (TypeError, ValueError):
+            ts = None
+        if ts is not None and now - ts <= _COST_DAY_WINDOW:
+            day = datetime.fromtimestamp(ts).strftime("%Y-%m-%d")
+            _acc(by_day.setdefault(day, _new_bucket()), tokens, cost)
+        _acc(by_role.setdefault(t.role, _new_bucket()), tokens, cost)
+        if model:
+            _acc(by_model.setdefault(str(model), _new_bucket()), tokens, cost)
+
+    def _clean(b: dict) -> dict:
+        return {"tasks": b["tasks"],
+                "tokens": b["tokens"] if b["_has_tokens"] else None,
+                "cost_usd": round(b["cost_usd"], 6) if b["_has_cost"] else None}
+
+    return {
+        "total": _clean(total),
+        "by_day": [{"date": d, **_clean(by_day[d])}
+                   for d in sorted(by_day)],
+        "by_role": {k: _clean(v) for k, v in sorted(by_role.items())},
+        "by_model": {k: _clean(v) for k, v in sorted(by_model.items())},
+    }
+
+
+def _aggregate_quality(tasks: list) -> dict:
+    """从 TaskRecord.meta 聚合输出质量：按 model 统计任务数与退化率。
+
+    degenerate 标记由内核兜底流程写入 KernelResult.meta，经 worker 侧
+    agent_runner / brain 本地 dispatcher 的 _kernel_meta 并入 TaskRecord.meta；
+    meta 缺失视为非退化。model 缺失的任务归入 "" 键（缺失为空）。
+    口径：发生过退化检出（detected=True）即计入，含重试恢复与熔断。
+    """
+    by_model: dict[str, dict] = {}
+    for t in tasks:
+        meta = t.meta if isinstance(t.meta, dict) else {}
+        model = str(meta.get("model") or "")
+        degen = meta.get("degenerate")
+        detected = bool(isinstance(degen, dict) and degen.get("detected"))
+        b = by_model.setdefault(model, {"tasks": 0, "degenerate": 0})
+        b["tasks"] += 1
+        if detected:
+            b["degenerate"] += 1
+    return {"by_model": {
+        k: {"tasks": v["tasks"], "degenerate": v["degenerate"],
+            "rate": round(v["degenerate"] / v["tasks"], 4) if v["tasks"] else 0.0}
+        for k, v in sorted(by_model.items())
+    }}
+
+
 def create_brain_app(registry: WorkerRegistry, task_store: TaskStore, cfg: Config,
                      dispatcher: Dispatcher | None = None,
                      experience_store: ExperienceStore | None = None,
@@ -107,9 +254,19 @@ def create_brain_app(registry: WorkerRegistry, task_store: TaskStore, cfg: Confi
                      schedule_store: ScheduleStore | None = None,
                      task_scheduler: TaskScheduler | None = None,
                      async_dispatcher: AsyncRemoteDispatcher | None = None,
-                     http_call=None) -> FastAPI:
-    """dispatcher 可选：remote 模式传入 RemoteDispatcher，使派发与注册状态同进程。"""
+                     event_bus: TaskEventBus | None = None,
+                     http_call=None,
+                     advisor=None,
+                     translator=None) -> FastAPI:
+    """dispatcher 可选：remote 模式传入 RemoteDispatcher，使派发与注册状态同进程。
+
+    event_bus 可选：SSE 实时流的事件总线；未传入时自建（派发器未接总线时
+    仅 /tasks/{id}/events 的快照+取消/lost 终态可发布，回调解路径共享实例才有事件）。
+    advisor 可选：AdvisorService（独立上下文推荐/解释）；未传入时 /recommend 返回未配置。
+    translator 可选：TranslatorService（独立上下文结果翻译）；未传入时 /translate 返回未配置。
+    """
     app = FastAPI()
+    bus = event_bus or TaskEventBus()
     if http_call is None:
         http_call = _make_http_call(cfg.api_key)
 
@@ -129,6 +286,10 @@ def create_brain_app(registry: WorkerRegistry, task_store: TaskStore, cfg: Confi
     )
 
     add_auth_middleware(app, cfg.api_key)
+
+    # 审计流水只读 API（独立 router：GET /audit，受同一鉴权中间件保护）
+    from audit_api import create_audit_router
+    app.include_router(create_audit_router())
 
     def _route_model(req: DispatchReq) -> str | None:
         """启发式模型路由（ORCH_MODEL_ROUTING=heuristic 时启用，默认 off）。
@@ -177,8 +338,10 @@ def create_brain_app(registry: WorkerRegistry, task_store: TaskStore, cfg: Confi
         return {"status": "unregistered", "worker_id": worker_id}
 
     @app.get("/tasks")
-    def list_tasks(worker_id: str | None = None):
+    def list_tasks(worker_id: str | None = None, status: str | None = None):
         recs = task_store.list_by_worker(worker_id) if worker_id else task_store.list_all()
+        if status:
+            recs = [r for r in recs if r.status == status]
         return [asdict(r) for r in recs]
 
     @app.get("/tasks/{task_id}")
@@ -202,7 +365,18 @@ def create_brain_app(registry: WorkerRegistry, task_store: TaskStore, cfg: Confi
                     http_call("POST", f"http://{w.host}:{w.port}/task/{task_id}/cancel")
                 except Exception:
                     pass
-        return asdict(task_store.update(task_id, status="cancelled"))
+        # 本地执行（ORCH_LOCAL_EXEC）：worker_id=="local"、无远程 worker 可通知，
+        # 需直接信号派发器置位该任务的 cancel_event，否则本地执行收不到取消。
+        if dispatcher is not None and hasattr(dispatcher, "cancel"):
+            try:
+                dispatcher.cancel(task_id)
+            except Exception:  # noqa: BLE001 - 取消信号失败不阻断状态置终
+                pass
+        rec = task_store.update(task_id, status="cancelled")
+        # cancelled 属终态：发布 done 事件让 SSE 订阅流关闭
+        publish_task_event(bus, task_id, event="done", state="cancelled",
+                           trace_id=rec.trace_id, summary="cancelled by request")
+        return asdict(rec)
 
     @app.post("/tasks/{task_id}/retry")
     def retry_task(task_id: str):
@@ -213,6 +387,11 @@ def create_brain_app(registry: WorkerRegistry, task_store: TaskStore, cfg: Confi
             raise HTTPException(status_code=404, detail="task not found")
         if rec.status not in ("lost", "failed"):
             raise HTTPException(status_code=400, detail=f"无法重试，任务当前状态为 {rec.status}")
+        # 被人工拒绝的指令不允许经 retry 绕过安全关卡重新执行
+        rec_meta = rec.meta if isinstance(rec.meta, dict) else {}
+        if (rec_meta.get("approval") or {}).get("status") == "rejected":
+            raise HTTPException(status_code=400,
+                                detail="被人工拒绝的指令不可重试，请修订后重新派发")
         try:
             res = dispatcher.dispatch(role=rec.role, prompt=rec.prompt)
         except RuntimeError as e:
@@ -230,6 +409,20 @@ def create_brain_app(registry: WorkerRegistry, task_store: TaskStore, cfg: Confi
     def redispatch_task(task_id: str, req: RedispatchReq):
         if dispatcher is None:
             raise HTTPException(status_code=400, detail="dispatcher 未配置（local 模式不支持重派）")
+        # 待审批/派发占位中的任务不可重派：需先走 approve/reject 人工裁决流程
+        rec0 = task_store.get(task_id)
+        if rec0 is not None and rec0.status == "awaiting_approval":
+            raise HTTPException(status_code=400,
+                                detail="待审批任务不可重派，请先走 approve/reject 流程")
+        if rec0 is not None and rec0.status == "dispatching":
+            raise HTTPException(status_code=400,
+                                detail="任务正在审批派发中，不可重派")
+        # 被人工拒绝的指令不允许经 redispatch 绕过安全关卡重新执行（与 retry 同检查）
+        if rec0 is not None:
+            rec_meta = rec0.meta if isinstance(rec0.meta, dict) else {}
+            if (rec_meta.get("approval") or {}).get("status") == "rejected":
+                raise HTTPException(status_code=400,
+                                    detail="被人工拒绝的指令不可重派，请修订后重新派发")
         try:
             res = dispatcher.redispatch(task_id, model=req.model)
         except KeyError as e:
@@ -242,16 +435,196 @@ def create_brain_app(registry: WorkerRegistry, task_store: TaskStore, cfg: Confi
             "product_verdict": res.verdict,
         }
 
+    def _approval_meta(rec: TaskRecord) -> dict:
+        """读取任务 meta 中的 approval 详情（缺省空 dict，类型容错）。"""
+        meta = rec.meta if isinstance(rec.meta, dict) else {}
+        approval = meta.get("approval")
+        return dict(approval) if isinstance(approval, dict) else {}
+
+    def _await_approval(req: DispatchReq, verdict: dict, request: Request) -> dict:
+        """block 指令转入待审批：任务挂起而非直接终结（阶段四审批挂起态）。
+
+        被拦截指令与裁决详情存 TaskRecord.meta["approval"]，状态置
+        awaiting_approval（非终态：不参与自动重试、不被 sweeper 标 lost、
+        SSE 流保持打开）；进入该状态发布 status 事件（时间线可见）。
+        force=true 仍直接放行（兼容旧有行为）。
+        """
+        task_id = f"task-{uuid.uuid4().hex[:8]}"
+        trace_id = new_trace_id()
+        ts = str(int(time.time()))
+        model = _route_model(req)
+        task_store.write(TaskRecord(
+            task_id=task_id, role=req.role, prompt=req.prompt, worker_id=None,
+            status="awaiting_approval", created_at=ts, updated_at=ts,
+            output=None, artifacts=[], error=None, trace_id=trace_id,
+            meta={"approval": {
+                "status": "pending",
+                "verdict": verdict,
+                "original_prompt": req.prompt,
+                "context_memory": req.context_memory,
+                "context_task_ids": req.context_task_ids,
+                "model": model,
+                "requested_by": _request_operator(request),
+            }},
+        ))
+        publish_task_event(bus, task_id, event="status", state="awaiting_approval",
+                           trace_id=trace_id,
+                           summary=str(verdict.get("reason") or "指令被安全关卡拦截，待人工审批"))
+        return {"status": "awaiting_approval", "task_id": task_id,
+                "verdict": verdict, "output": None, "artifacts": [], "error": None}
+
+    @app.post("/tasks/{task_id}/approve")
+    def approve_task(task_id: str, req: ApproveReq, request: Request):
+        """人工批准待审批任务：修订 prompt 则重过 security-guard，通过后按原流程派发。"""
+        if dispatcher is None:
+            raise HTTPException(status_code=400,
+                                detail="dispatcher 未配置（local 模式不支持审批派发）")
+        rec = task_store.get(task_id)
+        if rec is None:
+            raise HTTPException(status_code=404, detail="task not found")
+        if rec.status != "awaiting_approval":
+            raise HTTPException(status_code=400,
+                                detail=f"任务当前状态为 {rec.status}，非待审批")
+        # 原子占位（compare-and-set）：awaiting_approval -> dispatching。本端点是
+        # sync def，在线程池并发运行，「读状态→校验→派发（最长500s）→更新」窗口
+        # 内并发 approve 会双重派发同一危险指令；先占位使并发裁决者拿到 409。
+        if not task_store.transition(task_id, "awaiting_approval", "dispatching"):
+            raise HTTPException(status_code=409,
+                                detail="任务已被其他请求处理（并发裁决冲突），请刷新后重试")
+        approval = _approval_meta(rec)
+        operator = _request_operator(request)
+        revised_prompt = (req.prompt or "").strip()
+        revised = bool(revised_prompt and revised_prompt != rec.prompt)
+        prompt = revised_prompt or rec.prompt
+        if revised:
+            # 修订后的指令必须重过安全关卡；不通过则回滚占位并更新裁决详情
+            v = security_check(prompt, use_llm=cfg.security_llm)
+            record_security_event(
+                task_id=task_id, stage="approve",
+                decision="warn" if (v["verdict"] == "pass" and v.get("matched_rules"))
+                else v["verdict"],
+                matched_rules=v.get("matched_rules"), operator=operator,
+                llm_enhanced=bool(v.get("llm_enhanced", cfg.security_llm)),
+                reason=v.get("reason", ""))
+            if v["verdict"] == "block":
+                task_store.transition(task_id, "dispatching", "awaiting_approval")
+                approval["status"] = "pending"
+                approval["verdict"] = v
+                approval["revised_prompt"] = prompt
+                meta = dict(rec.meta or {})
+                meta["approval"] = approval
+                task_store.update(task_id, meta=meta, updated_at=str(int(time.time())))
+                publish_task_event(bus, task_id, event="status",
+                                   state="awaiting_approval", trace_id=rec.trace_id,
+                                   summary="修订后的指令仍未通过安全检验，维持待审批")
+                return {"status": "awaiting_approval", "task_id": task_id,
+                        "approved": False, "verdict": v,
+                        "error": "修订后的指令仍未通过安全检验，请继续修订或拒绝"}
+        else:
+            # 原指令人工放行：人工裁决即放行，不再重检；审计留痕关联原拦截裁决
+            record_security_event(
+                task_id=task_id, stage="approve", decision="approve",
+                matched_rules=approval.get("verdict", {}).get("matched_rules"),
+                operator=operator, llm_enhanced=cfg.security_llm,
+                reason="人工批准放行被拦截指令")
+        # 按原流程派发：沿用挂起时缓存的 context/model，修订时用修订后 prompt
+        context = approval.get("context_memory") or ""
+        ctx_task_ids = approval.get("context_task_ids") or []
+        if memory_store is not None and ctx_task_ids:
+            context = assemble_context(memory_store, context, ctx_task_ids)
+        context = clamp_context(context, cfg.context_memory_max_chars)
+        model = approval.get("model")
+        try:
+            res = dispatcher.dispatch(role=rec.role, prompt=prompt,
+                                      context_memory=context or None, model=model)
+        except Exception as e:  # noqa: BLE001 - 派发失败回滚占位，任务回到待审批
+            task_store.transition(task_id, "dispatching", "awaiting_approval")
+            publish_task_event(bus, task_id, event="status", state="awaiting_approval",
+                               trace_id=rec.trace_id,
+                               summary=f"approve 派发失败，回到待审批: {e}")
+            # 响应契约（与前端约定）：approved=false 才视为未成功放行
+            return {"approved": False, "status": "failed",
+                    "error": str(e), "task_id": task_id}
+        approval["status"] = "approved"
+        approval["approved_prompt"] = prompt
+        approval["approved_by"] = operator
+        approval["dispatched_task_id"] = res.task_id
+        meta = dict(rec.meta or {})
+        meta["approval"] = approval
+        task_store.update(task_id, status="done",
+                          output=f"已人工批准并派发为 {res.task_id}",
+                          meta=meta, updated_at=str(int(time.time())))
+        publish_task_event(bus, task_id, event="done", state="done",
+                           trace_id=rec.trace_id,
+                           summary=f"approved by {operator or 'operator'} -> {res.task_id}")
+        return {"status": "approved", "approved": True, "task_id": task_id,
+                "dispatched_task_id": res.task_id, "dispatch_status": res.status}
+
+    @app.post("/tasks/{task_id}/reject")
+    def reject_task(task_id: str, req: RejectReq, request: Request):
+        """人工拒绝待审批任务：终态 failed + 审计留痕。
+
+        与 approve 的 dispatching 占位互斥：先原子 CAS 到 failed，
+        并发 approve/reject 同一任务时落败方拿到 409。
+        """
+        rec = task_store.get(task_id)
+        if rec is None:
+            raise HTTPException(status_code=404, detail="task not found")
+        if rec.status != "awaiting_approval":
+            raise HTTPException(status_code=400,
+                                detail=f"任务当前状态为 {rec.status}，非待审批")
+        if not task_store.transition(task_id, "awaiting_approval", "failed"):
+            raise HTTPException(status_code=409,
+                                detail="任务已被其他请求处理（并发裁决冲突），请刷新后重试")
+        approval = _approval_meta(rec)
+        operator = _request_operator(request)
+        approval["status"] = "rejected"
+        approval["rejected_by"] = operator
+        if req.reason:
+            approval["reject_reason"] = req.reason
+        meta = dict(rec.meta or {})
+        meta["approval"] = approval
+        rec = task_store.update(
+            task_id,
+            error=req.reason or "指令被安全关卡拦截，人工裁决拒绝执行",
+            meta=meta, updated_at=str(int(time.time())))
+        record_security_event(
+            task_id=task_id, stage="approve", decision="reject",
+            matched_rules=approval.get("verdict", {}).get("matched_rules"),
+            operator=operator, llm_enhanced=cfg.security_llm,
+            reason=req.reason or "人工拒绝执行被拦截指令")
+        # failed 属终态：发布 done 事件让 SSE 订阅流关闭
+        publish_task_event(bus, task_id, event="done", state="failed",
+                           trace_id=rec.trace_id,
+                           summary=f"rejected by {operator or 'operator'}")
+        return asdict(rec)
+
     @app.post("/dispatch")
-    def dispatch(req: DispatchReq):
+    def dispatch(req: DispatchReq, request: Request):
         if dispatcher is None:
             return {"status": "failed", "error": "dispatcher 未配置（local 模式不提供 /dispatch）"}
         # security-guard 指令检验；force=true 跳过（用于放行 block 指令）
         if not req.force:
             v = security_check(req.prompt, use_llm=cfg.security_llm)
+            # 前置关卡审计：block/warn/pass 全量留痕（写入失败不阻断主流程）
+            record_security_event(
+                task_id=None, stage="dispatch",
+                decision="warn" if (v["verdict"] == "pass" and v.get("matched_rules"))
+                else v["verdict"],
+                matched_rules=v.get("matched_rules"),
+                operator=_request_operator(request),
+                llm_enhanced=bool(v.get("llm_enhanced", cfg.security_llm)),
+                reason=v.get("reason", ""),
+            )
             if v["verdict"] == "block":
-                return {"status": "blocked", "verdict": v, "task_id": None,
-                        "output": None, "artifacts": [], "error": None}
+                # 阶段四审批挂起态：不再直接终结，任务挂起等人工 approve/reject
+                return _await_approval(req, v, request)
+        else:
+            # force 强制放行：审计记录决策与来源（web Command「强制放行」按钮走此处）
+            record_security_event(
+                task_id=None, stage="dispatch", decision="force",
+                operator=_request_operator(request),
+                llm_enhanced=cfg.security_llm)
         context = req.context_memory
         if memory_store is not None and req.context_task_ids:
             context = assemble_context(memory_store, context, req.context_task_ids)
@@ -259,7 +632,9 @@ def create_brain_app(registry: WorkerRegistry, task_store: TaskStore, cfg: Confi
         model = _route_model(req)
         try:
             res = dispatcher.dispatch(role=req.role, prompt=req.prompt,
-                                      context_memory=context or None, model=model)
+                                      context_memory=context or None, model=model,
+                                      use_experience=req.use_experience,
+                                      enable_subagents=req.enable_subagents)
         except RuntimeError as e:
             return {"status": "failed", "error": str(e)}
         return {
@@ -269,13 +644,33 @@ def create_brain_app(registry: WorkerRegistry, task_store: TaskStore, cfg: Confi
         }
 
     @app.post("/dispatch/async")
-    async def dispatch_async(req: DispatchReq):
+    async def dispatch_async(req: DispatchReq, request: Request):
         if async_dispatcher is None:
             return {"status": "failed", "error": "async_dispatcher 未配置"}
         if not req.force:
-            v = security_check(req.prompt, use_llm=cfg.security_llm)
+            # security_llm 同步等待秒级：挪到线程池执行，避免阻塞 brain 事件循环
+            # （同步 /dispatch 路径保持原样不动）
+            v = await asyncio.to_thread(security_check, req.prompt,
+                                        use_llm=cfg.security_llm)
+            # 前置关卡审计：与同步 /dispatch 同语义，block/warn/pass 全量留痕
+            record_security_event(
+                task_id=None, stage="dispatch",
+                decision="warn" if (v["verdict"] == "pass" and v.get("matched_rules"))
+                else v["verdict"],
+                matched_rules=v.get("matched_rules"),
+                operator=_request_operator(request),
+                llm_enhanced=bool(v.get("llm_enhanced", cfg.security_llm)),
+                reason=v.get("reason", ""),
+            )
             if v["verdict"] == "block":
-                return {"status": "blocked", "verdict": v, "task_id": None}
+                # 阶段四审批挂起态：与同步 /dispatch 同语义，挂起等人工裁决
+                return _await_approval(req, v, request)
+        else:
+            # force 强制放行：审计记录决策与来源
+            record_security_event(
+                task_id=None, stage="dispatch", decision="force",
+                operator=_request_operator(request),
+                llm_enhanced=cfg.security_llm)
         context = req.context_memory
         if memory_store is not None and req.context_task_ids:
             context = assemble_context(memory_store, context, req.context_task_ids)
@@ -285,10 +680,126 @@ def create_brain_app(registry: WorkerRegistry, task_store: TaskStore, cfg: Confi
             task_id = await async_dispatcher.dispatch_async(
                 role=req.role, prompt=req.prompt,
                 context_memory=context or None, model=model,
+                use_experience=req.use_experience,
+                enable_subagents=req.enable_subagents,
             )
         except RuntimeError as e:
             return {"status": "failed", "error": str(e)}
         return {"status": "accepted", "task_id": task_id, "model": model}
+
+    @app.post("/recommend")
+    async def recommend(req: AdvisorReq, request: Request):
+        """AI 推荐/解释顾问：运行于独立上下文，绝不污染任务上下文。
+
+        默认仅返回建议（should_dispatch/roles/plan/explanation/risks）；
+        auto_apply（请求覆盖或全局 advisor_auto_apply）且顾问建议派发时，
+        经既有安全关卡把原始任务派发给建议的首要角色（默认 executor）。
+        安全关卡拦截时不自动派发（返回 blocked），由用户走 /dispatch 人工审批。
+        """
+        if advisor is None or not getattr(advisor.config, "advisor_enabled", True):
+            return {"status": "failed", "error": "advisor 未配置/未启用"}
+        # 顾问是同步 + LLM 调用：挪到线程池，避免阻塞 brain 事件循环
+        result = await asyncio.to_thread(
+            advisor.recommend, req.task, mode=req.mode,
+            finished_output=req.finished_output)
+        auto_apply = (req.auto_apply if req.auto_apply is not None
+                      else bool(getattr(advisor.config, "advisor_auto_apply", False)))
+        payload: dict = {
+            "status": "ok",
+            "recommendation": result.to_dict(),
+            "auto_applied": False,
+            "dispatched": [],
+        }
+        if not (auto_apply and result.should_dispatch):
+            return payload
+        if dispatcher is None:
+            payload["error"] = "auto_apply 需要已配置 dispatcher（本地执行或远程）"
+            return payload
+        role = (result.roles[0] if result.roles else "executor")
+        # auto-apply 仍走安全关卡：绝不因推荐而绕过拦截/审批
+        v = await asyncio.to_thread(security_check, req.task, use_llm=cfg.security_llm)
+        record_security_event(
+            task_id=None, stage="recommend_auto_apply",
+            decision="warn" if (v["verdict"] == "pass" and v.get("matched_rules"))
+            else v["verdict"],
+            matched_rules=v.get("matched_rules"),
+            operator=_request_operator(request),
+            llm_enhanced=bool(v.get("llm_enhanced", cfg.security_llm)),
+            reason=v.get("reason", ""),
+        )
+        if v["verdict"] == "block":
+            payload["dispatched"].append({"role": role, "status": "blocked",
+                                          "reason": v.get("reason", "")})
+            return payload
+        try:
+            res = await asyncio.to_thread(
+                dispatcher.dispatch, role=role, prompt=req.task,
+                context_memory=None, model=None,
+                enable_subagents=req.enable_subagents)
+        except RuntimeError as e:
+            payload["error"] = str(e)
+            return payload
+        payload["auto_applied"] = True
+        payload["dispatched"].append({
+            "role": role, "task_id": res.task_id, "status": res.status,
+            "output": res.output, "artifacts": res.artifacts, "error": res.error,
+        })
+        return payload
+
+    @app.post("/translate")
+    async def translate(req: TranslateReq):
+        """结果翻译：运行于独立上下文，把结果文本译为目标语言（默认中文）。
+
+        思考过程/流式 token 保持原语言（通常英文），本端点只对给定文本做一次
+        旁路翻译（绝不污染任务上下文）。翻译服务是同步 + LLM 调用：挪到线程池，
+        避免阻塞 brain 事件循环（与 /recommend 同姿态）。
+        """
+        if translator is None:
+            return {"status": "failed", "error": "translator 未配置"}
+        result = await asyncio.to_thread(
+            translator.translate, req.text, target_lang=req.target_lang)
+        return {"status": "ok", "translation": result.to_dict()}
+
+    @app.get("/tasks/{task_id}/events")
+    async def task_events(task_id: str):
+        """SSE 实时事件流：status（迁移/轮询进展）| callback（回调到达）| done（终态后关闭）。
+
+        EventSource 无法自定义 header，鉴权同时接受 X-API-Key 头与 ?api_key= 查询参数
+        （auth 中间件已支持 query key，无需本端点特殊处理）。先补发当前状态快照，
+        终态任务直接结束；空闲 15s 发心跳注释行防中间层断开。
+        """
+        rec = task_store.get(task_id)
+        if rec is None:
+            raise HTTPException(status_code=404, detail="task not found")
+
+        async def gen():
+            sid, q = bus.subscribe(task_id)
+            try:
+                # 先补发快照（订阅与快照之间的窗口事件已入队兜底），终态则直接收流
+                cur = task_store.get(task_id)
+                if cur is not None:
+                    yield TaskEvent("status", {
+                        "task_id": task_id, "trace_id": cur.trace_id,
+                        "state": cur.status, "timestamp": time.time(),
+                        "snapshot": True,
+                    }).sse_frame()
+                    if cur.status in TERMINAL_STATUSES:
+                        return
+                while True:
+                    try:
+                        ev = await asyncio.wait_for(q.get(), timeout=15.0)
+                    except asyncio.TimeoutError:
+                        yield ": keepalive\n\n"
+                        continue
+                    yield ev.sse_frame()
+                    if ev.event == "done":
+                        return
+            finally:
+                bus.unsubscribe(sid)
+
+        return StreamingResponse(gen(), media_type="text/event-stream",
+                                 headers={"Cache-Control": "no-cache",
+                                          "X-Accel-Buffering": "no"})
 
     @app.get("/tasks/{task_id}/status")
     def task_status(task_id: str):
@@ -329,6 +840,10 @@ def create_brain_app(registry: WorkerRegistry, task_store: TaskStore, cfg: Confi
             "task_status": status_counts,
             "experience_total": exp_count,
             "recent_tasks": [asdict(r) for r in recent],
+            # 成本聚合（近 7 天按日 / 按 role / 按 model，源自 TaskRecord.meta）
+            "cost": _aggregate_costs(tasks),
+            # 输出质量聚合（按 model 统计退化任务数与比率，与 cost 同级）
+            "quality": _aggregate_quality(tasks),
         }
 
     # ---- 记忆管理（V2 接线：此前 MemoryStore 只有抽象无调用方） ----
@@ -624,6 +1139,25 @@ def _make_async_http_call(api_key: str = ""):
     return _async_http_call
 
 
+def _build_local_core_config(cfg):
+    """单机本地执行的 AgentKernel 配置（与 CLI/worker 对等）。
+
+    配置对等（P0）：走与 CLI/worker 相同的 load_agent_config 装配，使
+    model / budget / planning / reflection / rag / 各类守卫开关在本地执行
+    路径同样生效；permission_mode / max_turns / task_timeout / mcp_config_path
+    由 load_agent_config 读 ORCH_* 环境变量兜底，语义不变。此前手搭
+    AgentConfig 遗漏大量字段，导致 brain 本地执行与 CLI 行为不一致。
+    仅覆盖 brain 已解析的目录/根路径，保证与调度器其他组件共用同一存储位置。
+    """
+    from agent_core.config import load_agent_config
+    return load_agent_config(
+        project_root=str(Path(__file__).resolve().parents[4]),
+        memory_core_dir=cfg.memory_core_dir,
+        memory_context_dir=cfg.memory_context_dir,
+        experience_store_dir=cfg.experience_store_dir,
+    )
+
+
 def _build_app() -> FastAPI:
     """从 config 装配 brain_app。
 
@@ -644,12 +1178,14 @@ def _build_app() -> FastAPI:
                                 max_count=cfg.experience_max_count,
                                 ttl_days=cfg.experience_ttl_days)
     mem_store = FileMemoryStore(cfg.memory_core_dir, cfg.memory_context_dir)
+    # proc_root = workspace/agent（runtime 上两级）；仓库根再上一级
     proc_root = Path(__file__).resolve().parents[2]
+    project_root = proc_root.parents[1]
     proc_store = ProceduralStore(
         store_dir=cfg.procedural_store_dir,
-        allowed_roots=[str(proc_root / "workspace" / "agent" / "skills"),
-                       str(proc_root / ".claude" / "agents")],
-        project_root=str(proc_root),
+        allowed_roots=[str(project_root / "workspace" / "agent" / "skills"),
+                       str(project_root / ".claude" / "agents")],
+        project_root=str(project_root),
         security_check=(lambda c: security_check(c, use_llm=cfg.security_llm)),
     )
     dispatcher = None
@@ -657,6 +1193,9 @@ def _build_app() -> FastAPI:
     async_disp = None
     sched_store = ScheduleStore(cfg.schedule_store_dir)
     scheduler = None
+    # 全链路共享事件总线：dispatcher/async_dispatcher/retry/brain 同一实例，
+    # 保证 SSE 订阅能收到派发、回调与终态事件
+    bus = TaskEventBus()
     if cfg.mode == "remote":
         strategy = os.environ.get("ORCH_SELECT_STRATEGY", "round_robin")
         product_check = (lambda c: security_check(c, use_llm=cfg.security_llm))
@@ -668,7 +1207,8 @@ def _build_app() -> FastAPI:
                                       experience_store=exp_store,
                                       memory_store=mem_store,
                                       max_retries=cfg.max_retries,
-                                      check_max_chars=cfg.security_check_max_chars)
+                                      check_max_chars=cfg.security_check_max_chars,
+                                      event_bus=bus)
         async_disp = AsyncRemoteDispatcher(
             task_store=store, registry=registry,
             async_http=async_http_call, select_strategy=strategy,
@@ -679,11 +1219,13 @@ def _build_app() -> FastAPI:
             poll_interval=cfg.async_poll_interval,
             poll_max=cfg.async_poll_max,
             brain_url=cfg.brain_url,
+            event_bus=bus,
         )
         retry_mgr = RetryManager(
             task_store=store, registry=registry, dispatcher=dispatcher,
             sweeper_interval=cfg.sweeper_interval,
             retry_base_delay=cfg.retry_base_delay,
+            event_bus=bus,
         )
         retry_mgr.start()
         scheduler = TaskScheduler(schedule_store=sched_store, dispatcher=dispatcher)
@@ -691,18 +1233,10 @@ def _build_app() -> FastAPI:
     elif cfg.mode == "local" and os.environ.get("ORCH_LOCAL_EXEC", "0") in ("1", "true", "True"):
         # 单机本地执行：brain 进程内直接运行 AgentKernel（默认不启用，行为不变）
         from local_executor_dispatcher import LocalExecutorDispatcher
-        from agent_core.config import AgentConfig as CoreAgentConfig
 
-        core_cfg = CoreAgentConfig(
-            project_root=str(Path(__file__).resolve().parents[4]),
-            permission_mode="bypassPermissions",
-            task_timeout=900,
-            max_turns=int(os.environ.get("ORCH_MAX_TURNS", "50")),
-            memory_core_dir=cfg.memory_core_dir,
-            memory_context_dir=cfg.memory_context_dir,
-            experience_store_dir=cfg.experience_store_dir,
-            mcp_config_path=os.environ.get("ORCH_MCP_CONFIG", ""),
-        )
+        # 配置对等（P0）：统一走 _build_local_core_config（内部 load_agent_config），
+        # 使 brain 本地执行与 CLI/worker 共享同一套开关与守卫，不再手搭遗漏字段。
+        core_cfg = _build_local_core_config(cfg)
         product_check = (lambda c: security_check(c, use_llm=cfg.security_llm))
         dispatcher = LocalExecutorDispatcher(
             task_store=store,
@@ -710,13 +1244,31 @@ def _build_app() -> FastAPI:
             experience_store=exp_store,
             memory_store=mem_store,
             product_check=product_check,
+            event_bus=bus,
         )
+    # AI 推荐/解释顾问：自建独立上下文，local/remote 两种模式均可用（与派发器无耦合）。
+    # 构建失败不拖垮 brain 启动（降级为 /recommend 返回未配置）。
+    advisor = None
+    try:
+        from agent_core.advisor import AdvisorService
+        advisor = AdvisorService(_build_local_core_config(cfg))
+    except Exception:  # noqa: BLE001 - 顾问不可用时 brain 仍正常启动
+        advisor = None
+    # 结果翻译：同样自建独立上下文，local/remote 两种模式均可用（与派发器无耦合）。
+    # 构建失败不拖垮 brain 启动（降级为 /translate 返回未配置）。
+    translator = None
+    try:
+        from agent_core.translator import TranslatorService
+        translator = TranslatorService(_build_local_core_config(cfg))
+    except Exception:  # noqa: BLE001 - 翻译不可用时 brain 仍正常启动
+        translator = None
     return create_brain_app(registry, store, cfg, dispatcher=dispatcher,
                             experience_store=exp_store, memory_store=mem_store,
                             procedural_store=proc_store,
                             retry_manager=retry_mgr,
                             schedule_store=sched_store, task_scheduler=scheduler,
-                            async_dispatcher=async_disp)
+                            async_dispatcher=async_disp, event_bus=bus,
+                            advisor=advisor, translator=translator)
 
 
 if __name__ == "__main__":

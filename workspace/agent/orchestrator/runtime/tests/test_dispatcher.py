@@ -187,3 +187,64 @@ def test_local_dispatcher_product_check(tmp_path):
     assert res.verdict is not None
     assert res.verdict["verdict"] == "pass"
 
+
+# ---- 经验消融硬关（use_experience）----
+
+class _FakeExp:
+    """假经验库：search 返回一条相似经验，record_from_task 记录调用。"""
+    def __init__(self):
+        self.search_calls = 0
+        self.recorded = []
+
+    def search(self, prompt, role=None, successful_only=True, limit=3):
+        self.search_calls += 1
+        return [type("E", (), {"prompt": "历史任务",
+                               "output_summary": "历史产出"})()]
+
+    def record_from_task(self, **kw):
+        self.recorded.append(kw)
+
+
+def _remote_with_exp(tmp_path, exp, captured):
+    store = TaskStore(str(tmp_path))
+    reg = WorkerRegistry(heartbeat_timeout=45, now_fn=lambda: 0.0)
+    reg.register(make_info())
+
+    def fake_http(method, url, **kwargs):
+        if method == "POST":
+            captured["body"] = kwargs.get("json", {})
+            return {"status_code": 200,
+                    "json": {"task_id": "task-e", "status": "accepted"}}
+        return {"status_code": 200, "json": {
+            "task_id": "task-e", "status": "done",
+            "output": "ok", "artifacts": [], "error": None}}
+
+    return RemoteDispatcher(task_store=store, registry=reg, http_call=fake_http,
+                            now_fn=lambda: "t0", experience_store=exp)
+
+
+def test_remote_ablation_disables_read_and_write(tmp_path):
+    """use_experience=False：不检索/不注入经验（读关）且不沉淀（写关）。"""
+    exp = _FakeExp()
+    captured = {}
+    d = _remote_with_exp(tmp_path, exp, captured)
+    res = d.dispatch(role="executor", prompt="do x", use_experience=False)
+    assert res.status == "done"
+    # 读关：POST body 的 context_memory 不含历史经验块，且未调 search
+    assert "历史经验参考" not in captured["body"].get("context_memory", "")
+    assert exp.search_calls == 0
+    # 写关：未沉淀经验
+    assert exp.recorded == []
+
+
+def test_remote_with_experience_enriches_and_records(tmp_path):
+    """默认（use_experience=True）：注入经验块并沉淀（回归保护）。"""
+    exp = _FakeExp()
+    captured = {}
+    d = _remote_with_exp(tmp_path, exp, captured)
+    res = d.dispatch(role="executor", prompt="do x")
+    assert res.status == "done"
+    assert "历史经验参考" in captured["body"].get("context_memory", "")
+    assert exp.search_calls == 1
+    assert len(exp.recorded) == 1
+

@@ -1,4 +1,5 @@
 """worker HTTP 服务：接受任务、查询状态、回传产出文件；启动即向大脑注册并定期心跳。"""
+import logging
 import os
 import sys
 import threading
@@ -15,6 +16,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "workspace" / "a
 from auth import add_auth_middleware
 from safe_id import validate_id
 
+log = logging.getLogger(__name__)
+
 
 class TaskBody(BaseModel):
     task_id: str
@@ -22,6 +25,7 @@ class TaskBody(BaseModel):
     context_memory: str = ""
     model: str | None = None
     callback_url: str | None = None
+    trace_id: str | None = None  # brain 派发时生成的链路追踪 ID，日志与 callback 透传
 
 
 def register_to_brain(cfg: WorkerConfig, http_post=None) -> bool:
@@ -71,15 +75,23 @@ def start_auto_heartbeat(cfg: WorkerConfig, interval: int | None = None,
 
 
 def _send_callback(callback_url: str, result: "TaskResult | None",
-                   api_key: str = "") -> None:
-    """任务完成后主动回调 Brain，通知结果。失败静默忽略。"""
+                   api_key: str = "", trace_id: str | None = None) -> None:
+    """任务完成后主动回调 Brain，通知结果。失败静默忽略。
+
+    trace_id 作为顶层字段回传（不依赖 agent_core 结果 meta），供 brain 关联
+    派发链路；meta 为 worker 执行元数据（usage/cost_usd/num_turns 等），
+    brain 终态化时入库并在 /tasks 与 /stats 透出。
+    """
     if result is None:
         return
     import requests
     payload = {
         "status": result.status, "output": result.output,
         "artifacts": result.artifacts, "error": result.error,
+        "meta": result.meta or {},
     }
+    if trace_id:
+        payload["trace_id"] = trace_id
     headers = {"X-API-Key": api_key} if api_key else {}
     try:
         requests.post(callback_url, json=payload, timeout=10, headers=headers)
@@ -130,7 +142,9 @@ def create_worker_app(runner: AgentRunner, cfg: WorkerConfig) -> FastAPI:
         with lock:
             cancel_events[body.task_id] = event
         req = TaskRequest(body.task_id, body.prompt, body.context_memory,
-                          body.model, cancel_event=event)
+                          body.model, cancel_event=event, trace_id=body.trace_id)
+        log.info("[trace=%s] task=%s execute start (model=%s)",
+                 body.trace_id, body.task_id, body.model)
         res = runner.run(req)
         # cancel 竞态保护：执行期间被取消 → 终态保持 cancelled，
         # 不被 runner 迟到的 done/failed 覆盖（产物/输出保留在 res 中备查）
@@ -138,6 +152,8 @@ def create_worker_app(runner: AgentRunner, cfg: WorkerConfig) -> FastAPI:
             if body.task_id in cancelled:
                 res.status = "cancelled"
         _record(body.task_id, res)
+        log.info("[trace=%s] task=%s execute end (status=%s)",
+                 body.trace_id, body.task_id, res.status)
 
     @app.post("/task")
     def post_task(body: TaskBody):
@@ -156,7 +172,8 @@ def create_worker_app(runner: AgentRunner, cfg: WorkerConfig) -> FastAPI:
                 res = state.get(body.task_id)
                 cancelled.discard(body.task_id)
             if body.callback_url and should_callback:
-                _send_callback(body.callback_url, res, api_key=cfg.api_key)
+                _send_callback(body.callback_url, res, api_key=cfg.api_key,
+                               trace_id=body.trace_id)
 
         threading.Thread(target=_bg, daemon=True, name=f"task-{body.task_id}").start()
         return {"task_id": body.task_id, "status": "accepted"}
@@ -239,6 +256,10 @@ def _build_app():
                                 max_turns=cfg.max_turns,
                                 max_thinking_tokens=cfg.max_thinking_tokens or None,
                                 task_budget_usd=cfg.task_budget_usd or None,
+                                experience_store_dir=cfg.experience_store_dir,
+                                output_guard_enabled=cfg.output_guard_enabled,
+                                output_guard_max_retries=cfg.output_guard_max_retries,
+                                fallback_model=cfg.fallback_model,
                                 mcp_servers=load_mcp_servers(cfg.mcp_config_path))
     else:
         runner = FakeAgentRunner(work_dir=cfg.work_dir)

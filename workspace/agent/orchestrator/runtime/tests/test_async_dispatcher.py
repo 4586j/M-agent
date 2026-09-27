@@ -353,3 +353,67 @@ def test_poll_skips_already_finalized(tmp_path):
                         "worker-A", "executor", "do x", "t0"))
     rec = store.get(task_id)
     assert rec.output == "callback result"
+
+
+def test_async_ablation_skips_experience_write(tmp_path):
+    """use_experience=False 时终态化不沉淀经验（写关）。"""
+    store = TaskStore(str(tmp_path))
+    reg = WorkerRegistry(heartbeat_timeout=45, now_fn=lambda: 0.0)
+    reg.register(make_info())
+
+    from experience_store import ExperienceStore
+    exp_store = ExperienceStore(str(tmp_path / "exp"))
+
+    async def fake_http(method, url, **kwargs):
+        if method == "POST":
+            return {"status_code": 200, "json": {"status": "accepted"}}
+        return {"status_code": 200, "json": {
+            "status": "done", "output": "结果",
+            "artifacts": [], "error": None}}
+
+    d = AsyncRemoteDispatcher(
+        task_store=store, registry=reg, async_http=fake_http,
+        now_fn=lambda: "t0", experience_store=exp_store,
+        poll_interval=0.01, poll_max=5,
+    )
+    task_id = _run(d.dispatch_async(role="executor", prompt="do x",
+                                    use_experience=False))
+    _run(d._poll_worker(task_id, "http://127.0.0.1:8000",
+                        "worker-A", "executor", "do x", "t0"))
+    assert store.get(task_id).status == "done"
+    assert exp_store.list_all() == []
+
+
+def test_async_ablation_skips_experience_read(tmp_path):
+    """use_experience=False 时不检索/不注入历史经验块（读关）；默认注入。"""
+    store = TaskStore(str(tmp_path))
+    reg = WorkerRegistry(heartbeat_timeout=45, now_fn=lambda: 0.0)
+    reg.register(make_info())
+
+    from experience_store import ExperienceStore
+    exp_store = ExperienceStore(str(tmp_path / "exp"))
+    exp_store.record_from_task(task_id="seed", role="executor",
+                               prompt="compute the total order amount",
+                               output="TOTAL=42", success=True, created_at="t-1")
+
+    seen = {}
+
+    async def fake_http(method, url, **kwargs):
+        if method == "POST":
+            seen.update(kwargs.get("json", {}))
+            return {"status_code": 200, "json": {"status": "accepted"}}
+        return {"status_code": 200, "json": {"status": "running"}}
+
+    d = AsyncRemoteDispatcher(
+        task_store=store, registry=reg, async_http=fake_http,
+        now_fn=lambda: "t0", experience_store=exp_store,
+    )
+    _run(d.dispatch_async(role="executor",
+                          prompt="compute the total order amount",
+                          use_experience=False))
+    assert "历史经验参考" not in (seen.get("context_memory") or "")
+
+    seen.clear()
+    _run(d.dispatch_async(role="executor",
+                          prompt="compute the total order amount"))
+    assert "历史经验参考" in (seen.get("context_memory") or "")

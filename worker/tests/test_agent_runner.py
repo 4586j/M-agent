@@ -208,3 +208,44 @@ def test_sdk_runner_passes_mcp_servers(tmp_path, monkeypatch):
                             project_root=PROJECT_ROOT, mcp_servers=mcp_servers)
     runner.run(TaskRequest(task_id="task-mcp", prompt="p", context_memory="", model=None))
     assert captured["mcp_servers"] == mcp_servers  # MCP 工具挂载进 SDK 会话
+
+
+def test_get_kernel_passthrough_output_guard_config(tmp_path):
+    """_get_kernel 构造 AgentConfig 时透传守卫三配置。
+
+    此前字段白名单缺失导致集群模式下 guard 无法关闭、fallback_model 不生效。
+    """
+    runner = SdkAgentRunner(
+        work_dir=str(tmp_path),
+        executor_def_path=str(Path(PROJECT_ROOT) / ".claude" / "agents" / "executor.md"),
+        project_root=PROJECT_ROOT,
+        output_guard_enabled=False, output_guard_max_retries=3,
+        fallback_model="fb-model")
+    kernel = runner._get_kernel()
+    assert kernel.config.output_guard_enabled is False
+    assert kernel.config.output_guard_max_retries == 3
+    assert kernel.config.fallback_model == "fb-model"
+
+
+def test_sdk_runner_merges_kernel_meta_into_task_result(tmp_path):
+    """kernel 产出的 meta（degenerate 输出质量标记等）并入 TaskResult.meta。"""
+    from agent_core.kernel import KernelResult
+
+    class FakeGuardKernel:
+        def run_oneshot(self, prompt, persona, cwd, context_memory="",
+                        cancel_event=None, resume=False):
+            return KernelResult(
+                output="乱码输出", is_error=True,
+                error_type="degenerate_output",
+                meta={"degenerate": {"detected": True, "recovered": False,
+                                     "attempts": 2, "models_tried": ["", "fb"]}})
+
+    runner = SdkAgentRunner(
+        work_dir=str(tmp_path),
+        executor_def_path=str(Path(PROJECT_ROOT) / ".claude" / "agents" / "executor.md"),
+        project_root=PROJECT_ROOT, kernel=FakeGuardKernel())
+    res = runner.run(TaskRequest(task_id="task-degen", prompt="p",
+                                 context_memory="", model=None))
+    assert res.status == "failed"
+    assert res.meta["degenerate"]["detected"] is True
+    assert res.meta["degenerate"]["attempts"] == 2

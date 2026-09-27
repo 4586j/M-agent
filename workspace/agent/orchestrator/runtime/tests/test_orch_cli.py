@@ -81,3 +81,113 @@ def test_handle_command_registry(capsys):
     s.stop = False
     assert orch_cli.handle_command("/不存在的命令", s) is True  # 提示但不发送
     assert not capsys.readouterr().out.startswith("你>")
+
+
+# ---- 子代理派发开关：--no-subagents / env 默认 -> build_options 不挂 agents ----
+
+def test_build_options_no_subagents_omits_agents():
+    """enable_subagents=False（--no-subagents）-> 不挂 agents，大脑不派生 SDK 子代理。"""
+    options = orch_cli.build_options(PROJECT_ROOT, model="sonnet", max_turns=10,
+                                     permission_mode="default",
+                                     enable_subagents=False)
+    assert not options.agents  # None 或空 dict
+
+
+def test_build_options_enable_subagents_wires_agents():
+    """enable_subagents=True -> 挂上 agents（覆盖全局关闭）。"""
+    options = orch_cli.build_options(PROJECT_ROOT, model="sonnet", max_turns=10,
+                                     permission_mode="default",
+                                     enable_subagents=True)
+    assert {"executor", "security-guard"} <= set(options.agents.keys())
+
+
+def test_build_options_follows_env_default(monkeypatch):
+    """enable_subagents=None -> 跟随全局 env 默认（ORCH_SUBAGENTS_ENABLED=0 关闭）。"""
+    monkeypatch.setenv("ORCH_SUBAGENTS_ENABLED", "0")
+    options = orch_cli.build_options(PROJECT_ROOT, model="sonnet", max_turns=10,
+                                     permission_mode="default",
+                                     enable_subagents=None)
+    assert not options.agents
+
+
+# ---- /recommend 顾问命令（独立上下文，仅建议不执行）----
+
+class _FakeAdvisor:
+    def __init__(self, result):
+        self._result = result
+        self.calls = []
+
+    def recommend(self, task, mode="all", finished_output=None):
+        self.calls.append({"task": task, "mode": mode,
+                           "finished_output": finished_output})
+        return self._result
+
+
+def test_recommend_command_prints_advice(monkeypatch, capsys):
+    from agent_core.advisor import AdvisorResult
+    result = AdvisorResult(
+        should_dispatch=True, roles=["executor"],
+        plan=[{"id": 1, "action": "读取数据", "depends_on": []}],
+        explanation="可拆两步", risks=["数据量大"], mode="all")
+    fake = _FakeAdvisor(result)
+    monkeypatch.setattr(orch_cli, "_get_advisor", lambda: fake)
+    s = orch_cli.Session(model="sonnet", max_turns=10, permission_mode="default")
+    assert orch_cli.handle_command("/recommend 分析 workspace/data.csv", s) is True
+    out = capsys.readouterr().out
+    assert "建议派发子代理" in out
+    assert "executor" in out
+    assert "可拆两步" in out
+    assert "独立上下文" in out       # 隔离保证提示
+    assert fake.calls[0]["task"] == "分析 workspace/data.csv"
+    assert fake.calls[0]["mode"] == "all"
+
+
+def test_recommend_command_without_task_shows_usage(capsys):
+    s = orch_cli.Session(model="sonnet", max_turns=10, permission_mode="default")
+    assert orch_cli.handle_command("/recommend", s) is True
+    assert "用法" in capsys.readouterr().out
+
+
+def test_subagents_command_toggles_session(capsys):
+    s = orch_cli.Session(model="sonnet", max_turns=10, permission_mode="default")
+    assert s.enable_subagents is None
+    orch_cli.handle_command("/subagents off", s)
+    assert s.enable_subagents is False
+    orch_cli.handle_command("/subagents on", s)
+    assert s.enable_subagents is True
+    orch_cli.handle_command("/subagents default", s)
+    assert s.enable_subagents is None
+    orch_cli.handle_command("/subagents bogus", s)
+    assert "用法" in capsys.readouterr().out
+
+
+# ---- /translate 结果翻译命令（独立上下文，思考英文/结果中文）----
+
+class _FakeTranslator:
+    def __init__(self, result):
+        self._result = result
+        self.calls = []
+
+    def translate(self, text, *, target_lang=None, skip_if_target=True):
+        self.calls.append({"text": text, "target_lang": target_lang})
+        return self._result
+
+
+def test_translate_command_prints_translation(monkeypatch, capsys):
+    from agent_core.translator import TranslationResult
+    fake = _FakeTranslator(TranslationResult(
+        translated="完成：42 行", target_lang="zh", changed=True))
+    monkeypatch.setattr(orch_cli, "_get_translator", lambda: fake)
+    s = orch_cli.Session(model="sonnet", max_turns=10, permission_mode="default")
+    assert orch_cli.handle_command("/translate Done: 42 rows", s) is True
+    out = capsys.readouterr().out
+    assert "译文" in out
+    assert "完成：42 行" in out
+    assert "独立上下文" in out          # 隔离保证提示
+    assert fake.calls[0]["text"] == "Done: 42 rows"
+
+
+def test_translate_command_without_text_shows_usage(capsys):
+    s = orch_cli.Session(model="sonnet", max_turns=10, permission_mode="default")
+    assert orch_cli.handle_command("/translate", s) is True
+    assert "用法" in capsys.readouterr().out

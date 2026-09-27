@@ -31,7 +31,7 @@ def make_proc(tmp_path) -> ProceduralStore:
 def make_client(tmp_path, proc=None, exp=None):
     reg = WorkerRegistry(heartbeat_timeout=45, now_fn=lambda: 0.0)
     store = TaskStore(str(tmp_path / "tasks"))
-    cfg = Config(mode="remote", task_store_dir=str(tmp_path / "tasks"))
+    cfg = Config(mode="remote", task_store_dir=str(tmp_path / "tasks"), security_llm=False)
     app = create_brain_app(reg, store, cfg, experience_store=exp,
                            procedural_store=proc)
     return TestClient(app)

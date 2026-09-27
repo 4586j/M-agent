@@ -12,7 +12,7 @@ from config import Config
 def make_app(tmp_path, now_fn=None):
     reg = WorkerRegistry(heartbeat_timeout=45, now_fn=now_fn or (lambda: 0.0))
     store = TaskStore(str(tmp_path))
-    cfg = Config(mode="remote", task_store_dir=str(tmp_path))
+    cfg = Config(mode="remote", task_store_dir=str(tmp_path), security_llm=False)
     app = create_brain_app(reg, store, cfg)
     return TestClient(app), reg, store
 
@@ -127,7 +127,7 @@ def make_app_remote(tmp_path, now_fn=None):
     from dispatcher import RemoteDispatcher
     reg = WorkerRegistry(heartbeat_timeout=45, now_fn=now_fn or (lambda: 0.0))
     store = TaskStore(str(tmp_path))
-    cfg = Config(mode="remote", task_store_dir=str(tmp_path))
+    cfg = Config(mode="remote", task_store_dir=str(tmp_path), security_llm=False)
 
     def fake_http(method, url, **kwargs):
         if method == "POST":
@@ -220,7 +220,7 @@ def test_proxy_artifact(tmp_path):
 
     reg = WorkerRegistry(heartbeat_timeout=45, now_fn=lambda: 0.0)
     store = TaskStore(str(tmp_path))
-    cfg = Config(mode="remote", task_store_dir=str(tmp_path))
+    cfg = Config(mode="remote", task_store_dir=str(tmp_path), security_llm=False)
     app = create_brain_app(reg, store, cfg, http_call=fake_http)
     client = TestClient(app)
     client.post("/register", json={
@@ -258,19 +258,30 @@ def test_dispatch_no_worker(tmp_path):
     assert r.json()["status"] == "failed"
 
 
-def test_dispatch_security_block(tmp_path):
+def test_dispatch_security_block_awaits_approval(tmp_path):
+    """阶段四审批挂起态：block 指令不再直接终结，任务置 awaiting_approval 等人工裁决。"""
     from dispatcher import RemoteDispatcher
     from unittest.mock import patch
     reg = WorkerRegistry(heartbeat_timeout=45, now_fn=lambda: 0.0)
     store = TaskStore(str(tmp_path))
-    cfg = Config(mode="remote", task_store_dir=str(tmp_path))
+    cfg = Config(mode="remote", task_store_dir=str(tmp_path), security_llm=False)
     disp = RemoteDispatcher(task_store=store, registry=reg,
                             http_call=lambda *a, **k: {"status_code": 200, "json": {}},
                             now_fn=lambda: "t0")
     client = TestClient(create_brain_app(reg, store, cfg, dispatcher=disp))
     with patch("brain_api.security_check", return_value={"verdict": "block", "reason": "dangerous"}):
         r = client.post("/dispatch", json={"prompt": "rm -rf /"})
-    assert r.json()["status"] == "blocked"
+    body = r.json()
+    assert body["status"] == "awaiting_approval"
+    task_id = body["task_id"]
+    assert task_id
+    rec = store.get(task_id)
+    assert rec is not None and rec.status == "awaiting_approval"
+    approval = rec.meta["approval"]
+    assert approval["status"] == "pending"
+    assert approval["verdict"]["reason"] == "dangerous"
+    assert approval["original_prompt"] == "rm -rf /"
+    assert rec.worker_id is None  # 挂起任务不占用 worker，也未产生真实派发
 
 
 def test_dispatch_force_skips_security(tmp_path):
@@ -279,7 +290,7 @@ def test_dispatch_force_skips_security(tmp_path):
     from worker_registry import WorkerInfo
     reg = WorkerRegistry(heartbeat_timeout=45, now_fn=lambda: 0.0)
     store = TaskStore(str(tmp_path))
-    cfg = Config(mode="remote", task_store_dir=str(tmp_path))
+    cfg = Config(mode="remote", task_store_dir=str(tmp_path), security_llm=False)
 
     def fake_http(method, url, **kwargs):
         if method == "POST":
@@ -311,7 +322,7 @@ def test_dispatch_async_success(tmp_path):
     from async_dispatcher import AsyncRemoteDispatcher
     reg = WorkerRegistry(heartbeat_timeout=45, now_fn=lambda: 0.0)
     store = TaskStore(str(tmp_path))
-    cfg = Config(mode="remote", task_store_dir=str(tmp_path))
+    cfg = Config(mode="remote", task_store_dir=str(tmp_path), security_llm=False)
 
     async def fake_async_http(method, url, **kwargs):
         return {"status_code": 200, "json": {"status": "accepted"}}
@@ -402,7 +413,7 @@ def test_callback_success(tmp_path):
     from async_dispatcher import AsyncRemoteDispatcher
     reg = WorkerRegistry(heartbeat_timeout=45, now_fn=lambda: 0.0)
     store = TaskStore(str(tmp_path))
-    cfg = Config(mode="remote", task_store_dir=str(tmp_path))
+    cfg = Config(mode="remote", task_store_dir=str(tmp_path), security_llm=False)
     store.write(TaskRecord(
         task_id="t1", role="executor", prompt="x", worker_id="A",
         status="running", created_at="t", updated_at="t"))
@@ -438,7 +449,7 @@ def _make_exp_store(tmp_path):
 def test_list_experiences(tmp_path):
     exp = _make_exp_store(tmp_path)
     client, reg, store = make_app(tmp_path)
-    app = create_brain_app(reg, store, Config(mode="remote", task_store_dir=str(tmp_path)),
+    app = create_brain_app(reg, store, Config(mode="remote", task_store_dir=str(tmp_path), security_llm=False),
                            experience_store=exp)
     client2 = TestClient(app)
     r = client2.get("/experiences")
@@ -450,7 +461,7 @@ def test_list_experiences(tmp_path):
 def test_list_experiences_all(tmp_path):
     exp = _make_exp_store(tmp_path)
     client, reg, store = make_app(tmp_path)
-    app = create_brain_app(reg, store, Config(mode="remote", task_store_dir=str(tmp_path)),
+    app = create_brain_app(reg, store, Config(mode="remote", task_store_dir=str(tmp_path), security_llm=False),
                            experience_store=exp)
     client2 = TestClient(app)
     r = client2.get("/experiences?successful_only=false")
@@ -465,7 +476,7 @@ def test_list_experiences_no_store(tmp_path):
 def test_search_experiences(tmp_path):
     exp = _make_exp_store(tmp_path)
     client, reg, store = make_app(tmp_path)
-    app = create_brain_app(reg, store, Config(mode="remote", task_store_dir=str(tmp_path)),
+    app = create_brain_app(reg, store, Config(mode="remote", task_store_dir=str(tmp_path), security_llm=False),
                            experience_store=exp)
     client2 = TestClient(app)
     r = client2.post("/experiences/search", json={"query": "build feature"})
@@ -477,7 +488,7 @@ def test_search_experiences(tmp_path):
 def test_get_experience(tmp_path):
     exp = _make_exp_store(tmp_path)
     client, reg, store = make_app(tmp_path)
-    app = create_brain_app(reg, store, Config(mode="remote", task_store_dir=str(tmp_path)),
+    app = create_brain_app(reg, store, Config(mode="remote", task_store_dir=str(tmp_path), security_llm=False),
                            experience_store=exp)
     client2 = TestClient(app)
     r = client2.get("/experiences/exp-1")
@@ -489,7 +500,7 @@ def test_get_experience(tmp_path):
 def test_delete_experience(tmp_path):
     exp = _make_exp_store(tmp_path)
     client, reg, store = make_app(tmp_path)
-    app = create_brain_app(reg, store, Config(mode="remote", task_store_dir=str(tmp_path)),
+    app = create_brain_app(reg, store, Config(mode="remote", task_store_dir=str(tmp_path), security_llm=False),
                            experience_store=exp)
     client2 = TestClient(app)
     r = client2.delete("/experiences/exp-1")
@@ -501,7 +512,7 @@ def test_delete_experience(tmp_path):
 def test_reindex_experiences(tmp_path):
     exp = _make_exp_store(tmp_path)
     client, reg, store = make_app(tmp_path)
-    app = create_brain_app(reg, store, Config(mode="remote", task_store_dir=str(tmp_path)),
+    app = create_brain_app(reg, store, Config(mode="remote", task_store_dir=str(tmp_path), security_llm=False),
                            experience_store=exp)
     client2 = TestClient(app)
     r = client2.post("/experiences/reindex")
@@ -525,7 +536,7 @@ def test_create_schedule(tmp_path):
                             http_call=lambda *a, **k: {"status_code": 200, "json": {}},
                             now_fn=lambda: "t0")
     sched = TaskScheduler(schedule_store=ss, dispatcher=disp)
-    app = create_brain_app(reg, store, Config(mode="remote", task_store_dir=str(tmp_path)),
+    app = create_brain_app(reg, store, Config(mode="remote", task_store_dir=str(tmp_path), security_llm=False),
                            schedule_store=ss, task_scheduler=sched)
     client2 = TestClient(app)
     r = client2.post("/schedules", json={
@@ -541,7 +552,7 @@ def test_create_schedule(tmp_path):
 def test_create_schedule_bad_cron(tmp_path):
     ss = _make_schedule_store(tmp_path)
     client, reg, store = make_app(tmp_path)
-    app = create_brain_app(reg, store, Config(mode="remote", task_store_dir=str(tmp_path)),
+    app = create_brain_app(reg, store, Config(mode="remote", task_store_dir=str(tmp_path), security_llm=False),
                            schedule_store=ss)
     client2 = TestClient(app)
     r = client2.post("/schedules", json={
@@ -554,7 +565,7 @@ def test_create_schedule_bad_cron(tmp_path):
 def test_list_schedules(tmp_path):
     ss = _make_schedule_store(tmp_path)
     client, reg, store = make_app(tmp_path)
-    app = create_brain_app(reg, store, Config(mode="remote", task_store_dir=str(tmp_path)),
+    app = create_brain_app(reg, store, Config(mode="remote", task_store_dir=str(tmp_path), security_llm=False),
                            schedule_store=ss)
     client2 = TestClient(app)
     client2.post("/schedules", json={
@@ -569,7 +580,7 @@ def test_list_schedules(tmp_path):
 def test_delete_schedule(tmp_path):
     ss = _make_schedule_store(tmp_path)
     client, reg, store = make_app(tmp_path)
-    app = create_brain_app(reg, store, Config(mode="remote", task_store_dir=str(tmp_path)),
+    app = create_brain_app(reg, store, Config(mode="remote", task_store_dir=str(tmp_path), security_llm=False),
                            schedule_store=ss)
     client2 = TestClient(app)
     body = client2.post("/schedules", json={
@@ -586,7 +597,7 @@ def test_delete_schedule(tmp_path):
 def test_toggle_schedule(tmp_path):
     ss = _make_schedule_store(tmp_path)
     client, reg, store = make_app(tmp_path)
-    app = create_brain_app(reg, store, Config(mode="remote", task_store_dir=str(tmp_path)),
+    app = create_brain_app(reg, store, Config(mode="remote", task_store_dir=str(tmp_path), security_llm=False),
                            schedule_store=ss)
     client2 = TestClient(app)
     sid = client2.post("/schedules", json={
@@ -603,7 +614,7 @@ def test_toggle_schedule(tmp_path):
 def test_toggle_schedule_404(tmp_path):
     ss = _make_schedule_store(tmp_path)
     client, reg, store = make_app(tmp_path)
-    app = create_brain_app(reg, store, Config(mode="remote", task_store_dir=str(tmp_path)),
+    app = create_brain_app(reg, store, Config(mode="remote", task_store_dir=str(tmp_path), security_llm=False),
                            schedule_store=ss)
     client2 = TestClient(app)
     assert client2.post("/schedules/missing/toggle").status_code == 404
@@ -626,7 +637,7 @@ def test_trigger_schedule(tmp_path):
     from task_scheduler import TaskScheduler
     disp = RemoteDispatcher(task_store=store, registry=reg, http_call=fake_http, now_fn=lambda: "t0")
     sched = TaskScheduler(schedule_store=ss, dispatcher=disp)
-    cfg = Config(mode="remote", task_store_dir=str(tmp_path))
+    cfg = Config(mode="remote", task_store_dir=str(tmp_path), security_llm=False)
     app = create_brain_app(reg, store, cfg, dispatcher=disp,
                            schedule_store=ss, task_scheduler=sched)
     client = TestClient(app)
@@ -642,7 +653,7 @@ def test_trigger_schedule(tmp_path):
 def test_trigger_no_scheduler(tmp_path):
     ss = _make_schedule_store(tmp_path)
     client, reg, store = make_app(tmp_path)
-    app = create_brain_app(reg, store, Config(mode="remote", task_store_dir=str(tmp_path)),
+    app = create_brain_app(reg, store, Config(mode="remote", task_store_dir=str(tmp_path), security_llm=False),
                            schedule_store=ss)
     client2 = TestClient(app)
     sid = client2.post("/schedules", json={
@@ -663,7 +674,7 @@ def test_cancel_propagates_to_worker(tmp_path):
 
     reg = WorkerRegistry(heartbeat_timeout=45, now_fn=lambda: 0.0)
     store = TaskStore(str(tmp_path))
-    cfg = Config(mode="remote", task_store_dir=str(tmp_path))
+    cfg = Config(mode="remote", task_store_dir=str(tmp_path), security_llm=False)
     from worker_registry import WorkerInfo
     reg.register(WorkerInfo(worker_id="A", role="executor", host="127.0.0.1",
                             port=8001, capabilities={}, last_heartbeat=0.0))
@@ -675,4 +686,422 @@ def test_cancel_propagates_to_worker(tmp_path):
     r = client.post("/tasks/t1/cancel")
     assert r.status_code == 200
     assert any("cancel" in url for _, url in calls)
+
+
+def test_cancel_signals_local_dispatcher(tmp_path):
+    """P0：本地执行（worker_id=local、无远程 worker）时，cancel 端点须
+    直接信号派发器 cancel(task_id)，否则本地执行收不到取消信号。"""
+    reg = WorkerRegistry(heartbeat_timeout=45, now_fn=lambda: 0.0)
+    store = TaskStore(str(tmp_path))
+    cfg = Config(mode="local", task_store_dir=str(tmp_path), security_llm=False)
+    signaled = []
+
+    class FakeLocalDispatcher:
+        def cancel(self, task_id):
+            signaled.append(task_id)
+            return True
+
+    app = create_brain_app(reg, store, cfg, dispatcher=FakeLocalDispatcher())
+    client = TestClient(app)
+    store.write(TaskRecord(
+        task_id="tl1", role="executor", prompt="x", worker_id="local",
+        status="running", created_at="t", updated_at="t"))
+    r = client.post("/tasks/tl1/cancel")
+    assert r.status_code == 200
+    assert r.json()["status"] == "cancelled"
+    assert signaled == ["tl1"]
+
+
+# ── 审批流：awaiting_approval / approve / reject（阶段四）──
+
+BLOCK_VERDICT = {"verdict": "block", "reason": "dangerous", "matched_rules": ["rule-1"],
+                 "suggestion": "", "llm_enhanced": False}
+
+
+def _audit_events(tmp_path):
+    import json
+    p = tmp_path / "audit.jsonl"
+    if not p.exists():
+        return []
+    return [json.loads(line) for line in p.read_text(encoding="utf-8").splitlines()
+            if line.strip()]
+
+
+def _approval_client(tmp_path, monkeypatch):
+    """带 dispatcher 的 app + 预置一个已挂起的待审批任务；审计落盘到 tmp。"""
+    from unittest.mock import patch
+    from dispatcher import RemoteDispatcher
+    monkeypatch.setenv("ORCH_AUDIT_LOG", str(tmp_path / "audit.jsonl"))
+    reg = WorkerRegistry(heartbeat_timeout=45, now_fn=lambda: 0.0)
+    reg.register(WorkerInfo(worker_id="A", role="executor", host="127.0.0.1",
+                            port=8001, capabilities={}, last_heartbeat=0.0))
+    store = TaskStore(str(tmp_path))
+    cfg = Config(mode="remote", task_store_dir=str(tmp_path), security_llm=False)
+    bodies = []
+
+    def fake_http(method, url, **kwargs):
+        if method == "POST" and url.endswith("/task"):
+            bodies.append(kwargs.get("json"))
+            return {"status_code": 200, "json": {"status": "accepted"}}
+        return {"status_code": 200,
+                "json": {"status": "done", "output": "ok", "artifacts": []}}
+
+    disp = RemoteDispatcher(task_store=store, registry=reg, http_call=fake_http,
+                            now_fn=lambda: "t0")
+    client = TestClient(create_brain_app(reg, store, cfg, dispatcher=disp))
+    with patch("brain_api.security_check", return_value=BLOCK_VERDICT):
+        r = client.post("/dispatch", json={"prompt": "rm -rf /",
+                                           "context_memory": "前置上下文",
+                                           "model": "sonnet"})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["status"] == "awaiting_approval"
+    return client, store, bodies, body["task_id"]
+
+
+def test_approve_original_prompt_dispatches(tmp_path, monkeypatch):
+    """原指令人工放行：不重检，直接按原流程派发并缓存 context/model。"""
+    client, store, bodies, task_id = _approval_client(tmp_path, monkeypatch)
+    r = client.post(f"/tasks/{task_id}/approve", json={}, headers={"X-Operator": "op-1"})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["status"] == "approved" and body["approved"] is True
+    assert body["dispatched_task_id"].startswith("task-")
+    # 原任务终态 done + 审批详情回写
+    rec = store.get(task_id)
+    assert rec.status == "done"
+    approval = rec.meta["approval"]
+    assert approval["status"] == "approved"
+    assert approval["approved_by"] == "op-1"
+    assert approval["approved_prompt"] == "rm -rf /"
+    # 派发沿用挂起时缓存的 context/model
+    dispatched = store.get(body["dispatched_task_id"])
+    assert dispatched.prompt == "rm -rf /"
+    assert dispatched.meta["model"] == "sonnet"
+    task_body = [b for b in bodies if b and b.get("task_id") == body["dispatched_task_id"]][0]
+    assert task_body["context_memory"] == "前置上下文"
+    # 审计留痕：decision=approve，operator 取 X-Operator
+    evts = [e for e in _audit_events(tmp_path) if e["stage"] == "approve"]
+    assert evts and evts[-1]["decision"] == "approve"
+    assert evts[-1]["operator"] == "op-1" and evts[-1]["task_id"] == task_id
+
+
+def test_approve_revised_prompt_recheck_pass(tmp_path, monkeypatch):
+    """修订后放行：重检通过则按修订后 prompt 派发。"""
+    from unittest.mock import patch
+    client, store, bodies, task_id = _approval_client(tmp_path, monkeypatch)
+    pass_verdict = {"verdict": "pass", "reason": "无规则命中", "matched_rules": [],
+                    "suggestion": "", "llm_enhanced": False}
+    with patch("brain_api.security_check", return_value=pass_verdict):
+        r = client.post(f"/tasks/{task_id}/approve", json={"prompt": "ls -l 安全指令"})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["approved"] is True
+    rec = store.get(task_id)
+    assert rec.status == "done"
+    assert rec.meta["approval"]["approved_prompt"] == "ls -l 安全指令"
+    dispatched = store.get(body["dispatched_task_id"])
+    assert dispatched.prompt == "ls -l 安全指令"  # 派发的是修订后指令
+
+
+def test_approve_revised_prompt_recheck_block_keeps_pending(tmp_path, monkeypatch):
+    """修订后仍未通过安全检验：维持挂起、更新裁决详情、不产生真实派发。"""
+    from unittest.mock import patch
+    client, store, bodies, task_id = _approval_client(tmp_path, monkeypatch)
+    new_block = dict(BLOCK_VERDICT, reason="仍然危险", matched_rules=["rule-2"])
+    with patch("brain_api.security_check", return_value=new_block):
+        r = client.post(f"/tasks/{task_id}/approve",
+                        json={"prompt": "rm -rf / --no-preserve-root"})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["approved"] is False
+    assert body["status"] == "awaiting_approval"
+    assert "仍未通过" in body["error"]
+    rec = store.get(task_id)
+    assert rec.status == "awaiting_approval"           # 维持挂起
+    approval = rec.meta["approval"]
+    assert approval["status"] == "pending"
+    assert approval["verdict"]["reason"] == "仍然危险"  # 裁决详情已更新
+    assert approval["revised_prompt"] == "rm -rf / --no-preserve-root"
+    assert bodies == []                                 # 未产生真实派发
+    evts = [e for e in _audit_events(tmp_path) if e["stage"] == "approve"]
+    assert evts and evts[-1]["decision"] == "block"    # 重检不通过也留痕
+
+
+def test_reject_marks_failed_and_audits(tmp_path, monkeypatch):
+    """拒绝：终态 failed + 审计留痕；拒绝后不可再 approve。"""
+    client, store, bodies, task_id = _approval_client(tmp_path, monkeypatch)
+    r = client.post(f"/tasks/{task_id}/reject", json={"reason": "危险操作，不予执行"},
+                    headers={"X-Operator": "op-2"})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["status"] == "failed"
+    assert body["error"] == "危险操作，不予执行"
+    rec = store.get(task_id)
+    approval = rec.meta["approval"]
+    assert approval["status"] == "rejected"
+    assert approval["rejected_by"] == "op-2"
+    assert approval["reject_reason"] == "危险操作，不予执行"
+    assert bodies == []                                # 拒绝不产生派发
+    evts = [e for e in _audit_events(tmp_path) if e["stage"] == "approve"]
+    assert evts and evts[-1]["decision"] == "reject"
+    assert evts[-1]["operator"] == "op-2"
+    # 已终态：再 approve/reject 都拒绝
+    assert client.post(f"/tasks/{task_id}/approve", json={}).status_code == 400
+    assert client.post(f"/tasks/{task_id}/reject", json={"reason": "x"}).status_code == 400
+
+
+def test_redispatch_and_retry_blocked_for_awaiting_approval(tmp_path, monkeypatch):
+    """待审批任务不参与重试/重派：必须先走人工裁决。"""
+    client, store, _, task_id = _approval_client(tmp_path, monkeypatch)
+    r = client.post(f"/tasks/{task_id}/redispatch", json={"model": None})
+    assert r.status_code == 400
+    assert "待审批" in r.json()["detail"]
+    # retry 端点同理：awaiting_approval 非 failed/lost，不满足重试条件
+    r2 = client.post(f"/tasks/{task_id}/retry")
+    assert r2.status_code == 400
+
+
+# ── approve/reject TOCTOU 并发防护与响应契约 ──
+
+def test_approve_concurrent_only_dispatches_once(tmp_path, monkeypatch):
+    """并发 approve 同一待审批任务：CAS 占位保证恰好派发一次，落败方 409。"""
+    import threading
+    from task_store import TaskStore as _TS
+    client, store, bodies, task_id = _approval_client(tmp_path, monkeypatch)
+    client2 = TestClient(client.app)
+    results = {}
+
+    real_transition = _TS.transition
+    entered = threading.Barrier(2)  # 强制两个请求都进入 CAS 段，消除调度不确定性
+
+    def racing_transition(self, tid, from_status, to_status):
+        entered.wait()
+        return real_transition(self, tid, from_status, to_status)
+
+    monkeypatch.setattr(_TS, "transition", racing_transition)
+
+    def call(i, c):
+        r = c.post(f"/tasks/{task_id}/approve", json={},
+                   headers={"X-Operator": f"op-{i}"})
+        results[i] = (r.status_code, r.json())
+
+    t1 = threading.Thread(target=call, args=(1, client))
+    t2 = threading.Thread(target=call, args=(2, client2))
+    t1.start(); t2.start(); t1.join(); t2.join()
+
+    codes = [results[1][0], results[2][0]]
+    assert codes.count(200) == 1
+    assert codes.count(409) == 1
+    assert len(bodies) == 1  # dispatcher 只被派发一次（修复前会派发两次）
+    winner = results[1] if results[1][0] == 200 else results[2]
+    assert winner[1]["approved"] is True
+
+
+def test_approve_cas_conflict_returns_409(tmp_path, monkeypatch):
+    """占位失败（已被其他请求抢先）：返回 409 且不产生派发。"""
+    client, store, bodies, task_id = _approval_client(tmp_path, monkeypatch)
+    monkeypatch.setattr(store, "transition", lambda *a, **k: False)
+    r = client.post(f"/tasks/{task_id}/approve", json={})
+    assert r.status_code == 409
+    assert bodies == []
+    assert store.get(task_id).status == "awaiting_approval"
+
+
+def test_reject_cas_conflict_returns_409(tmp_path, monkeypatch):
+    """reject 与 approve 同样持锁：CAS 失败返回 409，状态不变。"""
+    client, store, _, task_id = _approval_client(tmp_path, monkeypatch)
+    monkeypatch.setattr(store, "transition", lambda *a, **k: False)
+    r = client.post(f"/tasks/{task_id}/reject", json={"reason": "x"})
+    assert r.status_code == 409
+    rec = store.get(task_id)
+    assert rec.status == "awaiting_approval"
+    assert rec.meta["approval"]["status"] == "pending"
+
+
+def test_approve_dispatch_failure_contract_and_rollback(tmp_path, monkeypatch):
+    """dispatch 抛异常：HTTP 200 + {approved:false, status:failed, error, task_id}
+    契约体，任务回滚回 awaiting_approval，之后可重新裁决成功。"""
+    from dispatcher import RemoteDispatcher
+    real_dispatch = RemoteDispatcher.dispatch
+    calls = {"n": 0}
+
+    def flaky(self, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("无可用 executor worker")
+        return real_dispatch(self, **kwargs)
+
+    monkeypatch.setattr(RemoteDispatcher, "dispatch", flaky)
+    client, store, bodies, task_id = _approval_client(tmp_path, monkeypatch)
+
+    r = client.post(f"/tasks/{task_id}/approve", json={})
+    assert r.status_code == 200          # HTTP 200 保持不变
+    body = r.json()
+    assert body["approved"] is False
+    assert body["status"] == "failed"
+    assert body["error"] == "无可用 executor worker"
+    assert body["task_id"] == task_id
+    # 回滚：任务回到待审批，approval 仍 pending
+    rec = store.get(task_id)
+    assert rec.status == "awaiting_approval"
+    assert rec.meta["approval"]["status"] == "pending"
+
+    # 回滚后可重新裁决并成功放行
+    r2 = client.post(f"/tasks/{task_id}/approve", json={})
+    assert r2.status_code == 200
+    assert r2.json()["approved"] is True
+    assert store.get(task_id).status == "done"
+
+
+def test_redispatch_rejects_rejected_approval(tmp_path, monkeypatch):
+    """被人工拒绝的指令不可经 redispatch 绕过安全关卡（与 retry 同检查）。"""
+    client, store, bodies, task_id = _approval_client(tmp_path, monkeypatch)
+    r = client.post(f"/tasks/{task_id}/reject", json={"reason": "危险操作"})
+    assert r.status_code == 200
+    assert store.get(task_id).meta["approval"]["status"] == "rejected"
+
+    r2 = client.post(f"/tasks/{task_id}/redispatch", json={})
+    assert r2.status_code == 400
+    assert "拒绝" in r2.json()["detail"]
+    assert bodies == []  # 未产生任何真实派发
+
+
+def test_redispatch_blocked_for_dispatching(tmp_path, monkeypatch):
+    """dispatching（approve 派发占位中）任务不可重派。"""
+    client, store, _, task_id = _approval_client(tmp_path, monkeypatch)
+    assert store.transition(task_id, "awaiting_approval", "dispatching") is True
+    r = client.post(f"/tasks/{task_id}/redispatch", json={})
+    assert r.status_code == 400
+    assert "重派" in r.json()["detail"]
+
+
+def test_callback_rejected_for_dispatching_and_awaiting(tmp_path):
+    """迟到 callback 不得改写 dispatching/awaiting_approval/终态任务（修复前
+    仅拦截 done/failed，cancelled 等可被迟到回调复活）。"""
+    import asyncio
+    from async_dispatcher import AsyncRemoteDispatcher
+    reg = WorkerRegistry(heartbeat_timeout=45, now_fn=lambda: 0.0)
+    store = TaskStore(str(tmp_path))
+    cfg = Config(mode="remote", task_store_dir=str(tmp_path), security_llm=False)
+
+    async def fake_async_http(method, url, **kwargs):
+        return {"status_code": 200, "json": {}}
+
+    async_disp = AsyncRemoteDispatcher(
+        task_store=store, registry=reg, async_http=fake_async_http,
+        now_fn=lambda: "t0",
+    )
+    client = TestClient(create_brain_app(reg, store, cfg, async_dispatcher=async_disp))
+
+    for st in ("dispatching", "awaiting_approval", "cancelled", "lost", "failed"):
+        store.write(TaskRecord(
+            task_id=f"t-{st}", role="executor", prompt="x", worker_id="A",
+            status=st, created_at="t", updated_at="t"))
+        r = client.post(f"/tasks/t-{st}/callback",
+                        json={"status": "done", "output": "late result"})
+        assert r.status_code == 200, st
+        assert r.json()["handled"] is False, st
+        assert store.get(f"t-{st}").status == st, st  # 状态未被改写
+
+    # 对照组：running 任务正常接收回调
+    store.write(TaskRecord(
+        task_id="t-running", role="executor", prompt="x", worker_id="A",
+        status="running", created_at="t", updated_at="t"))
+    r = client.post("/tasks/t-running/callback",
+                    json={"status": "done", "output": "ok"})
+    assert r.json()["handled"] is True
+    assert store.get("t-running").status == "done"
+
+
+def test_dispatch_async_security_check_does_not_block_loop(tmp_path, monkeypatch):
+    """async 端点的安全检验挪到线程池：慢检验（阻塞型 LLM）期间事件循环
+    仍可调度其他协程；未修复时同步调用会阻塞整个 loop，心跳协程无法推进。"""
+    import asyncio
+    import time as _time
+    import httpx
+    from async_dispatcher import AsyncRemoteDispatcher
+    from unittest.mock import patch
+
+    reg = WorkerRegistry(heartbeat_timeout=45, now_fn=lambda: 0.0)
+    reg.register(WorkerInfo(worker_id="A", role="executor", host="127.0.0.1",
+                            port=8001, capabilities={}, last_heartbeat=0.0))
+    store = TaskStore(str(tmp_path))
+    cfg = Config(mode="remote", task_store_dir=str(tmp_path), security_llm=False)
+
+    async def fake_async_http(method, url, **kwargs):
+        return {"status_code": 200, "json": {"status": "accepted"}}
+
+    async_disp = AsyncRemoteDispatcher(
+        task_store=store, registry=reg, async_http=fake_async_http,
+        now_fn=lambda: "t0", poll_interval=0.01, poll_max=2,
+    )
+    app = create_brain_app(reg, store, cfg, async_dispatcher=async_disp)
+
+    def slow_check(*a, **k):
+        _time.sleep(0.6)  # 模拟阻塞型 security_llm 调用
+        return {"verdict": "pass", "reason": "ok", "matched_rules": [],
+                "suggestion": "", "llm_enhanced": False}
+
+    async def scenario():
+        ticks = {"n": 0}
+
+        async def heartbeat():
+            while True:
+                await asyncio.sleep(0.05)
+                ticks["n"] += 1
+
+        hb = asyncio.create_task(heartbeat())
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://t") as ac:
+            with patch("brain_api.security_check", slow_check):
+                r = await ac.post("/dispatch/async",
+                                  json={"prompt": "hello", "role": "executor"})
+        hb.cancel()
+        try:
+            await hb
+        except asyncio.CancelledError:
+            pass
+        return r, ticks["n"]
+
+    r, ticks = asyncio.run(scenario())
+    assert r.status_code == 200
+    assert r.json()["status"] == "accepted"
+    # 慢检验期间心跳协程持续被调度（0.6s / 0.05s ≈ 12 次）；
+    # 阻塞在事件循环里时 ticks 接近 0
+    assert ticks >= 5, f"事件循环疑似被阻塞：0.6s 内仅调度 {ticks} 次"
+
+
+# ---------------------------------------------------------------- P0 本地执行配置对等
+
+def test_build_local_core_config_parity(tmp_path, monkeypatch):
+    """P0 配置对等：本地执行核心配置走 load_agent_config，转发 brain
+    已解析的目录，并携带 CLI 同款 model / 守卫 / 纠错开关（不再手搭遗漏）。"""
+    import brain_api
+    # 显式设定环境变量，避免仓库 .env / 外部环境干扰断言（monkeypatch 先于
+    # load_dotenv 写入 os.environ，load_dotenv(override=False) 不会覆盖）
+    monkeypatch.setenv("AGENT_MODEL", "sonnet")
+    monkeypatch.setenv("ORCH_PERMISSION_MODE", "default")
+    monkeypatch.setenv("ORCH_MAX_TURNS", "42")
+    monkeypatch.setenv("AGENT_CORRECTION_ENABLED", "1")
+    monkeypatch.setenv("AGENT_OUTPUT_GUARD_ENABLED", "1")
+    cfg = Config(mode="local",
+                 memory_core_dir=str(tmp_path / "mc"),
+                 memory_context_dir=str(tmp_path / "mx"),
+                 experience_store_dir=str(tmp_path / "exp"))
+    core = brain_api._build_local_core_config(cfg)
+    # brain 解析的目录被原样转发（与调度器其他组件共用存储位置）
+    assert core.memory_core_dir == str(tmp_path / "mc")
+    assert core.memory_context_dir == str(tmp_path / "mx")
+    assert core.experience_store_dir == str(tmp_path / "exp")
+    # ORCH_* 兜底仍生效
+    assert core.permission_mode == "default"
+    assert core.max_turns == 42
+    # CLI 同款字段不再被手搭配置遗漏：model / 守卫 / 纠错 / 规划 / rag
+    assert core.model == "sonnet"
+    assert core.correction_enabled is True
+    assert core.output_guard_enabled is True
+    assert hasattr(core, "planning_enabled")
+    assert hasattr(core, "rag_enabled")
+    assert hasattr(core, "task_budget_usd")
 

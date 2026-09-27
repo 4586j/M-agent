@@ -45,7 +45,9 @@ class Config:
     experience_max_count: int = 500  # 经验库容量上限，超出按失败优先/命中少/最旧淘汰
     experience_ttl_days: int = 0  # 经验保留天数，0=不过期
     context_memory_max_chars: int = 8000  # 派发注入 context_memory 的限幅，防上下文膨胀
-    security_llm: bool = False  # security-guard LLM 增强（需 brain 侧 claude-agent-sdk）
+    # security-guard LLM 增强，阶段一起默认开启（需 brain 侧 claude-agent-sdk；
+    # 缺失时自动降级到规则引擎）；ORCH_SECURITY_LLM=0 显式关闭
+    security_llm: bool = True
     security_check_max_chars: int = 6000  # 产物检验合并输入限幅（LLM/规则输入封顶）
     model_routing: str = "off"  # off | heuristic：简单 executor 任务路由到便宜模型
     cheap_model: str = "haiku"  # 启发式命中的目标模型
@@ -76,7 +78,8 @@ def load_config() -> Config:
         experience_max_count=int(os.environ.get("ORCH_EXPERIENCE_MAX", "500")),
         experience_ttl_days=int(os.environ.get("ORCH_EXPERIENCE_TTL_DAYS", "0")),
         context_memory_max_chars=int(os.environ.get("ORCH_CONTEXT_MEMORY_MAX", "8000")),
-        security_llm=os.environ.get("ORCH_SECURITY_LLM", "0") in ("1", "true", "True"),
+        # 默认开启，ORCH_SECURITY_LLM=0/false 显式关闭（规则引擎兜底，LLM 缺失自动降级）
+        security_llm=os.environ.get("ORCH_SECURITY_LLM", "1") not in ("0", "false", "False", "no", "off"),
         security_check_max_chars=int(os.environ.get("ORCH_SECURITY_CHECK_MAX_CHARS", "6000")),
         model_routing=os.environ.get("ORCH_MODEL_ROUTING", "off"),
         cheap_model=os.environ.get("ORCH_CHEAP_MODEL", "haiku"),

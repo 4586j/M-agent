@@ -39,9 +39,14 @@ _GUARD_SYSTEM_PROMPT = """\
 
 
 def check(content: str) -> dict:
-    """对 content 逐条规则匹配，返回裁决（确定性正则引擎）。"""
+    """对 content 逐条规则匹配，返回裁决（确定性正则引擎）。
+
+    返回 dict 额外带 llm_enhanced 字段（纯规则裁决为 False），
+    供审计日志记录本次裁决是否经过 LLM 增强。
+    """
     if not content:
-        return {"verdict": "pass", "reason": "空内容", "matched_rules": [], "suggestion": ""}
+        return {"verdict": "pass", "reason": "空内容", "matched_rules": [],
+                "suggestion": "", "llm_enhanced": False}
     matched_block: list[dict] = []
     matched_warn: list[dict] = []
     for r in load_effective_rules():
@@ -56,6 +61,7 @@ def check(content: str) -> dict:
             "reason": "命中 block 规则: " + "; ".join(r["description"] for r in matched_block),
             "matched_rules": [r["id"] for r in matched_block],
             "suggestion": "修改指令移除危险内容，或确认后强制放行",
+            "llm_enhanced": False,
         }
     if matched_warn:
         return {
@@ -63,8 +69,10 @@ def check(content: str) -> dict:
             "reason": "命中 warn 规则（已放行）: " + "; ".join(r["description"] for r in matched_warn),
             "matched_rules": [r["id"] for r in matched_warn],
             "suggestion": "",
+            "llm_enhanced": False,
         }
-    return {"verdict": "pass", "reason": "无规则命中", "matched_rules": [], "suggestion": ""}
+    return {"verdict": "pass", "reason": "无规则命中", "matched_rules": [],
+            "suggestion": "", "llm_enhanced": False}
 
 
 def check_with_llm(content: str, use_llm: bool = False) -> dict:
@@ -73,6 +81,8 @@ def check_with_llm(content: str, use_llm: bool = False) -> dict:
     - 规则 block -> 直接返回（不调 LLM）
     - 规则 pass 且 use_llm -> 调 LLM 补充判断；LLM 不可用/异常 -> 回退规则结果
     - LLM 判 block -> 合并为 block（reason 标注 LLM 判断，matched_rules 保留规则命中的 warn）
+
+    返回 dict 带 llm_enhanced 字段：True 表示本次裁决经 LLM 增强判断，供审计记录。
     """
     rule_v = check(content)
     if rule_v["verdict"] == "block":
@@ -81,15 +91,16 @@ def check_with_llm(content: str, use_llm: bool = False) -> dict:
         return rule_v
     llm_v = _llm_judge(content)
     if llm_v is None:
-        return rule_v
+        return rule_v  # LLM 不可用：回退规则结果，未实际增强
     if llm_v.get("verdict") == "block":
         return {
             "verdict": "block",
             "reason": "LLM 判断: " + (llm_v.get("reason") or "疑似危险内容"),
             "matched_rules": rule_v.get("matched_rules", []),
             "suggestion": llm_v.get("suggestion") or "确认内容安全后强制放行",
+            "llm_enhanced": True,
         }
-    return rule_v
+    return {**rule_v, "llm_enhanced": True}
 
 
 def _run_async(coro):

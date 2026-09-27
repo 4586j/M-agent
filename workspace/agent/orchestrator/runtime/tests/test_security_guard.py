@@ -37,7 +37,10 @@ def test_empty_content_passes():
 
 def test_verdict_schema():
     r = check("rm -rf /")
-    assert set(r.keys()) == {"verdict", "reason", "matched_rules", "suggestion"}
+    # llm_enhanced 为阶段一新增字段：标记裁决是否经 LLM 增强（纯规则为 False）
+    assert set(r.keys()) == {"verdict", "reason", "matched_rules", "suggestion",
+                             "llm_enhanced"}
+    assert r["llm_enhanced"] is False
 
 
 def test_check_with_llm_rule_block_skips_llm(monkeypatch):

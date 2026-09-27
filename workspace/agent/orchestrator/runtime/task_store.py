@@ -1,12 +1,31 @@
-"""任务持久化。每个任务一个 JSON 文件，支持状态流转与按 worker/lost 查询。"""
+"""任务持久化。每个任务一个 JSON 文件，支持状态流转与按 worker/lost 查询。
+
+线程安全：approve/reject 等 sync def 端点在线程池并发运行，本模块以实例级
+可重入锁（RLock）保护全部写路径；transition 提供 compare-and-set 原子状态
+迁移，供审批流占位防并发双重派发（TOCTOU）。
+"""
 import json
+import threading
+import time
+import uuid
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
 from safe_id import validate_id
 
-VALID_STATUSES = ("pending", "running", "done", "failed", "lost", "cancelled")
+# 任务状态集合。awaiting_approval（阶段四审批挂起态）与 dispatching（approve
+# 派发占位态）为非终态：security-guard 拦截后等待人工裁决；approve 先原子
+# 占位 dispatching 再派发（完成后落终态、异常回滚回 awaiting_approval）。
+# 二者均不参与自动重试（list_retryable 只取 lost/failed）、不被 sweeper 标
+# lost（只扫 running）、事件总线 TERMINAL_STATUSES 亦不含它们。
+VALID_STATUSES = ("pending", "running", "awaiting_approval", "dispatching",
+                  "done", "failed", "lost", "cancelled")
+
+
+def new_trace_id() -> str:
+    """生成短格式 trace_id（uuid4 hex 截断，trc- 前缀便于日志 grep 关联）。"""
+    return f"trc-{uuid.uuid4().hex[:12]}"
 
 
 @dataclass
@@ -25,6 +44,12 @@ class TaskRecord:
     retry_count: int = 0
     max_retries: int = 0
     last_retry_at: str = ""
+    # 链路追踪 ID：任务创建时生成，贯穿 brain/worker 日志、worker payload 与回调。
+    # dataclass 默认值兜底旧任务文件缺字段（兼容读取为 None/空 dict）
+    trace_id: str | None = None
+    # worker 回传的执行元数据（usage/cost_usd/num_turns/model 等），终态化时由
+    # dispatcher 写入；无数据时保持空 dict，查询端点原样透出供 eval/前端消费
+    meta: dict = field(default_factory=dict)
 
 
 class TaskStore:
@@ -32,6 +57,11 @@ class TaskStore:
         self.store_dir = Path(store_dir)
         self.store_dir.mkdir(parents=True, exist_ok=True)
         self._cache: list[TaskRecord] | None = None
+        # 可重入写锁：get 返回缓存对象引用、update 原为无锁 setattr，而
+        # approve/reject 在线程池并发运行——统一串行化写路径；transition 的
+        # compare-and-set 依赖它保证原子性（可重入以支持 update/transition
+        # 内部复用 write）。
+        self._lock = threading.RLock()
 
     def _invalidate(self) -> None:
         self._cache = None
@@ -43,9 +73,10 @@ class TaskStore:
     def write(self, record: TaskRecord) -> None:
         if record.status not in VALID_STATUSES:
             raise ValueError(f"invalid status: {record.status}")
-        with open(self._path(record.task_id), "w", encoding="utf-8") as f:
-            json.dump(asdict(record), f, ensure_ascii=False, indent=2)
-        self._invalidate()
+        with self._lock:
+            with open(self._path(record.task_id), "w", encoding="utf-8") as f:
+                json.dump(asdict(record), f, ensure_ascii=False, indent=2)
+            self._invalidate()
 
     def get(self, task_id: str) -> TaskRecord | None:
         if self._cache is not None:
@@ -60,15 +91,58 @@ class TaskStore:
             return TaskRecord(**json.load(f))
 
     def update(self, task_id: str, **fields) -> TaskRecord:
-        rec = self.get(task_id)
-        if rec is None:
-            raise KeyError(f"task not found: {task_id}")
-        if "status" in fields and fields["status"] not in VALID_STATUSES:
-            raise ValueError(f"invalid status: {fields['status']}")
-        for k, v in fields.items():
-            setattr(rec, k, v)
-        self.write(rec)
-        return rec
+        """读改写全流程持锁：并发 update 不同字段不互相覆盖。"""
+        with self._lock:
+            rec = self.get(task_id)
+            if rec is None:
+                raise KeyError(f"task not found: {task_id}")
+            if "status" in fields and fields["status"] not in VALID_STATUSES:
+                raise ValueError(f"invalid status: {fields['status']}")
+            for k, v in fields.items():
+                setattr(rec, k, v)
+            self.write(rec)
+            return rec
+
+    def transition(self, task_id: str, from_status: str, to_status: str) -> bool:
+        """原子 compare-and-set 状态迁移：仅当当前状态等于 from_status 时迁移。
+
+        锁内完成「读-比较-写」：并发调用（如两个 approve 同时裁决同一任务）
+        恰好一个成功，其余返回 False——调用方据此返回 409 Conflict，
+        从根上消除「读状态→校验→派发→更新」窗口期的 TOCTOU 双重派发。
+        """
+        with self._lock:
+            rec = self.get(task_id)
+            if rec is None or rec.status != from_status:
+                return False
+            if to_status not in VALID_STATUSES:
+                raise ValueError(f"invalid status: {to_status}")
+            rec.status = to_status
+            rec.updated_at = str(int(time.time()))
+            self.write(rec)
+            return True
+
+    def finalize_if(self, task_id: str, expected: tuple[str, ...],
+                    **fields) -> TaskRecord | None:
+        """原子终态化：仅当当前状态在 expected 集合内才写入 fields（含 status）。
+
+        用于本地执行收尾（P0：取消不可覆盖）：若任务已被 cancel 端点置为
+        cancelled（终态、不可变），派发线程的迟到写入不得覆盖它——返回 None
+        表示未写入（已被取消/已终态化）。锁内完成「读-比较-写」，消除取消与
+        收尾的竞态；成功写入时刷新 updated_at（供时长/审计口径准确）。
+        """
+        with self._lock:
+            rec = self.get(task_id)
+            if rec is None:
+                raise KeyError(f"task not found: {task_id}")
+            if rec.status not in expected:
+                return None
+            if "status" in fields and fields["status"] not in VALID_STATUSES:
+                raise ValueError(f"invalid status: {fields['status']}")
+            for k, v in fields.items():
+                setattr(rec, k, v)
+            rec.updated_at = str(int(time.time()))
+            self.write(rec)
+            return rec
 
     def list_lost(self) -> list[TaskRecord]:
         return [r for r in self._all() if r.status == "lost"]

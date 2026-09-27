@@ -40,6 +40,44 @@ class FakeDispatcher:
         return self.dispatch(role="executor", prompt="redispatched")
 
 
+def test_sweep_leaves_awaiting_approval_untouched(tmp_path):
+    """阶段四审批挂起态：等待人工裁决的任务不被标 lost、不参与自动重试。"""
+    store = TaskStore(str(tmp_path))
+    reg = WorkerRegistry(heartbeat_timeout=45, now_fn=lambda: 0.0)
+    reg.register(make_info())
+    store.write(make_record("task-h", status="awaiting_approval", worker_id="worker-A"))
+    reg._now = lambda: 200.0  # worker 心跳超时（若为 running 会被标 lost）
+    fake_disp = FakeDispatcher()
+    mgr = RetryManager(store, reg, fake_disp, now_fn=lambda: 200.0, ts_fn=lambda: "200")
+
+    result = mgr.sweep_once()
+    assert result["marked_lost"] == 0
+    assert result["retried"] == 0
+    got = store.get("task-h")
+    assert got.status == "awaiting_approval"  # 挂起态原样保留
+    assert fake_disp.calls == []               # 无任何重试派发
+
+
+def test_sweep_leaves_dispatching_untouched(tmp_path):
+    """approve 派发占位态（dispatching）：worker 心跳超时也不被 sweeper 标 lost。"""
+    store = TaskStore(str(tmp_path))
+    reg = WorkerRegistry(heartbeat_timeout=45, now_fn=lambda: 0.0)
+    reg.register(make_info())
+    store.write(make_record("task-d", status="dispatching", worker_id="worker-A"))
+    reg._now = lambda: 200.0
+    fake_disp = FakeDispatcher()
+    mgr = RetryManager(store, reg, fake_disp, now_fn=lambda: 200.0, ts_fn=lambda: "200")
+
+    result = mgr.sweep_once()
+    assert result["marked_lost"] == 0
+    assert result["retried"] == 0
+    assert store.get("task-d").status == "dispatching"  # 占位态原样保留
+    assert fake_disp.calls == []
+
+    # dispatching 不参与自动重试
+    assert [r.task_id for r in store.list_retryable()] == []
+
+
 def test_sweep_marks_dead_worker_tasks_as_lost(tmp_path):
     store = TaskStore(str(tmp_path))
     reg = WorkerRegistry(heartbeat_timeout=10, now_fn=lambda: 100.0)

@@ -5,11 +5,14 @@ FakeAgentRunner / SdkAgentRunner）与向后兼容的 re-export（scan_skills /
 build_env_block / load_mcp_servers）；真实 SDK 消费逻辑已下沉到
 agent_core.kernel.AgentKernel，SdkAgentRunner 退化为其薄 adapter。
 """
+import logging
 import threading  # noqa: F401  保留：worker_api 等历史调用方可能引用本模块命名空间
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+log = logging.getLogger(__name__)
 
 # re-export：保持向后兼容（测试与 orch_cli / worker_api 从本模块 import 这些）
 from agent_core.tools import scan_skills, load_mcp_servers  # noqa: F401
@@ -24,6 +27,8 @@ class TaskRequest:
     model: str | None
     # threading.Event：worker 收到 cancel 时 set，runner 在 turn 边界协作退出
     cancel_event: Any = None
+    # 链路追踪 ID：brain 派发 payload 下发，贯穿 worker 日志与结果 callback（顶层字段）
+    trace_id: str | None = None
 
 
 @dataclass
@@ -67,13 +72,17 @@ class SdkAgentRunner(AgentRunner):
     """
 
     def __init__(self, work_dir: str, executor_def_path: str,
-                 permission_mode: str = "bypassPermissions",
+                 permission_mode: str = "default",  # 默认收敛：bypassPermissions 须显式传入
                  project_root: str | None = None,
                  task_timeout: int = 900,
                  max_turns: int = 50,
                  max_thinking_tokens: int | None = 10000,
                  task_budget_usd: float | None = None,
                  mcp_servers: dict | None = None,
+                 experience_store_dir: str | None = None,
+                 output_guard_enabled: bool = True,
+                 output_guard_max_retries: int = 1,
+                 fallback_model: str = "",
                  kernel: Any = None):
         self.work_dir = Path(work_dir)
         self.work_dir.mkdir(parents=True, exist_ok=True)
@@ -85,6 +94,13 @@ class SdkAgentRunner(AgentRunner):
         self.max_thinking_tokens = max_thinking_tokens
         self.task_budget_usd = task_budget_usd
         self.mcp_servers = mcp_servers
+        # 经验库目录：None 时 _get_kernel 退回 worker 约定默认（与大脑
+        # runtime/.experiences 共享）；显式传入可隔离（如测试用 tmp 目录）
+        self.experience_store_dir = experience_store_dir
+        # 输出质量守卫三配置（集群模式下经 WorkerConfig 透传进来）
+        self.output_guard_enabled = output_guard_enabled
+        self.output_guard_max_retries = output_guard_max_retries
+        self.fallback_model = fallback_model
         self._kernel = kernel  # 可注入（测试替身）；None 时 run() 内延迟自建
 
     def _get_kernel(self):
@@ -93,6 +109,11 @@ class SdkAgentRunner(AgentRunner):
             return self._kernel
         from agent_core.config import AgentConfig
         from agent_core.kernel import AgentKernel
+        # 经验库目录兜底：缺省时退回 worker 约定默认（与大脑共享的
+        # runtime/.experiences，基于 __file__ 锚定，与进程 CWD 无关），
+        # 避免 AgentConfig 默认空串导致 ExperienceStore(Path("")) 落到 CWD、
+        # 在进程工作目录散落 exp-local-<ts>.json（历史缺陷）
+        from worker_config import _default_experience_store_dir
         config = AgentConfig(
             max_turns=self.max_turns,
             # 0/None 一律视为「不限制」，与原有成本控制语义一致
@@ -103,6 +124,12 @@ class SdkAgentRunner(AgentRunner):
             project_root=self.project_root,
             mcp_servers=self.mcp_servers,  # 预加载的 dict，优先于 mcp_config_path
             mcp_config_path="",
+            experience_store_dir=self.experience_store_dir or _default_experience_store_dir(),
+            # 输出质量守卫三配置透传（此前缺失导致集群下 guard 无法关闭、
+            # fallback_model 不生效）
+            output_guard_enabled=self.output_guard_enabled,
+            output_guard_max_retries=self.output_guard_max_retries,
+            fallback_model=self.fallback_model,
         )
         self._kernel = AgentKernel(config)
         return self._kernel
@@ -128,10 +155,14 @@ class SdkAgentRunner(AgentRunner):
 
         # 委托内核执行：system prompt / 用户消息前缀 / 超时 / 取消 / usage 全由 kernel 负责
         kernel = self._get_kernel()
+        log.info("[trace=%s] task=%s kernel run start (model=%s)",
+                 req.trace_id, req.task_id, persona.model)
         result: KernelResult = kernel.run_oneshot(
             prompt=req.prompt, persona=persona, cwd=str(task_dir),
             context_memory=req.context_memory, cancel_event=req.cancel_event,
         )
+        log.info("[trace=%s] task=%s kernel run end (is_error=%s cancelled=%s)",
+                 req.trace_id, req.task_id, result.is_error, result.cancelled)
 
         # 映射 KernelResult -> TaskResult 的 meta（用量/成本/时长可观测）
         meta: dict = {"num_turns": result.turns}
@@ -145,6 +176,11 @@ class SdkAgentRunner(AgentRunner):
             meta["cost_usd"] = result.cost_usd
         if result.duration_ms:
             meta["duration_ms"] = result.duration_ms
+        # 阶段四反思回流：kernel 产出的 meta（reflection、plan_status、plan 等）
+        # 并入 TaskResult.meta，经 callback 入库 TaskRecord.meta，供 retry_manager
+        # 重试时把失败教训注入重试任务的 context
+        if result.meta:
+            meta.update(result.meta)
 
         # 协作式取消：kernel 在消息边界检测到 cancel_event 置位后返回 cancelled=True
         if result.cancelled:
@@ -154,13 +190,14 @@ class SdkAgentRunner(AgentRunner):
 
         # 墙钟超时：kernel 以 error_type="timeout" 精确标识，映射为原有 timeout 错误形状
         if result.error_type == "timeout":
+            meta["timeout"] = self.task_timeout
             return TaskResult(req.task_id, "failed",
                               error=f"task timeout after {self.task_timeout}s",
-                              meta={"timeout": self.task_timeout})
+                              meta=meta)
 
         # SDK 异常：kernel 收敛为 error_type="sdk_error"，透传其 output 作为 error
         if result.error_type == "sdk_error":
-            return TaskResult(req.task_id, "failed", error=result.output)
+            return TaskResult(req.task_id, "failed", error=result.output, meta=meta)
 
         # ResultMessage 自报 is_error：视为任务失败，保留 output 便于排障
         if result.is_error:

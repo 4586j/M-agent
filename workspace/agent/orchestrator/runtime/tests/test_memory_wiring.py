@@ -81,7 +81,7 @@ def test_assemble_context_rejects_invalid_task_id(tmp_path):
 def make_client(tmp_path, dispatcher=None):
     reg = WorkerRegistry(heartbeat_timeout=45, now_fn=lambda: 0.0)
     store = TaskStore(str(tmp_path / "tasks"))
-    cfg = Config(mode="remote", task_store_dir=str(tmp_path / "tasks"))
+    cfg = Config(mode="remote", task_store_dir=str(tmp_path / "tasks"), security_llm=False)
     mem = make_memory(tmp_path)
     app = create_brain_app(reg, store, cfg, dispatcher=dispatcher, memory_store=mem)
     return TestClient(app), mem
@@ -126,7 +126,7 @@ def test_memory_endpoints_require_store():
     from brain_api import create_brain_app as cab
     reg = WorkerRegistry(heartbeat_timeout=45, now_fn=lambda: 0.0)
     with tempfile.TemporaryDirectory() as td:
-        cfg = Config(mode="remote", task_store_dir=td)
+        cfg = Config(mode="remote", task_store_dir=td, security_llm=False)
         app = cab(reg, TaskStore(td), cfg)  # 不传 memory_store
         client = TC(app)
         assert client.get("/memory/core").status_code == 400
@@ -137,7 +137,8 @@ class CapturingDispatcher(Dispatcher):
     def __init__(self):
         self.calls = []
 
-    def dispatch(self, role, prompt, context_memory=None, model=None):
+    def dispatch(self, role, prompt, context_memory=None, model=None,
+                 use_experience=True, enable_subagents=None):
         self.calls.append({"role": role, "prompt": prompt,
                            "context_memory": context_memory, "model": model})
         return DispatchResult("task-cap1", "done", output="ok", artifacts=[], error=None)
@@ -205,7 +206,8 @@ def test_check_product_caps_combined_input():
 def make_routing_client(tmp_path, cfg_kwargs, dispatcher):
     reg = WorkerRegistry(heartbeat_timeout=45, now_fn=lambda: 0.0)
     store = TaskStore(str(tmp_path / "tasks"))
-    cfg = Config(mode="remote", task_store_dir=str(tmp_path / "tasks"), **cfg_kwargs)
+    cfg = Config(mode="remote", task_store_dir=str(tmp_path / "tasks"),
+                 security_llm=False, **cfg_kwargs)
     app = create_brain_app(reg, store, cfg, dispatcher=dispatcher)
     return TestClient(app)
 
@@ -214,7 +216,8 @@ def test_model_routing_routes_simple_task(tmp_path):
     class Cap(Dispatcher):
         calls = []
 
-        def dispatch(self, role, prompt, context_memory=None, model=None):
+        def dispatch(self, role, prompt, context_memory=None, model=None,
+                     use_experience=True, enable_subagents=None):
             Cap.calls.append(model)
             return DispatchResult("task-r1", "done", output="ok", artifacts=[], error=None)
 
@@ -234,7 +237,8 @@ def test_model_routing_skips_skill_and_long_tasks(tmp_path):
     class Cap(Dispatcher):
         calls = []
 
-        def dispatch(self, role, prompt, context_memory=None, model=None):
+        def dispatch(self, role, prompt, context_memory=None, model=None,
+                     use_experience=True, enable_subagents=None):
             Cap.calls.append(model)
             return DispatchResult("task-r2", "done", output="ok", artifacts=[], error=None)
 
@@ -255,7 +259,8 @@ def test_model_routing_respects_explicit_model(tmp_path):
     class Cap(Dispatcher):
         calls = []
 
-        def dispatch(self, role, prompt, context_memory=None, model=None):
+        def dispatch(self, role, prompt, context_memory=None, model=None,
+                     use_experience=True, enable_subagents=None):
             Cap.calls.append(model)
             return DispatchResult("task-r3", "done", output="ok", artifacts=[], error=None)
 

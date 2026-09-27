@@ -7,6 +7,7 @@ from typing import Callable
 from task_store import TaskStore, TaskRecord
 from worker_registry import WorkerRegistry
 from dispatcher import Dispatcher
+from event_bus import TaskEventBus, publish_task_event
 
 log = logging.getLogger(__name__)
 
@@ -21,12 +22,14 @@ class RetryManager:
         retry_base_delay: float = 1.0,
         now_fn: Callable[[], float] | None = None,
         ts_fn: Callable[[], str] | None = None,
+        event_bus: TaskEventBus | None = None,
     ):
         self.task_store = task_store
         self.registry = registry
         self.dispatcher = dispatcher
         self.sweeper_interval = sweeper_interval
         self.retry_base_delay = retry_base_delay
+        self.event_bus = event_bus
         self._now = now_fn or time.time
         self._ts = ts_fn or (lambda: str(int(time.time())))
         self._stop = threading.Event()
@@ -63,8 +66,28 @@ class RetryManager:
                         error=f"worker {dw.worker_id} heartbeat timeout",
                         updated_at=self._ts(),
                     )
+                    log.info("[trace=%s] task=%s marked lost (worker=%s heartbeat timeout)",
+                             rec.trace_id, rec.task_id, dw.worker_id)
+                    # lost 属终态：发布 done 事件让 SSE 订阅流关闭
+                    publish_task_event(self.event_bus, rec.task_id, event="done",
+                                       state="lost", trace_id=rec.trace_id,
+                                       summary=f"worker {dw.worker_id} heartbeat timeout")
                     count += 1
         return count
+
+    @staticmethod
+    def _retry_context(rec: TaskRecord) -> str:
+        """从 TaskRecord.meta 提取反思摘要，作为重试任务的 context（上次失败教训）。
+
+        阶段四反思回流：worker 侧 kernel 反思产物经 callback 存入
+        TaskRecord.meta["reflection"]；重试派发时注入 context_memory，
+        让重试任务带着「上次为什么失败」的教训执行。缺失返回空串。
+        """
+        meta = rec.meta if isinstance(rec.meta, dict) else {}
+        reflection = str(meta.get("reflection") or "").strip()
+        if not reflection:
+            return ""
+        return f"[上次失败教训（自动反思摘要，供参考改进）]\n{reflection[:800]}"
 
     def _retry_eligible(self) -> int:
         now = self._now()
@@ -73,8 +96,9 @@ class RetryManager:
             if not self._backoff_elapsed(rec, now):
                 continue
             try:
-                self.dispatcher.dispatch(
+                res = self.dispatcher.dispatch(
                     role=rec.role, prompt=rec.prompt,
+                    context_memory=self._retry_context(rec),
                 )
                 self.task_store.update(
                     rec.task_id,
@@ -82,9 +106,13 @@ class RetryManager:
                     last_retry_at=self._ts(),
                     updated_at=self._ts(),
                 )
+                log.info("[trace=%s] retry task=%s -> new task=%s (trace=%s, attempt=%s)",
+                         rec.trace_id, rec.task_id, res.task_id, res.trace_id,
+                         rec.retry_count + 1)
                 count += 1
             except Exception:
-                log.exception("retry dispatch failed for %s", rec.task_id)
+                log.exception("retry dispatch failed for %s (trace=%s)",
+                              rec.task_id, rec.trace_id)
         return count
 
     def _backoff_elapsed(self, rec: TaskRecord, now: float) -> bool:
@@ -107,7 +135,9 @@ class RetryManager:
         count = 0
         for rec in lost:
             try:
-                self.dispatcher.dispatch(role=rec.role, prompt=rec.prompt)
+                res = self.dispatcher.dispatch(
+                    role=rec.role, prompt=rec.prompt,
+                    context_memory=self._retry_context(rec))
                 self.task_store.update(
                     rec.task_id, status="running",
                     worker_id=worker_id,
@@ -115,7 +145,10 @@ class RetryManager:
                     last_retry_at=self._ts(),
                     updated_at=self._ts(),
                 )
+                log.info("[trace=%s] healing task=%s -> new task=%s (trace=%s)",
+                         rec.trace_id, rec.task_id, res.task_id, res.trace_id)
                 count += 1
             except Exception:
-                log.exception("healing dispatch failed for %s", rec.task_id)
+                log.exception("healing dispatch failed for %s (trace=%s)",
+                              rec.task_id, rec.trace_id)
         return count
