@@ -1,0 +1,145 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  python-tests:
+    name: Python 测试（3.11+ 矩阵）
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r workspace/agent/orchestrator/runtime/requirements.txt
+          pip install -e ./agent_core
+          pip install pytest
+      - name: 运行测试（agent_core / worker / runtime）
+        run: python -m pytest agent_core/tests worker/tests workspace/agent/orchestrator/runtime/tests -q
+
+  # Windows 门（Slice 4 / P1-6）：shell 与进程树/路径假设必须在 Windows 上验证，
+  # 而非只在 Linux 跑。覆盖 execution_host 的 Windows 后代清理、路径分隔符、
+  # 子进程派生等平台相关路径。与 Linux 同为「确定性 mock 套件」，不触网、不需 key。
+  windows-tests:
+    name: Windows 测试（确定性套件）
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r workspace/agent/orchestrator/runtime/requirements.txt
+          pip install -e ./agent_core
+          pip install pytest
+      - name: 运行测试（agent_core / worker / runtime）
+        run: python -m pytest agent_core/tests worker/tests workspace/agent/orchestrator/runtime/tests -q
+
+  # 清洁包装验证（Slice 4）：全新虚拟环境里从源码安装 agent_core 并做导入冒烟，
+  # 确保打包元数据/依赖声明可用（与 mock 测试分离，独立信号）。
+  clean-package:
+    name: 清洁包装安装 + 导入冒烟
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: 全新虚拟环境安装
+        run: |
+          python -m venv /tmp/cleanenv
+          . /tmp/cleanenv/bin/activate
+          python -m pip install --upgrade pip
+          pip install ./agent_core
+      - name: 导入冒烟（核心模块可加载）
+        run: |
+          . /tmp/cleanenv/bin/activate
+          python -c "import agent_core, agent_core.kernel, agent_core.run_store, agent_core.execution_host, agent_core.isolated_executor, agent_core.tool_policy; print('import ok', agent_core.__name__)"
+
+  eval-smoke:
+    name: eval 冒烟（不依赖 brain / API key）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: 安装依赖
+        run: pip install httpx pytest
+      - name: 任务集 dry-run
+        run: python eval/run_eval.py --dry-run
+      - name: eval 单测（纯逻辑，不触网）
+        run: python -m pytest eval/tests -q
+
+  # 占位：真实评测需要 ANTHROPIC_API_KEY 与已启动的 brain/worker，
+  # 待评测环境就绪后把 if: false 移除即可启用。
+  eval-real:
+    if: false
+    name: 真实 brain 派发评测（需 API key）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install httpx
+      - name: 派发评测任务集
+        env:
+          ORCH_BRAIN_URL: ${{ secrets.ORCH_BRAIN_URL }}
+          ORCH_API_KEY: ${{ secrets.ORCH_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: python eval/run_eval.py --brain-url $ORCH_BRAIN_URL --api-key $ORCH_API_KEY
+
+  # 真实 SDK 冒烟（Slice 4）：与 mock 测试分离——用真实 claude-agent-sdk 跑一个
+  # 最小任务，验证「安装的 SDK/CLI 组合」确实可执行（而非仅 mock 契约通过）。
+  # 需 ANTHROPIC_API_KEY，故默认 if: false；就绪后移除即启用，并据此固定 SDK 版本。
+  sdk-smoke:
+    if: false
+    name: 真实 SDK 冒烟（需 API key，与 mock 分离）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r workspace/agent/orchestrator/runtime/requirements.txt
+          pip install -e ./agent_core
+      - name: 真实 SDK 最小任务冒烟
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: python -m pytest agent_core/tests -q -m sdk_smoke
+
+  frontend-build:
+    name: 前端构建（node 20 + vite）
+    runs-on: ubuntu-latest
+    continue-on-error: true  # 前端构建失败不阻塞主流程
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: 安装依赖
+        working-directory: web
+        run: npm install
+      - name: 构建
+        working-directory: web
+        run: npm run build

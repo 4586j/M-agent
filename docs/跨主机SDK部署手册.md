@@ -5,6 +5,8 @@
 > 适用场景：多机并行执行、利用远程机器算力/环境、生产化部署。
 >
 > 推荐节奏：**先用 fake 模式打通网络链路，再切 sdk 模式接入真实执行**。前者不消耗 API、不需要认证，能快速定位网络/配置问题；后者在此基础上叠加认证与 executor 定义。
+>
+> ⚠ **鉴权默认值变更**：新版本 brain 不再全开放——未配置 `ORCH_API_KEY` 时仅放行环回请求（127.0.0.1/::1），非环回一律 403。跨主机部署必须从三条鉴权路径（见 §3.2.1）中选一条，否则 worker 注册、派发全部被拒。
 
 ---
 
@@ -116,15 +118,27 @@ pip install fastapi uvicorn requests httpx pyyaml
 | `ORCH_MODE` | `remote` | 启用跨主机派发 |
 | `ORCH_BRAIN_HOST` | `0.0.0.0` | 对所有网卡监听，允许远程 worker 连入 |
 | `ORCH_BRAIN_URL` | `http://<大脑IP>:7000` | 供 dispatch_cli 转发（默认 127.0.0.1，跨主机需改成大脑真实 IP） |
+| `ORCH_API_KEY` | 自定义密钥 | 跨主机部署**必设**（见 3.2.1）：worker 注册/心跳与派发侧均需携带同一 key |
 
-### 3.3 [可选] security-guard LLM 增强
-默认安全检验用确定性规则引擎。开启 LLM 增强（规则 pass 后调 haiku 补判"规则之外"可疑情况）需大脑侧装 `claude-agent-sdk`：
+### 3.2.1 鉴权（跨主机必读：三条路径三选一）
+
+auth 中间件（`auth.py`）默认行为：配置了 `ORCH_API_KEY` 时，所有非 public 请求须携带正确的 `X-API-Key` 头（或 `?api_key=` 查询参数，适配 EventSource）；**未配置时默认仅放行环回地址（127.0.0.1/::1），非环回请求返回 403**。跨主机部署从以下三条路径中选一条：
+
+| 路径 | 做法 | 适用场景 |
+|------|------|---------|
+| ① 双侧配置 `ORCH_API_KEY`（推荐） | 大脑启动设 `ORCH_API_KEY=<key>`；worker、dispatch_cli、eval 等派发侧设同一 key；Web 控制台在「状态总览 → 连接设置」填入（存 localStorage.orch_api_key） | 生产/跨主机标准做法 |
+| ② 临时全开放 | 大脑启动设 `ORCH_ALLOW_UNAUTHENTICATED=1` | 仅内网受控环境临时联调，勿暴露公网 |
+| ③ 全链路环回 | 不配 key，所有访问（brain、worker、前端）都在同一台机器走 127.0.0.1 | 单机自足，无跨主机需求 |
+
+- **dispatch_cli 现已支持 X-API-Key**：自动读取 `ORCH_API_KEY` / `AGENT_API_KEY` 环境变量，存在才携带该头（未配置时不发头，行为不变）。
+- **反向代理场景注意**：经 nginx/frp 等代理后，brain 看到的请求来源是代理机而非环回，「未配 key 仅放行环回」的豁免不再生效（必须走路径 ① 显式配 key），否则全站 403。
+
+### 3.3 [可选] security-guard LLM 增强（默认已开启）
+**新版本默认开启** LLM 增强：规则引擎 pass 后再调 haiku 只读会话补判「规则之外」的可疑情况，需大脑侧装 `claude-agent-sdk`；SDK 缺失或调用异常时自动降级回纯规则引擎，不影响主流程。注意：开启状态下**每次派发会多一次 LLM 调用**（成本/延迟敏感或纯内网可显式关闭）：
 ```bash
-pip install claude-agent-sdk
-# 启动时设
-export ORCH_SECURITY_LLM=1
+export ORCH_SECURITY_LLM=0   # 显式关闭（回退纯规则引擎，零额外 LLM 开销）
+# 默认（不设或设 1）= 开启；需 pip install claude-agent-sdk
 ```
-异常时自动降级回规则引擎，不影响主流程。
 
 ### 3.4 启动大脑
 ```bash
@@ -132,6 +146,7 @@ cd <项目根>/workspace/agent/orchestrator/runtime
 export ORCH_MODE=remote
 export ORCH_BRAIN_HOST=0.0.0.0
 export ORCH_BRAIN_URL=http://<大脑IP>:7000
+export ORCH_API_KEY=<你的密钥>        # 跨主机必设（见 3.2.1）
 python -m brain_api
 ```
 看到 `Uvicorn running on http://0.0.0.0:7000` 即成功。
@@ -223,6 +238,7 @@ export ORCH_EXECUTOR_DEF=/abs/path/to/executor.md
 ```bash
 cd <部署根>/worker
 export ORCH_BRAIN_URL=http://<大脑IP>:7000     # 指向大脑
+export ORCH_API_KEY=<与大脑相同的密钥>          # ★ 鉴权（跨主机必设，见 3.2.1）
 export ORCH_WORKER_ID=worker-B                 # 唯一标识（勿与 worker-A 重名）
 export ORCH_WORKER_HOST=<worker本机真实IP>      # 关键！大脑靠它回连拉产物
 export ORCH_WORKER_PORT=8001                   # 监听端口
@@ -262,6 +278,7 @@ curl http://127.0.0.1:7000/workers
 ```bash
 cd <项目根>
 export ORCH_BRAIN_URL=http://<大脑IP>:7000
+export ORCH_API_KEY=<你的密钥>   # dispatch_cli 自动读取并携带 X-API-Key 头（见 3.2.1）
 python workspace/agent/orchestrator/runtime/dispatch_cli.py "在当前目录写一个 hello.py，内容为打印 hello world"
 ```
 预期返回：
@@ -304,9 +321,11 @@ curl "http://127.0.0.1:7000/proxy/artifact?worker_id=worker-B&task_id=task-xxxxx
 | `ORCH_MODE` | local | `remote` 跨主机 |
 | `ORCH_BRAIN_HOST` | 127.0.0.1 | 监听地址，跨主机设 `0.0.0.0` |
 | `ORCH_BRAIN_URL` | http://127.0.0.1:7000 | 大脑地址（dispatch_cli 转发目标） |
+| `ORCH_API_KEY` | ""（空） | 大脑鉴权密钥；配置后所有非 public 请求须携带 X-API-Key。未配置时仅放行环回（非环回 403），见 3.2.1 |
+| `ORCH_ALLOW_UNAUTHENTICATED` | 未设 | 设 1 显式恢复全开放（覆盖环回限制；仅限受控环境） |
 | `ORCH_HEARTBEAT_TIMEOUT` | 45 | 心跳超时阈值（秒），超时剔除 worker |
 | `ORCH_SELECT_STRATEGY` | round_robin | worker 选择策略：`round_robin` / `least_load` |
-| `ORCH_SECURITY_LLM` | 0 | 1 开启 security-guard LLM 增强（需大脑侧 sdk） |
+| `ORCH_SECURITY_LLM` | 1（默认开启） | security-guard LLM 增强（需大脑侧 claude-agent-sdk，缺失自动降级规则引擎）；设 0 显式关闭。注意：开启时每次派发多一次 LLM 调用 |
 | `ORCH_CORS_ORIGINS` | http://localhost:5173 | 允许的前端来源（逗号分隔） |
 | `ORCH_WEB_DIST` | 自动查找 web/dist | 前端构建产物目录（同源托管） |
 
@@ -346,6 +365,8 @@ curl "http://127.0.0.1:7000/proxy/artifact?worker_id=worker-B&task_id=task-xxxxx
 | 任务一直 `running` 不返回 | sdk 执行中或卡住。`GET /task/{id}` 轮询；复杂任务耗时长，可调大耐心；卡死可标 lost 后重派 |
 | 产物拉取 404 / 502 | `ORCH_WORKER_HOST` 填了 127.0.0.1（大脑连不回），或 worker 8001 防火墙未放行，或 path 越界（防路径穿越校验拦截） |
 | 派发返回 `无可用 worker` | worker 未注册或已超时。`GET /workers` 确认；启动 worker 并等其注册 |
+| 请求返回 403（API key not configured） | brain 未配 key 且请求来源非环回（默认仅放行环回）。按 §3.2.1 三条路径之一处理：双侧配 `ORCH_API_KEY` / 临时 `ORCH_ALLOW_UNAUTHENTICATED=1` / 全链路环回。反代场景环回豁免失效，必须配 key |
+| 请求返回 401（invalid or missing API key） | brain 已配 key 但请求未携带或不匹配：核对 worker/派发侧 `ORCH_API_KEY` 与 brain 是否一致；Web 控制台在「连接设置」填入正确 key |
 | `ModuleNotFoundError: claude_agent_sdk` | worker 依赖未装全。`pip install -r requirements.txt` |
 | `permission_mode=default` 卡住 | 跨主机勿用 default。改 `ORCH_PERMISSION_MODE=bypassPermissions` 重启 worker |
 | 大脑重启后 worker 不见了 | worker 注册只在启动时发一次，大脑重启会丢记录。**重启大脑后 worker 也要重启**才能重新注册 |
@@ -360,7 +381,7 @@ curl "http://127.0.0.1:7000/proxy/artifact?worker_id=worker-B&task_id=task-xxxxx
 
 ## 8. 生产化与安全建议
 
-1. **TLS 与鉴权**：V2 默认假设内网可信，HTTP 明文且无鉴权。上生产需补 TLS（反向代理终结）与 token 鉴权，防止 worker 被冒充注册、指令被窃听。
+1. **TLS 与鉴权**：新版已内置 API Key 鉴权（`X-API-Key` 头 / `?api_key=` 查询参数）：跨主机部署须双侧配置同一 `ORCH_API_KEY`（未配 key 时仅放行环回，非环回 403）；上生产再补 TLS（反向代理终结，注意代理后环回豁免失效），防止 worker 被冒充注册、指令被窃听。
 2. **权限模式取舍**：`bypassPermissions` 无人值守但 executor 全工具不停顿，务必依赖 security-guard 双关卡（指令+产物）兜底；高敏感场景考虑 `acceptEdits` 并接受需人工介入的代价。
 3. **API 成本控制**：sdk 模式按 token 计费。简单任务用 `ORCH_MODEL=haiku` 降档；复杂任务才升 sonnet/opus。关注 Anthropic 用量面板。
 4. **工作目录隔离**：每个 task 在 `work_dir/{task_id}/` 独立目录执行，互不污染；定期清理历史产物。
@@ -376,7 +397,7 @@ curl "http://127.0.0.1:7000/proxy/artifact?worker_id=worker-B&task_id=task-xxxxx
 ```bash
 # === 大脑主机 ===
 cd <项目根>/workspace/agent/orchestrator/runtime
-export ORCH_MODE=remote ORCH_BRAIN_HOST=0.0.0.0 ORCH_BRAIN_URL=http://<大脑IP>:7000
+export ORCH_MODE=remote ORCH_BRAIN_HOST=0.0.0.0 ORCH_BRAIN_URL=http://<大脑IP>:7000 ORCH_API_KEY=<密钥>
 python -m brain_api
 # 防火墙(管理员): netsh advfirewall firewall add rule name="orch-brain" dir=in action=allow protocol=TCP localport=7000
 
@@ -386,6 +407,7 @@ pip install -r requirements.txt
 # 认证(网关): export ANTHROPIC_AUTH_TOKEN=... ANTHROPIC_BASE_URL=https://ark.cn-beijing.volces.com/api/plan ANTHROPIC_MODEL=ark-code-latest
 #   (官方直连改用: export ANTHROPIC_API_KEY=sk-ant-...)
 export ORCH_BRAIN_URL=http://<大脑IP>:7000
+export ORCH_API_KEY=<与大脑相同的密钥>   # 鉴权（见 3.2.1）
 export ORCH_WORKER_ID=worker-B
 export ORCH_WORKER_HOST=<worker真实IP>
 export ORCH_WORKER_PORT=8001
@@ -396,10 +418,10 @@ python -m worker_api
 
 # === 验证 ===
 curl http://127.0.0.1:7000/workers                              # 大脑查注册节点
-python .../dispatch_cli.py "写一个 hello.py 打印 hello world"  # 派发 sdk 任务
+python .../dispatch_cli.py "写一个 hello.py 打印 hello world"  # 派发 sdk 任务（自动携带 ORCH_API_KEY 对应的 X-API-Key 头）
 curl "http://127.0.0.1:7000/proxy/artifact?worker_id=worker-B&task_id=<id>&path=hello.py"  # 拉产物
 ```
 
 ---
 
-*手册版本：2026-07-12 · 基于 brain_api（含 ORCH_BRAIN_HOST 改造）、worker_api、SdkAgentRunner 实测编写*
+*手册版本：2026-09-10 · 基于 brain_api（含 ORCH_BRAIN_HOST 改造、API Key 鉴权、security_llm 默认开启）、worker_api、SdkAgentRunner 实测编写；新增 §3.2.1 三条鉴权路径*
