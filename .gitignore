@@ -38,3 +38,7 @@ workspace/agent/orchestrator/runtime/audit/
 
 # 真实任务运行产物目录
 result/
+workspace/agent/orchestrator/runtime/.tasks-run/
+workspace/agent/orchestrator/runtime/.exp-run/
+workspace/agent/orchestrator/runtime/.sched-run/
+workspace/agent/orchestrator/runtime/.proc-run/

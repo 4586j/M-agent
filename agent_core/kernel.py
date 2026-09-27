@@ -11,6 +11,7 @@
   不直接 isinstance 绑定 SDK 具体类，降低 SDK 版本升级的破坏面。
 """
 import asyncio
+import json
 import logging
 import time
 from dataclasses import dataclass, field
@@ -635,6 +636,24 @@ class AgentKernel:
         kr.meta["injection"] = verdict.to_dict()
         return kr
 
+    def _write_unattended_settings(self, cwd: str) -> str:
+        """无人值守模式（bypassPermissions）的任务目录权限设置。
+
+        Windows CLI 实测：bypassPermissions 需要 IS_SANDBOX 且 Windows 下 CLI 直接异常；
+        改为在任务目录写 .claude/settings.json（allow 清单 + defaultMode=acceptEdits），
+        经 options.settings 显式加载——setting_sources 仍为空，用户级/项目级设置继续隔离。
+        """
+        settings_dir = Path(cwd) / ".claude"
+        settings_dir.mkdir(parents=True, exist_ok=True)
+        settings = {"permissions": {
+            "defaultMode": "acceptEdits",
+            "allow": ["Write", "Edit", "Read", "Glob", "Grep", "Bash", "WebFetch", "WebSearch"],
+            "deny": [],
+        }}
+        path = settings_dir / "settings.json"
+        path.write_text(json.dumps(settings, indent=2), encoding="utf-8")
+        return str(path)
+
     def _build_options(self, persona: Persona, cwd: str,
                        resume_session_id: str | None = None,
                        query: str = "") -> Any:
@@ -659,10 +678,17 @@ class AgentKernel:
         )
         model = persona.model or self.config.model
 
+        # 无人值守权限：bypassPermissions（Windows 不可用）→ 任务目录 settings + acceptEdits
+        permission_mode = self.config.permission_mode
+        unattended_settings: str | None = None
+        if permission_mode == "bypassPermissions":
+            unattended_settings = self._write_unattended_settings(cwd)
+            permission_mode = "acceptEdits"
+
         kwargs: dict[str, Any] = dict(
             cwd=cwd,
             system_prompt=system_prompt,
-            permission_mode=self.config.permission_mode,
+            permission_mode=permission_mode,
             max_turns=self.config.max_turns,
             # 隔离用户级/项目级 Claude Code 设置文件（~/.claude/settings.json 等）。
             # 某些本地代理工具（如 image-vision-mcp）会在用户级 settings.json 的 env 块里
@@ -712,6 +738,8 @@ class AgentKernel:
             kwargs["agents"] = persona.sub_agents
         if resume_session_id:
             kwargs["resume"] = resume_session_id
+        if unattended_settings:
+            kwargs["settings"] = unattended_settings
 
         options = sdk.ClaudeAgentOptions(**kwargs)
         # persona 显式限定工具集时收窄 allowed_tools（None=全工具）
