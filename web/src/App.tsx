@@ -7,6 +7,8 @@ import Tasks from './views/Tasks'
 import NodeManage from './views/NodeManage'
 import Command from './views/Command'
 import Memory from './views/Memory'
+import Schedules from './views/Schedules'
+import Audit from './views/Audit'
 import ConnectionSettings from './components/ConnectionSettings'
 
 const NAV = [
@@ -31,8 +33,8 @@ export default function App() {
           <Route path="/nodes" element={<NodeManage />} />
           <Route path="/command" element={<Command />} />
           <Route path="/memory" element={<Memory />} />
-          <Route path="/schedules" element={<Placeholder title="调度" phase="三期：cron 定时任务管理" />} />
-          <Route path="/audit" element={<Placeholder title="审计" phase="三期：安全裁决流水（依赖 GET /audit 只读端点）" />} />
+          <Route path="/schedules" element={<Schedules />} />
+          <Route path="/audit" element={<Audit />} />
         </Routes>
       </main>
     </div>
@@ -124,23 +126,5 @@ function TopBar() {
         <ConnectionSettings />
       </div>
     </header>
-  )
-}
-
-function Placeholder({ title, phase }: { title: string; phase: string }) {
-  return (
-    <div className="bg-white p-12 rounded-2xl border border-mint-100 shadow-mint-card text-center">
-      <div className="w-16 h-16 rounded-full bg-mint-50 text-mint-600 flex items-center justify-center mx-auto mb-4 text-2xl">
-        🌱
-      </div>
-      <h3 className="text-base font-bold text-slate-800">{title}模块 · 建设中</h3>
-      <p className="text-xs text-slate-400 mt-2 max-w-md mx-auto leading-relaxed">{phase}。后端能力已就绪，界面按《客户端界面设计》分期实施。</p>
-      <Link
-        to="/"
-        className="mt-6 inline-block px-4 py-2 bg-mint-600 hover:bg-mint-500 text-white rounded-lg text-xs font-semibold transition"
-      >
-        返回总览看板
-      </Link>
-    </div>
   )
 }

@@ -2,7 +2,7 @@ import type {
   WorkerInfo, TaskRecord, DispatchResult, DispatchAsyncResponse, Stats, RegisterBody, DispatchBody,
   RecommendBody, RecommendResponse, TranslateBody, TranslateResponse,
   MemoryCoreItem, ContextNotesResponse, ExperienceRecord, ExperienceSearchBody,
-  ProposalRecord, ReflectionReport,
+  ProposalRecord, ReflectionReport, ScheduleRecord, ScheduleBody, AuditEntry,
 } from '../types'
 
 // 相对路径：dev 走 vite proxy，prod 同源直调。
@@ -129,6 +129,27 @@ export const api = {
     request<{ status: string }>(`/memory/procedural/proposals/${encodeURIComponent(id)}`, {
       method: 'DELETE',
     }),
+
+  // ---- 调度与审计（三期） ----
+
+  schedules: () => request<ScheduleRecord[]>('/schedules'),
+  createSchedule: (body: ScheduleBody) =>
+    request<ScheduleRecord>('/schedules', { method: 'POST', body: JSON.stringify(body) }),
+  deleteSchedule: (id: string) =>
+    request<{ status: string }>(`/schedules/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+  toggleSchedule: (id: string) =>
+    request<ScheduleRecord>(`/schedules/${encodeURIComponent(id)}/toggle`, { method: 'POST' }),
+  triggerSchedule: (id: string) =>
+    request<{ status: string }>(`/schedules/${encodeURIComponent(id)}/trigger`, { method: 'POST' }),
+
+  audit: (params?: { stage?: string; decision?: string; limit?: number }) => {
+    const q = new URLSearchParams()
+    if (params?.stage) q.set('stage', params.stage)
+    if (params?.decision) q.set('decision', params.decision)
+    if (params?.limit) q.set('limit', String(params.limit))
+    const qs = q.toString()
+    return request<AuditEntry[]>(`/audit${qs ? `?${qs}` : ''}`)
+  },
 
   // AI 推荐/解释顾问（独立上下文，不污染任务上下文）
   recommend: (body: RecommendBody) =>

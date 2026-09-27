@@ -265,3 +265,41 @@ export interface DispatchAsyncResponse {
   model?: string | null
   error?: string | null
 }
+
+// ---- 调度与审计（三期） ----
+
+/** 定时调度任务（/schedules） */
+export interface ScheduleRecord {
+  schedule_id: string
+  name: string
+  cron_expr: string
+  role: string
+  prompt: string
+  context_memory: string | null
+  model: string | null
+  enabled: boolean
+  last_run: string
+  next_run: string
+  created_at: string
+}
+
+export interface ScheduleBody {
+  name: string
+  cron_expr: string
+  role: string
+  prompt: string
+  context_memory?: string | null
+  model?: string | null
+}
+
+/** 安全裁决审计事件（GET /audit，JSONL 一行一事件） */
+export interface AuditEntry {
+  timestamp: string
+  task_id: string | null
+  stage: 'dispatch' | 'product_check' | 'approve'
+  decision: 'block' | 'warn' | 'pass' | 'force' | 'approve' | 'reject'
+  matched_rules: string[]
+  operator: string | null
+  llm_enhanced: boolean
+  reason?: string
+}
