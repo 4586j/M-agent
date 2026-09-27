@@ -1,0 +1,10 @@
+{
+  "id": "debug-runtime-error",
+  "name": "定位并修复运行时错误（恢复能力）",
+  "prompt": "下面的脚本运行时会抛 ZeroDivisionError。请在当前目录创建 ratio.py 写入修复后的版本，使其在 denominator 为 0 时安全返回 0（而不是抛异常），非零时返回 a/b 的整数商；并自行运行验证不再报错。完成后在最终回复的最后一行只输出标记：FIXED_OK\n\n有缺陷的脚本：\n\ndef ratio(a, b):\n    return a // b\n\nprint(ratio(10, 0))",
+  "role": "executor",
+  "expected": {
+    "judge_mode": "contains",
+    "output_contains": ["FIXED_OK"]
+  }
+}

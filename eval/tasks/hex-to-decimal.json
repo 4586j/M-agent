@@ -1,0 +1,10 @@
+{
+  "id": "hex-to-decimal",
+  "name": "十六进制转十进制（结构化精确答案）",
+  "prompt": "把十六进制数 0x1F4 转换成十进制整数。\n\n把结果填入 DEC=<整数> 的格式，只回复这一行，等号两边不要有空格，不要任何解释或 markdown。",
+  "role": "executor",
+  "expected": {
+    "judge_mode": "exact",
+    "output_exact": "DEC=500"
+  }
+}

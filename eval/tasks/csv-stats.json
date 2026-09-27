@@ -1,0 +1,10 @@
+{
+  "id": "csv-stats",
+  "name": "CSV 文本统计",
+  "prompt": "解析以下 CSV 文本（首行为表头，逗号分隔）：\n\ncity,score\nBeijing,90\nShanghai,98\nShenzhen,72\nBeijing,55\nHangzhou,45\n\n统计三项指标：数据行数（不含表头）、score 列总和、最高分。最终回复中单独输出一行统计结果，格式严格为：ROWS=5 SUM=360 MAX=98（等号两侧不要有空格，三项之间用单个空格分隔）。",
+  "role": "executor",
+  "expected": {
+    "judge_mode": "contains",
+    "output_contains": ["ROWS=5", "SUM=360", "MAX=98"]
+  }
+}

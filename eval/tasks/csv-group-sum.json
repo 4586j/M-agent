@@ -1,0 +1,10 @@
+{
+  "id": "csv-group-sum",
+  "name": "CSV 分组求和（结构化答案）",
+  "prompt": "下面是一段 CSV 文本（表头为逗号分隔首行）：\n\ncity,score\nBeijing,90\nShanghai,98\nBeijing,55\nShanghai,2\n\n请按 city 分组，对 score 求和。回复中必须各占一行给出两个城市的合计，格式严格为 Beijing=145 与 Shanghai=100（等号两边不要空格）。可以附带简短说明，但这两行必须原样出现。",
+  "role": "executor",
+  "expected": {
+    "judge_mode": "contains",
+    "output_contains": ["Beijing=145", "Shanghai=100"]
+  }
+}

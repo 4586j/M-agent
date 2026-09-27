@@ -1,0 +1,10 @@
+{
+  "id": "ini-config-write",
+  "name": "生成 INI 配置文件（文件生成）",
+  "prompt": "在当前目录创建 app.ini，内容为合法 INI 格式，包含一个 [db] 段，其中有 host=localhost 与 port=5432 两个键；再包含一个 [app] 段，其中有 name=orch-eval 与 debug=false 两个键。写入后可用 python -c \"import configparser; c=configparser.ConfigParser(); c.read('app.ini'); print(c['db']['host'])\" 自检。文件必须落在当前目录（作为产物）。",
+  "role": "executor",
+  "expected": {
+    "judge_mode": "artifact",
+    "artifact_glob": ["app.ini"]
+  }
+}

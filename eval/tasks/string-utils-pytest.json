@@ -1,0 +1,10 @@
+{
+  "id": "string-utils-pytest",
+  "name": "字符串工具模块 + pytest（仓库改动带测试）",
+  "prompt": "在当前目录创建字符串工具模块 string_utils.py，实现 reverse(s) 返回反转字符串、is_blank(s) 判断去空格后是否为空；再创建 test_string_utils.py，用 pytest 覆盖：普通字符串反转、回文串反转后不变、空串/纯空格 is_blank 为 True、非空为 False。运行 pytest 确认全部通过。两个文件都必须落在当前目录（作为产物）。",
+  "role": "executor",
+  "expected": {
+    "judge_mode": "artifact",
+    "artifact_glob": ["string_utils.py", "test_string_utils.py"]
+  }
+}

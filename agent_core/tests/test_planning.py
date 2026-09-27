@@ -1,9 +1,10 @@
 """测试 agent_core.planning：Plan 序列化、进度持久化、计划解析与提示构造。"""
 import json
+import time
 
 from agent_core.planning import (Plan, PlanningManager, PlanStep,
                                  build_planning_prompt, build_reflection_prompt,
-                                 parse_plan_from_output)
+                                 build_step_prompt, parse_plan_from_output)
 
 
 def _sample_plan() -> Plan:
@@ -137,6 +138,42 @@ def test_is_complete_empty_steps():
     assert Plan(goal="g").is_complete() is False
 
 
+# ---- all_done / max_step_id ----
+
+def test_all_done_true_only_when_every_step_done():
+    plan = _sample_plan()
+    for s in plan.steps:
+        s.status = "done"
+    assert plan.all_done() is True
+
+
+def test_all_done_false_with_failed_step():
+    """is_complete 把 failed 算收尾，all_done 不算——二者语义必须区分。"""
+    plan = _sample_plan()
+    plan.steps[0].status = "done"
+    plan.steps[1].status = "failed"
+    plan.steps[2].status = "done"
+    assert plan.is_complete() is True   # 执行循环已停
+    assert plan.all_done() is False     # 但并非每步都成功
+
+
+def test_all_done_false_with_pending_step():
+    plan = _sample_plan()
+    plan.steps[0].status = "done"
+    plan.steps[1].status = "done"
+    # steps[2] 仍 pending
+    assert plan.all_done() is False
+
+
+def test_all_done_empty_steps():
+    assert Plan(goal="g").all_done() is False
+
+
+def test_max_step_id():
+    assert _sample_plan().max_step_id() == 3
+    assert Plan(goal="g").max_step_id() == 0
+
+
 # ---- PlanningManager 持久化 ----
 
 def test_planning_manager_creates_dir(tmp_path):
@@ -230,6 +267,55 @@ def test_planning_manager_progress_summary_no_plan(tmp_path):
     assert mgr.get_progress_summary("ghost") == "（无进行中的计划）"
 
 
+# ---- find_resumable 计划年龄上限（断点续跑防陈旧计划错配） ----
+
+def _save_plan_with_created_at(tmp_path, session_id, prompt, created_at):
+    """落盘指定 created_at 的未完成计划（步骤 2 pending），返回其 PlanningManager。"""
+    mgr = PlanningManager(tmp_path / "progress")
+    plan = Plan(goal="g", steps=[
+        PlanStep(id=1, action="a", status="done"),
+        PlanStep(id=2, action="b"),
+    ], source_prompt=prompt)
+    mgr.save_plan(session_id, plan)
+    # save_plan 自动填当前时间，这里覆盖为指定值以模拟陈旧/异常时间戳
+    path = tmp_path / "progress" / f"{session_id}.json"
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data["created_at"] = created_at
+    path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    return mgr
+
+
+def test_find_resumable_within_max_age(tmp_path):
+    now = time.strftime("%Y-%m-%d %H:%M:%S")
+    mgr = _save_plan_with_created_at(tmp_path, "s1", "任务P", now)
+    assert mgr.find_resumable("任务P", max_age_hours=24) is not None
+
+
+def test_find_resumable_expired_returns_none(tmp_path):
+    stale = time.strftime("%Y-%m-%d %H:%M:%S",
+                          time.localtime(time.time() - 25 * 3600))
+    mgr = _save_plan_with_created_at(tmp_path, "s1", "任务P", stale)
+    # 超龄不续跑（调用方据此开新计划），不限年龄时照常命中
+    assert mgr.find_resumable("任务P", max_age_hours=24) is None
+    assert mgr.find_resumable("任务P") is not None
+
+
+def test_find_resumable_invalid_created_at_treated_as_expired(tmp_path):
+    """created_at 缺失/无法解析时无法判定年龄：保守视同超龄，不续跑。"""
+    mgr = _save_plan_with_created_at(tmp_path, "s1", "任务P", "不是时间")
+    assert mgr.find_resumable("任务P", max_age_hours=24) is None
+    assert mgr.find_resumable("任务P") is not None
+
+
+def test_find_resumable_zero_or_negative_age_means_unlimited(tmp_path):
+    """max_age_hours <=0 表示不限年龄（保持旧行为），由 config 层决定。"""
+    stale = time.strftime("%Y-%m-%d %H:%M:%S",
+                          time.localtime(time.time() - 25 * 3600))
+    mgr = _save_plan_with_created_at(tmp_path, "s1", "任务P", stale)
+    assert mgr.find_resumable("任务P", max_age_hours=0) is not None
+    assert mgr.find_resumable("任务P", max_age_hours=None) is not None
+
+
 # ---- parse_plan_from_output ----
 
 def test_parse_plan_pure_json():
@@ -309,3 +395,31 @@ def test_build_reflection_prompt_includes_output():
     prompt = build_reflection_prompt(task_output)
     assert task_output in prompt
     assert "评估" in prompt  # 反思指令
+
+
+# ---- build_step_prompt ----
+
+def _two_step_plan() -> Plan:
+    return Plan(goal="g", steps=[
+        PlanStep(id=1, action="第一步", status="done", output="步骤一产物"),
+        PlanStep(id=2, action="第二步", depends_on=[1]),
+    ])
+
+
+def test_build_step_prompt_includes_context_memory():
+    """步骤轮 prompt 注入与规划轮同源的 context_memory 前缀。"""
+    plan = _two_step_plan()
+    prompt = build_step_prompt("原始任务", plan, plan.steps[1],
+                               context_memory="记忆内容XYZ")
+    assert "[上下文记忆]" in prompt
+    assert "记忆内容XYZ" in prompt
+    assert "[当前步骤 2]" in prompt
+    assert "原始任务" in prompt
+
+
+def test_build_step_prompt_without_context_memory_omits_section():
+    """不传 context_memory 时不出现空段（保持旧行为）。"""
+    plan = _two_step_plan()
+    prompt = build_step_prompt("原始任务", plan, plan.steps[1])
+    assert "[上下文记忆]" not in prompt
+    assert "[当前步骤 2]" in prompt

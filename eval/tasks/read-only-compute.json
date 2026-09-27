@@ -1,0 +1,10 @@
+{
+  "id": "read-only-compute",
+  "name": "受限工具：只读不落盘的心算",
+  "prompt": "约束：本任务禁止创建、写入或修改任何文件，也不要执行任何命令，只用心算作答。请计算 15 乘以 15 的结果。\n\n把结果填入 READONLY=<整数> 的格式，只回复这一行，等号两边不要有空格，不要任何解释或 markdown。",
+  "role": "executor",
+  "expected": {
+    "judge_mode": "contains",
+    "output_contains": ["READONLY=225"]
+  }
+}

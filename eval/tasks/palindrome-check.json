@@ -1,0 +1,10 @@
+{
+  "id": "palindrome-check",
+  "name": "回文判断函数自测",
+  "prompt": "在当前目录创建 palindrome.py：实现 is_palindrome(s)（忽略大小写与空格，空字符串视为回文）。用至少 4 个用例自测，必须包含 \"Level\"（应返回 True）、空字符串（应返回 True）以及一个非回文用例。全部通过后，在最终回复中单独输出一行标记：PALINDROME_OK",
+  "role": "executor",
+  "expected": {
+    "judge_mode": "contains",
+    "output_contains": ["PALINDROME_OK"]
+  }
+}

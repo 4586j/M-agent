@@ -1,0 +1,10 @@
+{
+  "id": "csv-to-json",
+  "name": "CSV 转 JSON 文件（文件转换）",
+  "prompt": "把下面的 CSV 文本转换为 JSON 数组（每行一个对象，键为表头），并在当前目录写入文件 data.json。CSV 文本（表头为逗号分隔首行）：\n\nname,qty\napple,3\nbanana,7\n\n要求：data.json 内容为合法 JSON，形如 [{\"name\": \"apple\", \"qty\": 3}, {\"name\": \"banana\", \"qty\": 7}]，qty 为整数。写入后可用 python -c \"import json; json.load(open('data.json'))\" 自检。文件必须落在当前目录（作为产物）。",
+  "role": "executor",
+  "expected": {
+    "judge_mode": "artifact",
+    "artifact_glob": ["data.json"]
+  }
+}

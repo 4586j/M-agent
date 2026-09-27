@@ -1,0 +1,10 @@
+{
+  "id": "offline-power-compute",
+  "name": "受限工具：离线计算幂",
+  "prompt": "约束：本任务在完全离线环境下进行，禁止访问网络、禁止联网检索，只用心算作答。请计算 2 的 10 次方。\n\n把结果填入 POW=<整数> 的格式，只回复这一行，等号两边不要有空格，不要任何解释或 markdown。",
+  "role": "executor",
+  "expected": {
+    "judge_mode": "contains",
+    "output_contains": ["POW=1024"]
+  }
+}

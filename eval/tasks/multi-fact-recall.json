@@ -1,0 +1,10 @@
+{
+  "id": "multi-fact-recall",
+  "name": "多事实召回（长上下文）",
+  "prompt": "阅读下面这段项目说明，然后回答末尾问题。\n\norch-eval 是单机 Agent 的评测框架。它有三个核心阈值参数：采样批次大小 alpha 设为 1，重试上限 beta 设为 2，并发度 gamma 设为 3。派发器把每个任务送到 worker，worker 运行 kernel 并通过回调返回结果。经验库默认关闭写入以便 A/B 对照。产物裁决在终态化前执行。整个流程强调可复现与隔离。\n\n问题：请分别给出 alpha、beta、gamma 的取值。回复中必须各占一行、原样包含以下三行：A=1、B=2、C=3（等号两边不要空格）。可附简短说明，但这三行必须出现。",
+  "role": "executor",
+  "expected": {
+    "judge_mode": "contains",
+    "output_contains": ["A=1", "B=2", "C=3"]
+  }
+}

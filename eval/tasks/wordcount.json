@@ -1,0 +1,10 @@
+{
+  "id": "wordcount",
+  "name": "英文段落词数统计",
+  "prompt": "统计以下英文段落的单词数（以空格分隔的词元数，标点附着在词上不单独计数）：\n\nAgent systems combine large language models with tools memory and planning loops. A dispatcher sends each task to a worker that runs the agent kernel. Results return through callbacks and get stored in a task store for review.\n\n最终回复中单独输出一行，格式严格为：WORDS=38 这样的形式（用实际词数替换数字，等号两侧不要有空格）。",
+  "role": "executor",
+  "expected": {
+    "judge_mode": "contains",
+    "output_contains": ["WORDS=38"]
+  }
+}

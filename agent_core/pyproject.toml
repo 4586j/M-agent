@@ -30,3 +30,10 @@ agent-cli = "agent_core.cli:main"
 # 改用显式 package-dir 映射：包 agent_core -> "."，子包 agent_core.tests -> "./tests"。
 package-dir = { "agent_core" = "." }
 packages = [ "agent_core", "agent_core.tests" ]
+
+[tool.pytest.ini_options]
+# 标记真实 SDK 冒烟测试（需 ANTHROPIC_API_KEY），与确定性 mock 套件分离：
+# CI 的 sdk-smoke 作业用 `-m sdk_smoke` 只跑真实 SDK 用例，默认作业不带该标记即跳过。
+markers = [
+    "sdk_smoke: 真实 claude-agent-sdk 冒烟测试（需 API key，与 mock 测试分离；CI 中默认禁用）",
+]

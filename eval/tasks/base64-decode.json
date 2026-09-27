@@ -1,0 +1,10 @@
+{
+  "id": "base64-decode",
+  "name": "Base64 解码（结构化精确答案）",
+  "prompt": "解码下面的 Base64 字符串，得到其中的英文单词：\n\naGVsbG8=\n\n把解码结果填入 RESULT=<结果> 的格式，只回复这一行，等号两边不要有空格，不要任何解释、标点或 markdown 代码块。",
+  "role": "executor",
+  "expected": {
+    "judge_mode": "exact",
+    "output_exact": "RESULT=hello"
+  }
+}

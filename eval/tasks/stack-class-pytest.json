@@ -1,0 +1,10 @@
+{
+  "id": "stack-class-pytest",
+  "name": "栈类实现 + pytest（仓库改动带测试）",
+  "prompt": "在当前目录创建 stack.py，实现一个 Stack 类，支持 push(x)、pop()（空栈弹出抛 IndexError）、peek()（空栈抛 IndexError）、is_empty()、size()；再创建 test_stack.py，用 pytest 覆盖：压入后 size 增加、pop 返回最后压入元素、空栈 pop/peek 抛 IndexError、is_empty 正确。运行 pytest 确认全部通过。两个文件都必须落在当前目录（作为产物）。",
+  "role": "executor",
+  "expected": {
+    "judge_mode": "artifact",
+    "artifact_glob": ["stack.py", "test_stack.py"]
+  }
+}

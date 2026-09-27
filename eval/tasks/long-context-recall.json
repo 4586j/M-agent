@@ -1,0 +1,10 @@
+{
+  "id": "long-context-recall",
+  "name": "长上下文关键信息召回",
+  "prompt": "下面是一段较长的运行日志，请在通读后回答末尾的问题。\n\n[10:00:01] dispatcher started, selecting worker for role=executor\n[10:00:02] worker-A heartbeat ok, latency=12ms\n[10:00:03] kernel building options: model=sonnet, max_turns=32\n[10:00:04] NOTE: the magic token for this session is ZEBRA-7788, keep it for the final report\n[10:00:05] tool_guard cache warmed, entries=17\n[10:00:06] enrich_experience skipped: no similar history\n[10:00:07] run_oneshot begin, cwd=/work/task-abc123\n[10:00:08] plan validated: 3 steps, all dependencies resolved\n[10:00:09] step-1 executed, artifacts=[note.txt]\n[10:00:10] step-2 executed, artifacts=[data.json]\n[10:00:11] product_check verdict=pass\n[10:00:12] journal commit effect, replay_safe=true\n[10:00:13] run_oneshot done, turns=6, cost_usd=0.012\n[10:00:14] record_from_task skipped: use_experience=false\n[10:00:15] dispatcher finalized task, status=done\n\n问题：日志中给出的本次会话 magic token 是什么？把结果填入 TOKEN=<值> 的格式，只回复这一行，等号两边不要有空格，不要任何解释或 markdown。",
+  "role": "executor",
+  "expected": {
+    "judge_mode": "exact",
+    "output_exact": "TOKEN=ZEBRA-7788"
+  }
+}

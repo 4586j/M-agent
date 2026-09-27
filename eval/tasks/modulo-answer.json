@@ -1,0 +1,10 @@
+{
+  "id": "modulo-answer",
+  "name": "取模运算（结构化精确答案）",
+  "prompt": "计算 1000 除以 7 的余数（1000 mod 7）。\n\n把结果填入 MOD=<整数> 的格式，只回复这一行，等号两边不要有空格，不要任何解释或 markdown。",
+  "role": "executor",
+  "expected": {
+    "judge_mode": "exact",
+    "output_exact": "MOD=6"
+  }
+}

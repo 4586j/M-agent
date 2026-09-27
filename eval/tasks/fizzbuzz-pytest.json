@@ -1,0 +1,10 @@
+{
+  "id": "fizzbuzz-pytest",
+  "name": "FizzBuzz 实现 + pytest（仓库改动带测试）",
+  "prompt": "在当前目录创建 fizzbuzz.py，实现 fizzbuzz(n) 返回 1..n 的列表，规则：3 的倍数为 \"Fizz\"，5 的倍数为 \"Buzz\"，同时为 3 和 5 的倍数为 \"FizzBuzz\"，其余为整数本身；再创建 test_fizzbuzz.py，用 pytest 覆盖 fizzbuzz(15) 的关键位置（第 3、5、15 个元素）与长度。运行 pytest 确认全部通过。两个文件都必须落在当前目录（作为产物）。",
+  "role": "executor",
+  "expected": {
+    "judge_mode": "artifact",
+    "artifact_glob": ["fizzbuzz.py", "test_fizzbuzz.py"]
+  }
+}

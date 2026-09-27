@@ -1,0 +1,10 @@
+{
+  "id": "sort-utils-pytest",
+  "name": "纯函数排序模块 + pytest",
+  "prompt": "在当前目录创建纯函数模块 sort_utils.py：实现 bubble_sort(items)（返回升序新列表，不修改入参）。再创建 test_sort_utils.py：用 pytest 编写用例，覆盖正序列表、逆序列表、含重复元素、空列表四种场景。运行 pytest 确认全部通过。两个文件都必须留在当前目录作为产物。",
+  "role": "executor",
+  "expected": {
+    "judge_mode": "artifact",
+    "artifact_glob": ["sort_utils.py", "test_sort_utils.py"]
+  }
+}

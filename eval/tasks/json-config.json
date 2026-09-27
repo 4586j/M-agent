@@ -1,0 +1,10 @@
+{
+  "id": "json-config",
+  "name": "生成可解析的 JSON 配置",
+  "prompt": "在当前目录创建 app_config.json，内容为一个 JSON 对象，必须包含三个键：name（值为 \"orch-eval\"）、version（值为 \"0.1.0\"）、debug（布尔值 false）。创建后用 python -c \"import json; json.load(open('app_config.json'))\" 验证可正常解析。文件必须留在当前目录作为产物。",
+  "role": "executor",
+  "expected": {
+    "judge_mode": "artifact",
+    "artifact_glob": ["app_config.json"]
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "id": "no-shell-write-file",
+  "name": "受限工具：仅写文件不用 shell",
+  "prompt": "约束：本任务禁止使用任何 shell / 命令执行类工具（不要运行 bash、python、终端命令），只允许使用文件写入工具。请在当前目录创建 note.txt，内容为一行：hello。完成后在最终回复的最后一行只输出标记：NO_SHELL_OK",
+  "role": "executor",
+  "expected": {
+    "judge_mode": "contains",
+    "output_contains": ["NO_SHELL_OK"]
+  }
+}

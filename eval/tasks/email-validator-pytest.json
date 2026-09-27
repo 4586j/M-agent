@@ -1,0 +1,10 @@
+{
+  "id": "email-validator-pytest",
+  "name": "邮箱校验器 + pytest 全通过（仓库改动带测试）",
+  "prompt": "在当前目录创建 email_validator.py，实现 is_valid_email(s)：要求恰好一个 @，@ 左侧非空，右侧含至少一个点且点两侧非空，不含空格；再创建 test_email_validator.py，用 pytest 覆盖合法（如 a@b.com）与非法（缺 @、多个 @、@ 后无点、含空格）用例。运行 pytest 确认全部通过后，在最终回复的最后一行只输出标记：VALIDATOR_OK",
+  "role": "executor",
+  "expected": {
+    "judge_mode": "contains",
+    "output_contains": ["VALIDATOR_OK"]
+  }
+}

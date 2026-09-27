@@ -1,0 +1,10 @@
+{
+  "id": "fastapi-hello",
+  "name": "FastAPI Hello World 可导入",
+  "prompt": "在当前目录创建 fastapi_app.py：定义 app = FastAPI()，并添加根路由 GET / 返回 {\"status\": \"ok\"}。然后运行 python -c \"import fastapi_app\" 验证模块可正常导入。全部成功后，在最终回复中单独输出一行标记：FASTAPI_IMPORT_OK",
+  "role": "executor",
+  "expected": {
+    "judge_mode": "contains",
+    "output_contains": ["FASTAPI_IMPORT_OK"]
+  }
+}

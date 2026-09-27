@@ -29,7 +29,11 @@ class Persona:
     name: str
     description: str = ""
     model: str | None = None
-    tools: list[str] | None = None  # None = 全工具
+    # 允许的工具名列表；None = 全工具（放开全部）。
+    # 安全建议（阶段一）：生产/多租户场景按「最小够用」显式列出工具，
+    # 只读角色参考 security-guard.md（Read/Glob/Grep/WebFetch）；
+    # 该列表最终映射为 SDK options.allowed_tools（见 kernel._build_options）。
+    tools: list[str] | None = None
     system_prompt: str = ""
     sub_agents: dict = field(default_factory=dict)  # SDK agents 选项
 
@@ -104,6 +108,18 @@ def load_persona_by_name(name: str, persona_dir: str | Path) -> Persona:
     if not p.is_file():
         raise FileNotFoundError(f"persona 定义不存在：{p}")
     return load_persona(p)
+
+
+def list_persona_names(persona_dir: str | Path) -> list[str]:
+    """列出 persona_dir 下可用人设名（*.md 文件名主干，排序）。
+
+    供 doctor 自检与 resolve_persona 未命中时的兜底提示使用：
+    目录不存在或为空返回空列表，不抛异常。
+    """
+    d = Path(persona_dir)
+    if not d.is_dir():
+        return []
+    return sorted(p.stem for p in d.glob("*.md"))
 
 
 def parse_subagents(agents_dir: str | Path) -> dict:

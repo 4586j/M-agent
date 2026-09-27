@@ -39,6 +39,7 @@ from agent_core.context import load_core_memories_block
 from agent_core.kernel import AgentKernel
 from agent_core.persona import (
     Persona,
+    list_persona_names,
     load_persona_by_name,
     parse_subagents,
     strip_frontmatter,
@@ -48,7 +49,7 @@ from agent_core.planning import (
     build_planning_prompt,
     parse_plan_from_output,
 )
-from agent_core.tools import load_mcp_servers, scan_skills
+from agent_core.tools import load_mcp_servers, scan_skills, valid_memory_name
 
 # ---- 富终端依赖（可选，导入失败即降级为朴素模式） ----
 # 只有 rich 与 prompt_toolkit 都可用时才启用富交互；任一缺失/报错都置 _RICH_OK=False。
@@ -141,15 +142,86 @@ def dim(text: str) -> str:
     return f"\033[2m{text}\033[0m" if _dim_enabled() else text
 
 
-# ---- 会话持久化 ----
+# ---- 会话持久化（多槽目录制） ----
+#
+# 新格式：<项目根>/.agent_sessions/<session_id>.json，每会话一份元数据：
+#   {session_id, persona, created_at, updated_at, first_message,
+#    total_turns, total_cost}
+# 兼容读取旧单文件 <root>/.agent_session（仅含 session_id）：目录无记录时
+# 把旧文件内容合成为一条记录，供 /sessions、/switch、--resume 消费。
+
 
 def _default_session_file() -> Path:
-    """默认会话持久化文件：<项目根>/.agent_session。"""
+    """旧版单会话持久化文件（兼容保留）：<项目根>/.agent_session。"""
     return Path(_discover_project_root()) / ".agent_session"
 
 
+def _sessions_dir(project_root: str | Path | None = None) -> Path:
+    """多槽会话记录目录：<项目根>/.agent_sessions。"""
+    root = project_root or _discover_project_root()
+    return Path(root) / ".agent_sessions"
+
+
+def save_session_record(record: dict, sessions_dir: str | Path | None = None) -> Path:
+    """把单条会话元数据写入 .agent_sessions/<session_id>.json 并返回路径。
+
+    session_id 缺失时忽略（尚未产生 SDK session_id 时没有可续接的意义）。
+    """
+    sid = record.get("session_id")
+    if not sid:
+        raise ValueError("session_id 缺失，无法持久化会话记录")
+    d = Path(sessions_dir) if sessions_dir else _sessions_dir()
+    d.mkdir(parents=True, exist_ok=True)
+    p = d / f"{sid}.json"
+    p.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
+    return p
+
+
+def load_session_records(sessions_dir: str | Path | None = None,
+                         project_root: str | Path | None = None) -> list[dict]:
+    """列出全部会话记录，按 updated_at 降序（最近在前）。
+
+    目录无记录时尝试兼容读取旧 .agent_session，合成为一条最小记录。
+    损坏文件跳过；目录不存在且无旧文件返回空列表。
+    """
+    d = Path(sessions_dir) if sessions_dir else _sessions_dir(project_root)
+    records: list[dict] = []
+    if d.is_dir():
+        for p in d.glob("*.json"):
+            try:
+                rec = json.loads(p.read_text(encoding="utf-8"))
+                if isinstance(rec, dict) and rec.get("session_id"):
+                    records.append(rec)
+            except Exception:  # noqa: BLE001 - 损坏记录跳过不拖垮列表
+                continue
+    if not records:
+        legacy_id = load_session(_default_session_file() if project_root is None
+                                 else Path(project_root) / ".agent_session")
+        if legacy_id:
+            records.append({
+                "session_id": legacy_id,
+                "persona": "(未知)",
+                "created_at": "",
+                "updated_at": "",
+                "first_message": "",
+                "total_turns": 0,
+                "total_cost": 0.0,
+                "legacy": True,
+            })
+    records.sort(key=lambda r: r.get("updated_at") or "", reverse=True)
+    return records
+
+
+def load_last_session_id(project_root: str | Path | None = None) -> str | None:
+    """取最近一次会话的 session_id（--resume 用）：多槽目录优先，旧文件兜底。"""
+    records = load_session_records(project_root=project_root)
+    if records:
+        return records[0].get("session_id")
+    return load_session()
+
+
 def save_session(session_id: str | None, path: str | Path | None = None) -> None:
-    """把 session_id 写入持久化文件；空值忽略。"""
+    """【兼容保留】把 session_id 写入旧版单文件；空值忽略。"""
     if not session_id:
         return
     p = Path(path) if path else _default_session_file()
@@ -157,57 +229,12 @@ def save_session(session_id: str | None, path: str | Path | None = None) -> None
 
 
 def load_session(path: str | Path | None = None) -> str | None:
-    """读取上次持久化的 session_id；不存在/损坏返回 None。"""
+    """读取旧版单文件持久化的 session_id；不存在/损坏返回 None。"""
     try:
         p = Path(path) if path else _default_session_file()
         return json.loads(p.read_text(encoding="utf-8")).get("session_id")
     except Exception:  # noqa: BLE001 - 无历史会话是正常情形
         return None
-
-
-# ---- RAG 检索增强 ----
-
-# 拼接到 prompt 前的经验块限幅（字符）：上下文是稀缺注意力预算，防噪声注入
-_RAG_BLOCK_MAX_CHARS = 3000
-
-
-def _rag_enrich(prompt: str, config: AgentConfig) -> str:
-    """RAG 增强：检索相似历史经验并拼接到 prompt 前。
-
-    仅在 config.rag_enabled 为真时生效；否则原样返回 prompt。延迟导入
-    runtime 的 ExperienceStore（把 runtime 目录加入 sys.path），检索失败或
-    无相似经验时静默回退到原 prompt，不拖垮 REPL。
-    """
-    if not getattr(config, "rag_enabled", False) or not prompt:
-        return prompt
-    try:
-        rt = (Path(config.project_root) / "workspace" / "agent"
-              / "orchestrator" / "runtime")
-        if str(rt) not in sys.path:
-            sys.path.insert(0, str(rt))
-        from experience_store import ExperienceStore
-        try:
-            from dispatch_common import clamp_context
-        except Exception:  # noqa: BLE001 - clamp_context 不可用时降级为直接截断
-            clamp_context = None
-
-        store = ExperienceStore(config.experience_store_dir)
-        similar = store.search(prompt, successful_only=True, limit=3)
-        if not similar:
-            return prompt
-        lines = ["[历史经验参考]"]
-        for i, exp in enumerate(similar, 1):
-            lines.append(f"{i}. 任务: {exp.prompt[:100]}")
-            if exp.output_summary:
-                lines.append(f"   产出: {exp.output_summary[:200]}")
-        block = "\n".join(lines)
-        if clamp_context is not None:
-            block = clamp_context(block, _RAG_BLOCK_MAX_CHARS)
-        elif len(block) > _RAG_BLOCK_MAX_CHARS:
-            block = block[:_RAG_BLOCK_MAX_CHARS] + "\n[经验块已截断]"
-        return f"{block}\n\n{prompt}"
-    except Exception:  # noqa: BLE001 - RAG 失败不影响主流程
-        return prompt
 
 
 # ---- 人设解析 ----
@@ -238,13 +265,17 @@ def resolve_persona(name: str, config: AgentConfig) -> Persona:
 
     - 优先在 persona_dir 下找 <name>.md（executor / security-guard 等）；
     - name == orchestrator 且无定义文件时，回退构造大脑人设（等同 orch_cli）；
-    - 其余未知名给最小人设兜底，避免直接崩溃。
+    - 其余未知名给最小人设兜底，避免直接崩溃，并打印警告列出可用人设名。
     """
     try:
         return load_persona_by_name(name, config.persona_dir)
     except FileNotFoundError:
         if name == "orchestrator":
             return _build_orchestrator_persona(config)
+        available = list_persona_names(config.persona_dir)
+        print(dim(f"[persona] 未找到人设定义 '{name}'（目录：{config.persona_dir}）；"
+                  f"可用人设：{', '.join(available) or '无'}；已回退最小人设。"),
+              file=sys.stderr)
         return Persona(
             name=name,
             description=f"{name}（未找到定义文件，使用最小人设）",
@@ -254,28 +285,40 @@ def resolve_persona(name: str, config: AgentConfig) -> Persona:
 
 # ---- slash 命令清单（补全与 /help 共用） ----
 
-# (命令, 说明)；/exit 与 /quit 等价，补全里都给出
+# (命令, 说明)；/quit 也接受但不在列表里显示（等价 /exit）
 _COMMANDS: list[tuple[str, str]] = [
     ("/help", "查看本帮助"),
     ("/new", "开新会话（清空上下文，重连客户端）"),
+    ("/sessions", "列出历史会话（.agent_sessions/）"),
+    ("/switch <序号>", "切换到指定历史会话（关闭当前、resume 选中）"),
+    ("/session", "显示当前会话元数据"),
     ("/cost", "显示本次累计 turns 与 cost"),
+    ("/usage", "把本会话逐轮用量追加写 .agent_usage/<session_id>.jsonl"),
     ("/tools", "列出人设工具、技能、MCP 服务与记忆工具"),
     ("/plan", "显示当前规划进度（--planning 模式下有意义）"),
-    ("/memory", "查看核心记忆（跨任务持久）"),
+    ("/memory", "查看核心记忆；/memory <名> 查看；/memory set <名> 写入"),
+    ("/retry", "重发上一条失败的消息"),
     ("/interrupt", "中断当前正在执行的一轮"),
-    ("/exit", "退出（等价 /quit）"),
-    ("/quit", "退出"),
+    ("/exit", "退出"),
 ]
 
 _HELP_TEXT = """命令：
   /help        查看本帮助
   /new         开新会话（清空上下文，重连客户端）
+  /sessions    列出历史会话（多槽持久化于 .agent_sessions/）
+  /switch <序号>  切换到指定历史会话（关闭当前、resume 选中）
+  /session     显示当前会话元数据（id/人设/累计用量/首条消息）
   /cost        显示本次累计 turns 与 cost
+  /usage       把本会话逐轮用量 {时间,turns,cost,tokens} 追加写
+               .agent_usage/<session_id>.jsonl
   /tools       列出人设工具、技能、MCP 服务与记忆工具
   /plan        显示当前规划进度（--planning 模式下有意义）
-  /memory      查看核心记忆（跨任务持久）
+  /memory          查看全部核心记忆
+  /memory <名>     按名查看一条核心记忆
+  /memory set <名> 交互式写入一条核心记忆（空行结束）
+  /retry       重发上一条失败的消息
   /interrupt   中断当前正在执行的一轮
-  /exit /quit  退出
+  /exit        退出
 其余输入都作为消息发送给 Agent；长对话由内核自动压缩。"""
 
 
@@ -299,6 +342,20 @@ class CliState:
         self.session_file = Path(session_file) if session_file else root / ".agent_session"
         progress = Path(progress_dir) if progress_dir else root / ".agent_progress"
         self.planning_mgr = PlanningManager(progress) if planning else None
+        # 会话多槽：当前会话元数据（personas/首条消息/创建时间），随会话切换重置
+        self.session_meta: dict = self._new_session_meta()
+        # /retry：缓存最近一次发送的用户消息，fatal 后可重发
+        self.last_prompt: str | None = None
+        # /usage：本会话逐轮用量记录 + 已写盘条数（避免重复追加）
+        self.turn_records: list[dict] = []
+        self.usage_flushed: int = 0
+
+    def _new_session_meta(self) -> dict:
+        return {
+            "persona": self.persona.name if self.persona else "",
+            "first_message": "",
+            "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
 
     @property
     def session_key(self) -> str:
@@ -306,15 +363,72 @@ class CliState:
         sid = self.session.session_id if self.session else None
         return sid or "default"
 
+    def note_first_message(self, text: str) -> None:
+        """记录本会话首条用户消息摘要（会话元数据用，幂等）。"""
+        if self.session_meta.get("first_message") is None or \
+                not self.session_meta.get("first_message"):
+            self.session_meta["first_message"] = " ".join(text.split())[:80]
 
-async def _open_session(state: CliState, resume_id: str | None = None) -> None:
-    """创建并连接一个新的 AgentSession；resume_id 非空时续接历史会话。"""
+    def record_turn(self, info: dict) -> None:
+        """把本轮用量追加进 turn_records（/usage 落盘数据源）。"""
+        usage = info.get("usage") if isinstance(info.get("usage"), dict) else {}
+        self.turn_records.append({
+            "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "turns": info.get("num_turns") or 0,
+            "cost": info.get("cost_usd"),
+            "input_tokens": (usage or {}).get("input_tokens") or 0,
+            "output_tokens": (usage or {}).get("output_tokens") or 0,
+        })
+
+    def save_current_session_record(self) -> Path | None:
+        """把当前会话元数据写入 .agent_sessions/；无 session_id 时静默跳过。"""
+        sid = self.session.session_id if self.session else None
+        if not sid:
+            return None
+        rec = {
+            "session_id": sid,
+            "persona": self.session_meta.get("persona") or self.persona.name,
+            "created_at": self.session_meta.get("created_at", ""),
+            "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "first_message": self.session_meta.get("first_message", ""),
+            "total_turns": getattr(self.session, "total_turns", 0) or 0,
+            "total_cost": round(getattr(self.session, "total_cost", 0.0) or 0.0, 6),
+        }
+        try:
+            return save_session_record(rec, _sessions_dir(self.config.project_root))
+        except Exception:  # noqa: BLE001 - 持久化失败不拖垮会话
+            return None
+
+
+async def _open_session(state: CliState, resume_id: str | None = None,
+                        ui: Any = None) -> None:
+    """创建并连接一个新的 AgentSession；resume_id 非空时续接历史会话。
+
+    resume 失败（SDK 异常，如历史会话文件已损坏/不存在）时降级为开新会话，
+    并通过 ui（可选）明确告知「历史不可恢复」。
+    """
     session = state.kernel.open_session(state.persona, state.cwd)
     if resume_id:
         # AgentSession.connect() 会以 _session_id 作为 resume 目标续接
         session._session_id = resume_id  # noqa: SLF001 - CLI 复用内核续接语义
-    await session.connect()
+    try:
+        await session.connect()
+    except Exception as e:  # noqa: BLE001 - resume 失败降级开新会话
+        if resume_id:
+            fallback = state.kernel.open_session(state.persona, state.cwd)
+            await fallback.connect()
+            state.session = fallback
+            state.session_meta = state._new_session_meta()
+            msg = (f"· 续接会话 {resume_id} 失败（{e}）；已开新会话，"
+                   "历史上下文不可恢复")
+            if ui is not None:
+                ui.info(msg)
+            else:
+                print(dim(msg))
+            return
+        raise
     state.session = session
+    state.session_meta = state._new_session_meta()
 
 
 # ---- 内容截断辅助（富终端工具面板/结果摘要用） ----
@@ -375,6 +489,43 @@ def _fmt_cost(v: Any) -> str:
         return f"${float(v):.4f}"
     except (TypeError, ValueError):
         return "—"
+
+
+def _extract_tokens(usage: Any) -> tuple[int, int]:
+    """从 result 事件的 usage dict 提取 (input_tokens, output_tokens)。"""
+    if not isinstance(usage, dict):
+        return 0, 0
+    try:
+        inp = int(usage.get("input_tokens") or 0)
+    except (TypeError, ValueError):
+        inp = 0
+    try:
+        out = int(usage.get("output_tokens") or 0)
+    except (TypeError, ValueError):
+        out = 0
+    return inp, out
+
+
+def _tokens_text(info: dict) -> str:
+    """渲染本轮 tokens 片段（无 usage 数据时返回空串）。"""
+    inp, out = _extract_tokens(info.get("usage"))
+    if inp or out:
+        return f"  tokens={inp}/{out}"
+    return ""
+
+
+def _budget_warning_text(data: Any) -> str:
+    """渲染预算软预警行。"""
+    if isinstance(data, dict):
+        thr = data.get("threshold")
+        spent = data.get("spent_usd")
+        budget = data.get("budget_usd")
+        try:
+            return (f"⚠ 预算软预警：累计成本 ${float(spent):.4f} 已达预算 "
+                    f"${float(budget):.2f} 的 {int(float(thr) * 100)}%")
+        except (TypeError, ValueError):
+            pass
+    return f"⚠ 预算软预警：{data}"
 
 
 def _format_plan(plan: Any) -> str:
@@ -441,6 +592,9 @@ class PlainUI:
     def interrupted(self) -> None:
         print(dim("\n[已中断本轮]"))
 
+    def budget_warning(self, data: Any) -> None:
+        print(dim(_budget_warning_text(data)))
+
     def turn_end(self) -> None:
         print()  # 收尾换行
 
@@ -493,12 +647,12 @@ class PlainUI:
     def turn_stats(self, info: dict, session: Any) -> None:
         turns = info.get("num_turns") or 0
         cost = session.total_cost if session else 0.0
-        print(dim(f"[turns={turns} 累计cost=${cost:.4f}]"))
+        print(dim(f"[turns={turns} 累计cost=${cost:.4f}{_tokens_text(info)}]"))
 
     def oneshot_stats(self, info: dict, session: Any) -> None:
         turns = info.get("num_turns") or 0
         cost = session.total_cost if session else 0.0
-        print(dim(f"\n[turns={turns} cost=${cost:.4f}]"))
+        print(dim(f"\n[turns={turns} cost=${cost:.4f}{_tokens_text(info)}]"))
 
 
 if _RICH_OK:  # pragma: no cover - 依赖富库是否可用
@@ -632,6 +786,10 @@ class RichUI:
         self._stop_live()
         self.console.print(Text("[已中断本轮]", style="dim"))
 
+    def budget_warning(self, data: Any) -> None:
+        self._stop_live()
+        self.console.print(Text(_budget_warning_text(data), style="yellow"))
+
     def turn_end(self) -> None:
         self._stop_live()
         final = list(self._committed)
@@ -755,11 +913,15 @@ class RichUI:
         total = session.total_cost if session else 0.0
         dur = info.get("duration_ms")
         sid = info.get("session_id")
+        inp, out = _extract_tokens(info.get("usage"))
         t = Text()
         if lead_newline:
             t.append("\n")
         t.append("turns=", style="dim")
         t.append(f"{turns}", style="bold")
+        if inp or out:
+            t.append("  tokens(in/out)=", style="dim")
+            t.append(f"{inp}/{out}", style="bold")
         t.append("  本轮 cost=", style="dim")
         t.append(_fmt_cost(info.get("cost_usd")), style="bold")
         t.append("  累计=", style="dim")
@@ -857,12 +1019,21 @@ async def stream_turn(state: CliState, prompt: str, ui: Any) -> dict:
     session_id / is_error）。规划模式下累积文本用于解析结构化计划并持久化。
     Ctrl+C / 取消：协作式中断当前轮（session.interrupt），停在 turn 边界，
     与原 agent_cli.py 中断语义一致。
+
+    墙钟截止（P0）：此前 send 无 timeout，卡住的后端会让整轮无限等待；现取
+    config.task_timeout 作为单轮上限（非正数视为不限），超时由内核转 error
+    事件收场，headless 退出码据此判失败（见 oneshot_async）。
     """
     text_buf: list[str] = []
     result_info: dict = {}
+    saw_error = False   # 是否出现 error 事件（流内报错）
+    saw_result = False  # 是否收到终结 result 事件（缺失=流异常提前结束）
+    turn_timeout = getattr(state.config, "task_timeout", None)
+    if not (isinstance(turn_timeout, (int, float)) and turn_timeout > 0):
+        turn_timeout = None
     ui.turn_start()
     try:
-        async for ev in state.session.send(prompt):
+        async for ev in state.session.send(prompt, timeout=turn_timeout):
             if ev.type == "text_delta":
                 chunk = ev.data or ""
                 text_buf.append(chunk)
@@ -873,8 +1044,12 @@ async def stream_turn(state: CliState, prompt: str, ui: Any) -> dict:
             elif ev.type == "tool_result":
                 ui.tool_result(ev.data)
             elif ev.type == "result":
+                saw_result = True
                 result_info = ev.data if isinstance(ev.data, dict) else {}
+            elif ev.type == "budget_warning":
+                ui.budget_warning(ev.data)
             elif ev.type == "error":
+                saw_error = True
                 ui.error(ev.data)
     except (KeyboardInterrupt, asyncio.CancelledError):
         ui.interrupted()
@@ -882,6 +1057,9 @@ async def stream_turn(state: CliState, prompt: str, ui: Any) -> dict:
             await state.session.interrupt()
         except Exception:  # noqa: BLE001 - 中断失败不阻断 REPL
             pass
+        result_info = dict(result_info)
+        result_info["_saw_error"] = True   # 中断=未正常完成
+        result_info["_saw_result"] = saw_result
         return result_info
 
     ui.turn_end()
@@ -890,10 +1068,94 @@ async def stream_turn(state: CliState, prompt: str, ui: Any) -> dict:
         plan = parse_plan_from_output("".join(text_buf))
         if plan is not None:
             state.planning_mgr.save_plan(state.session_key, plan)
+    # 真相口径（P0）：把流内 error / 缺失终结 result 的信号透传给调用方，
+    # 供 headless 退出码判定，避免「只出 error 事件、无 result」静默退出 0。
+    result_info = dict(result_info)
+    result_info["_saw_error"] = saw_error
+    result_info["_saw_result"] = saw_result
     return result_info
 
 
 # ---- slash 命令处理（共用，按 UI 分叉显示） ----
+
+async def _send_user_message(state: CliState, text: str, ui: Any) -> None:
+    """发送一条用户消息的完整链路（REPL 主循环与 /retry 共用）。
+
+    规划提示包装保留在 CLI；RAG 经验拼装已在内核侧统一（kernel.rag_enrich），
+    CLI 不再自行拼接。发送前缓存 last_prompt 供 /retry 重发。
+    """
+    state.last_prompt = text
+    state.note_first_message(text)
+    prompt = build_planning_prompt(text) if state.planning else text
+    try:
+        info = await stream_turn(state, prompt, ui)
+    except Exception as e:  # noqa: BLE001 - 单轮异常不拖垮 REPL
+        ui.fatal(e)
+        ui.info("· 可输入 /retry 重发上一条消息")
+        return
+    state.record_turn(info)
+    state.save_current_session_record()
+    ui.turn_stats(info, state.session)
+
+
+def _render_session_records(records: list[dict]) -> str:
+    """渲染 /sessions 列表（朴素文本，共用）。"""
+    if not records:
+        return "（暂无历史会话）"
+    lines = ["历史会话（最近在前，/switch <序号> 切换）："]
+    for i, rec in enumerate(records, 1):
+        sid = str(rec.get("session_id") or "")[:16]
+        persona = rec.get("persona") or "(未知)"
+        updated = rec.get("updated_at") or "—"
+        first = rec.get("first_message") or "—"
+        cost = rec.get("total_cost")
+        cost_s = f"${float(cost):.4f}" if isinstance(cost, (int, float)) else "—"
+        legacy = " [旧格式]" if rec.get("legacy") else ""
+        lines.append(f"  {i}. {sid}  {persona}  {updated}  cost={cost_s}{legacy}")
+        lines.append(f"     首条消息：{first}")
+    return "\n".join(lines)
+
+
+def _usage_file_path(state: CliState) -> Path | None:
+    """本会话用量 JSONL 落盘路径：.agent_usage/<session_id>.jsonl。"""
+    sid = state.session.session_id if state.session else None
+    if not sid:
+        return None
+    root = Path(state.config.project_root or _discover_project_root())
+    return root / ".agent_usage" / f"{sid}.jsonl"
+
+
+def _valid_memory_name(name: str) -> bool:
+    """记忆名校验：委托 tools.valid_memory_name（与 service 共用同一实现，
+    含 Windows 保留设备名黑名单）。"""
+    return valid_memory_name(name)
+
+
+async def _interactive_write_memory(cfg: AgentConfig, name: str,
+                                    input_fn=None) -> str | None:
+    """交互式写入核心记忆 config.memory_core_dir/<name>.md。
+
+    逐行读取直到空行；返回写入路径，取消/无内容返回 None。
+    input_fn 可注入（测试用）；默认阻塞读 stdin，放线程避免卡事件循环。
+    """
+    if input_fn is None:
+        input_fn = input
+    print(dim(f"输入记忆 '{name}' 的内容（逐行输入，空行结束）："))
+    lines: list[str] = []
+    while True:
+        line = await asyncio.to_thread(input_fn)
+        if line is None or line.strip() == "":
+            break
+        lines.append(line)
+    content = "\n".join(lines).strip()
+    if not content:
+        return None
+    d = Path(cfg.memory_core_dir)
+    d.mkdir(parents=True, exist_ok=True)
+    p = d / f"{name}.md"
+    p.write_text(content, encoding="utf-8")
+    return str(p)
+
 
 async def handle_command(state: CliState, text: str, ui: Any) -> None:
     """处理 slash 命令。/exit /quit 置 stop；/new 重连会话。"""
@@ -914,8 +1176,79 @@ async def handle_command(state: CliState, text: str, ui: Any) -> None:
                 await state.session.close()
         except Exception:  # noqa: BLE001 - 关闭失败不阻断新会话
             pass
-        await _open_session(state)
+        await _open_session(state, ui=ui)
         ui.info("· 已开新会话（核心记忆保留，上下文清空）")
+        return
+
+    if cmd == "/sessions":
+        records = load_session_records(
+            sessions_dir=_sessions_dir(cfg.project_root))
+        ui.info(_render_session_records(records))
+        return
+
+    if cmd == "/switch":
+        parts = text.split()
+        records = load_session_records(
+            sessions_dir=_sessions_dir(cfg.project_root))
+        if len(parts) < 2 or not parts[1].isdigit():
+            ui.info("· 用法：/switch <序号>（先 /sessions 查看列表）")
+            return
+        idx = int(parts[1])
+        if not (1 <= idx <= len(records)):
+            ui.info(f"· 序号超出范围（1-{len(records)}）")
+            return
+        target = records[idx - 1]
+        try:
+            if state.session is not None:
+                await state.session.close()
+        except Exception:  # noqa: BLE001
+            pass
+        await _open_session(state, resume_id=target.get("session_id"), ui=ui)
+        # 元数据继承自目标记录；resume 失败降级时 _open_session 已重置
+        if state.session is not None and \
+                state.session.session_id == target.get("session_id"):
+            state.session_meta = {
+                "persona": target.get("persona") or state.persona.name,
+                "first_message": target.get("first_message") or "",
+                "created_at": target.get("created_at")
+                or time.strftime("%Y-%m-%d %H:%M:%S"),
+            }
+        ui.info(f"· 已切换到会话 {target.get('session_id')}"
+                f"（人设：{target.get('persona') or '(未知)'}）")
+        return
+
+    if cmd == "/session":
+        s = state.session
+        sid = s.session_id if s else None
+        meta = state.session_meta
+        lines = ["当前会话：",
+                 f"  session_id：{sid or '（尚未产生）'}",
+                 f"  人设：{meta.get('persona') or state.persona.name}",
+                 f"  工作目录：{state.cwd}",
+                 f"  创建时间：{meta.get('created_at') or '—'}",
+                 f"  首条消息：{meta.get('first_message') or '—'}",
+                 f"  累计 turns：{getattr(s, 'total_turns', 0) if s else 0}",
+                 f"  累计 cost：${getattr(s, 'total_cost', 0.0) or 0.0:.4f}"]
+        if sid:
+            lines.append(f"  记录文件：.agent_sessions/{sid}.json")
+        ui.info("\n".join(lines))
+        return
+
+    if cmd == "/usage":
+        p = _usage_file_path(state)
+        if p is None:
+            ui.info("· 尚未产生 session_id（先发一条消息）")
+            return
+        pending = state.turn_records[state.usage_flushed:]
+        try:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            with p.open("a", encoding="utf-8") as f:
+                for rec in pending:
+                    f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            state.usage_flushed = len(state.turn_records)
+            ui.info(f"· 已追加写入 {len(pending)} 条用量记录 → {p}")
+        except Exception as e:  # noqa: BLE001 - 写盘失败只提示不崩溃
+            ui.info(f"· 写入失败：{e}")
         return
 
     if cmd == "/cost":
@@ -939,7 +1272,48 @@ async def handle_command(state: CliState, text: str, ui: Any) -> None:
         return
 
     if cmd == "/memory":
-        ui.memory(load_core_memories_block(cfg.memory_core_dir))
+        parts = text.split()
+        if len(parts) == 1:
+            ui.memory(load_core_memories_block(cfg.memory_core_dir))
+            return
+        if parts[1] == "set":
+            if len(parts) < 3:
+                ui.info("· 用法：/memory set <名称>（随后逐行输入内容，空行结束）")
+                return
+            name = parts[2]
+            if not _valid_memory_name(name):
+                ui.info("· 记忆名只能含字母/数字/下划线/连字符，不含路径分隔符，且不得为 Windows 保留设备名（con/nul 等）")
+                return
+            path = await _interactive_write_memory(cfg, name)
+            if path:
+                ui.info(f"· 已写入核心记忆 '{name}' → {path}")
+            else:
+                ui.info("· 未输入任何内容，取消写入")
+            return
+        name = parts[1]
+        if not _valid_memory_name(name):
+            ui.info("· 记忆名只能含字母/数字/下划线/连字符，不含路径分隔符，且不得为 Windows 保留设备名（con/nul 等）")
+            return
+        p = Path(cfg.memory_core_dir) / f"{name}.md"
+        if p.is_file():
+            try:
+                ui.memory(p.read_text(encoding="utf-8"))
+            except Exception as e:  # noqa: BLE001
+                ui.info(f"· 读取失败：{e}")
+        else:
+            available = sorted(
+                q.stem for q in Path(cfg.memory_core_dir).glob("*.md")
+            ) if Path(cfg.memory_core_dir).is_dir() else []
+            ui.info(f"· 无此记忆 '{name}'（{p}）；"
+                    f"可用：{', '.join(available) or '无'}")
+        return
+
+    if cmd == "/retry":
+        if not state.last_prompt:
+            ui.info("· 没有可重发的消息（/retry 用于重发上一条失败消息）")
+            return
+        ui.info(f"· 重发上一条消息：{state.last_prompt[:50]}")
+        await _send_user_message(state, state.last_prompt, ui)
         return
 
     if cmd == "/interrupt":
@@ -961,8 +1335,8 @@ async def repl_async(state: CliState, resume: bool, ui: Any) -> None:
 
     富交互时用 prompt_toolkit 读取（多行/历史/补全），否则回退到内置 input()。
     """
-    resume_id = load_session(state.session_file) if resume else None
-    await _open_session(state, resume_id=resume_id)
+    resume_id = load_last_session_id(state.config.project_root) if resume else None
+    await _open_session(state, resume_id=resume_id, ui=ui)
     if resume:
         ui.info(f"· 继续会话 {resume_id}" if resume_id
                 else "· 没有可恢复的历史会话，从头开始")
@@ -992,19 +1366,10 @@ async def repl_async(state: CliState, resume: bool, ui: Any) -> None:
             await handle_command(state, text, ui)
             continue
 
-        prompt = build_planning_prompt(text) if state.planning else text
-        prompt = _rag_enrich(prompt, state.config)
-        try:
-            info = await stream_turn(state, prompt, ui)
-        except Exception as e:  # noqa: BLE001 - 单轮异常不拖垮 REPL
-            ui.fatal(e)
-            continue
+        await _send_user_message(state, text, ui)
 
-        save_session(state.session.session_id if state.session else None,
-                     state.session_file)
-        ui.turn_stats(info, state.session)
-
-    # 退出前关闭会话
+    # 退出前持久化会话记录并关闭会话
+    state.save_current_session_record()
     try:
         if state.session is not None:
             await state.session.close()
@@ -1018,16 +1383,23 @@ async def oneshot_async(state: CliState, prompt: str, resume: bool,
 
     ui 恒为 PlainUI（纯文本），便于 CI 与脚本管道消费。
     """
-    resume_id = load_session(state.session_file) if resume else None
-    await _open_session(state, resume_id=resume_id)
+    resume_id = load_last_session_id(state.config.project_root) if resume else None
+    await _open_session(state, resume_id=resume_id, ui=ui)
     full_prompt = build_planning_prompt(prompt) if state.planning else prompt
-    full_prompt = _rag_enrich(full_prompt, state.config)
     exit_code = 0
     try:
         info = await stream_turn(state, full_prompt, ui)
+        state.note_first_message(prompt)
+        state.record_turn(info)
+        state.save_current_session_record()
+        # 旧版单文件同步写一份，保持 --resume 对旧工具链的兼容
         save_session(state.session.session_id if state.session else None,
                      state.session_file)
         if info.get("is_error"):
+            exit_code = 1
+        # 真相口径（P0）：流内出现 error 事件、或整轮未收到终结 result
+        # 事件（SDK 子进程崩溃/被杀/协议中断），均视为失败，不得退出 0。
+        if info.get("_saw_error") or not info.get("_saw_result"):
             exit_code = 1
         ui.oneshot_stats(info, state.session)
     finally:
@@ -1072,16 +1444,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         help="单任务最大轮次（默认 AGENT_MAX_TURNS 或 50）")
     parser.add_argument("--permission-mode",
                         default=os.environ.get("AGENT_PERMISSION_MODE",
-                                               "bypassPermissions"),
-                        help="权限姿态（默认 bypassPermissions）")
+                                               "default"),
+                        help="权限姿态（默认 default；bypassPermissions 须显式指定）")
     parser.add_argument("--planning", action="store_true",
-                        default=_env_bool("AGENT_PLANNING"),
-                        help="启用规划模式（先产出结构化计划再执行）")
+                        default=_env_bool("AGENT_PLANNING_ENABLED"),
+                        help="启用规划模式（先产出结构化计划再执行；"
+                             "默认读 AGENT_PLANNING_ENABLED）")
     parser.add_argument("--resume", action="store_true",
                         help="续接上一次会话")
     parser.add_argument("--rag", action="store_true",
                         default=_env_bool("AGENT_RAG_ENABLED"),
                         help="启用 RAG 检索增强")
+    parser.add_argument("--doctor", action="store_true",
+                        help="运行环境自检（SDK/鉴权/MCP/人设/.env）后退出")
     return parser
 
 
@@ -1110,6 +1485,13 @@ def main(argv: list[str] | None = None) -> int:
     kernel = AgentKernel(config)
     cwd = config.project_root or project_root
     state = CliState(kernel, persona, config, cwd, planning=args.planning)
+
+    # doctor 自检：装配 config 后、进入 REPL/单发前执行，打印报告即退出
+    if args.doctor:
+        from agent_core.doctor import run_checks, format_report
+        checks = run_checks(config, default_persona=args.persona)
+        print(format_report(checks))
+        return 1 if any(c.status == "fail" for c in checks) else 0
 
     try:
         if args.prompt:

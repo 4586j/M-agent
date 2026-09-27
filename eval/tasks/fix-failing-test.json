@@ -1,0 +1,10 @@
+{
+  "id": "fix-failing-test",
+  "name": "修复失败的测试（恢复能力）",
+  "prompt": "下面是一个有缺陷的函数，请先在当前目录创建 calc.py 写入它，再创建 test_calc.py 用 pytest 断言 add(2, 3) == 5、add(-1, 1) == 0。此时测试会失败。请定位并修复 calc.py 中的缺陷，使 pytest 全部通过。两个文件最终都必须落在当前目录（作为产物），且修复后测试为真通过（不得修改断言来迁就错误实现）。\n\n有缺陷的实现：\n\ndef add(a, b):\n    return a - b",
+  "role": "executor",
+  "expected": {
+    "judge_mode": "artifact",
+    "artifact_glob": ["calc.py", "test_calc.py"]
+  }
+}

@@ -7,16 +7,20 @@
 进程内驱动 ``agent_core.kernel.AgentKernel``，不依赖 brain，是单机自足的执行入口。
 
 启动：python -m agent_core.mcp_agent_server   （stdio 传输）
-工具面刻意收敛（5 个），避免工具过多烧 token：
+工具面刻意收敛（8 个），避免工具过多烧 token：
   agent_run              单发执行，返回结果 dict
   agent_session_create   创建多轮会话，返回 {session_id}
   agent_session_send     向会话发一轮消息
+  agent_session_close    关闭会话并释放底层子进程（防泄漏）
+  agent_memory_list      列出核心记忆名（只读）
+  agent_memory_read      读取一条核心记忆（只读）
   agent_tools_list       列出可用工具/技能/MCP
   agent_status           内核状态（活跃会话数、累计用量）
 
 设计约束：SDK 延迟导入（内核内部按需 import）；mcp 为硬依赖（项目已装 1.28.1）。
 """
 import asyncio
+import logging
 import uuid
 from dataclasses import asdict
 from pathlib import Path
@@ -26,8 +30,16 @@ from mcp.server.fastmcp import FastMCP
 
 from agent_core.config import AgentConfig, load_agent_config
 from agent_core.kernel import AgentKernel
-from agent_core.persona import Persona, load_persona_by_name, parse_subagents, strip_frontmatter
+from agent_core.persona import (
+    Persona,
+    list_persona_names,
+    load_persona_by_name,
+    parse_subagents,
+    strip_frontmatter,
+)
 from agent_core.tools import load_mcp_servers, scan_skills
+
+logger = logging.getLogger("agent.mcp")
 
 mcp = FastMCP(
     "agent",
@@ -77,16 +89,23 @@ def _build_orchestrator_persona(config: AgentConfig) -> Persona:
 
 def resolve_persona(name: str) -> Persona:
     """按名称解析并缓存人设；orchestrator 无定义文件回退大脑人设，
-    其余未知名给最小人设兜底。"""
+    其余未知名给最小人设兜底并告警提示可用人设名。"""
     if name in _PERSONAS:
         return _PERSONAS[name]
     config = get_config()
     try:
         persona = load_persona_by_name(name, config.persona_dir)
     except FileNotFoundError:
+        available = list_persona_names(config.persona_dir)
         if name == "orchestrator":
+            logger.warning("persona '%s' 无定义文件，已回退内置大脑人设；可用人设：%s",
+                           name, ", ".join(available) or "（无）")
             persona = _build_orchestrator_persona(config)
         else:
+            logger.warning(
+                "persona '%s' 无定义文件，已使用最小人设兜底；可用人设：%s"
+                "（目录：%s）", name, ", ".join(available) or "（无）",
+                config.persona_dir)
             persona = Persona(name=name,
                               description=f"{name}（未找到定义文件，使用最小人设）",
                               system_prompt=f"你是 {name}。请按用户指令完成任务。")
@@ -170,6 +189,50 @@ async def agent_session_send(session_id: str, prompt: str) -> dict:
     if entry is None:
         return {"status": "error", "detail": f"session not found: {session_id}"}
     return await _run_session_turn(entry["session"], prompt)
+
+
+@mcp.tool()
+async def agent_session_close(session_id: str) -> dict:
+    """关闭一个多轮会话并释放底层 SDK 子进程（会话结束后务必调用，防泄漏）。"""
+    entry = _SESSIONS.pop(session_id, None)
+    if entry is None:
+        return {"status": "error", "detail": f"session not found: {session_id}"}
+    try:
+        await entry["session"].close()
+    except Exception as e:  # noqa: BLE001 - 关闭失败也视为已移除，不让工具抛异常
+        return {"status": "closed_with_warning", "session_id": session_id,
+                "detail": f"底层连接关闭异常（会话已移除）：{e}"}
+    return {"status": "closed", "session_id": session_id}
+
+
+@mcp.tool()
+def agent_memory_list() -> dict:
+    """列出核心记忆名（只读，来自 config.memory_core_dir 下的 *.md）。"""
+    config = get_config()
+    d = Path(config.memory_core_dir)
+    names: list[str] = []
+    if d.is_dir():
+        names = sorted(p.stem for p in d.glob("*.md"))
+    return {"memories": names, "count": len(names),
+            "backend": config.memory_backend, "dir": str(d)}
+
+
+@mcp.tool()
+async def agent_memory_read(name: str) -> dict:
+    """按名读取一条核心记忆的正文（只读）；不存在返回 status=not_found。"""
+    from agent_core.tools import _make_local_backend, _make_remote_backend
+    config = get_config()
+    backend = (_make_remote_backend(config) if config.memory_backend == "remote"
+               else _make_local_backend(config))
+    try:
+        data = await backend["read_core_memory"](name)
+    except Exception as e:  # noqa: BLE001 - 后端异常收敛为错误 dict
+        return {"status": "error", "detail": f"读取记忆失败：{e}"}
+    content = data.get("content") if isinstance(data, dict) else None
+    if not content:
+        return {"status": "not_found", "name": name,
+                "detail": f"记忆 '{name}' 不存在或为空；可用 agent_memory_list 查看全部记忆名"}
+    return {"status": "ok", "name": name, "content": content}
 
 
 @mcp.tool()

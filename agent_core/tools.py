@@ -6,8 +6,32 @@ scan_skills / load_mcp_servers 从 worker/agent_runner.py 原样迁移（逻辑�
 mcp_server.py 对齐，便于两种接入方式（HTTP MCP / 进程内 SDK）行为一致。
 """
 import json
+import logging
+import re
 import sys
 from pathlib import Path
+
+log = logging.getLogger(__name__)
+
+
+# ---- 共享记忆名校验（service / cli 共用，避免两处各写一套漂移） ----
+
+# Windows 保留设备名：作为文件名会被设备吞（如 PUT core/NUL 实际写到
+# NUL 设备而非磁盘文件），一律拒绝（大小写不敏感）
+_WINDOWS_RESERVED_NAMES = {
+    "con", "prn", "aux", "nul",
+    *(f"com{i}" for i in range(1, 10)),
+    *(f"lpt{i}" for i in range(1, 10)),
+}
+_MEMORY_NAME_RE = re.compile(r"[\w\-\u4e00-\u9fff]+")
+
+
+def valid_memory_name(name: str) -> bool:
+    """记忆名校验：仅字母/数字/下划线/连字符/中文，防路径穿越；
+    并拒绝 Windows 保留设备名（con/prn/aux/nul/com1-9/lpt1-9）。"""
+    if not name or _MEMORY_NAME_RE.fullmatch(name) is None:
+        return False
+    return name.lower() not in _WINDOWS_RESERVED_NAMES
 
 # SDK @tool 装饰器：可用则构造真正的 SdkMcpTool；导入失败降级为 dict 定义
 # （fallback，见 build_memory_tools 尾部说明）。
@@ -15,6 +39,11 @@ try:  # pragma: no cover - 取决于运行环境是否装了 claude-agent-sdk
     from claude_agent_sdk import tool as sdk_tool
 except Exception:  # pragma: no cover
     sdk_tool = None
+
+# embedding 模型进程内缓存：模型加载成本高（秒级/数百 MB），而 _make_local_backend
+# 在每个任务的 _build_options 都会执行，按模型名缓存实例（含失败结果 None，
+# 避免每个任务反复重试拖慢启动）。
+_EMBEDDING_MODEL_CACHE: dict[str, object | None] = {}
 
 
 def scan_skills(project_root: str) -> list[dict]:
@@ -49,34 +78,46 @@ def scan_skills(project_root: str) -> list[dict]:
     return skills
 
 
-def load_mcp_servers(path: str) -> dict | None:
+def load_mcp_servers(path: str, *, return_warnings: bool = False):
     """加载 MCP 服务器配置（ORCH_MCP_CONFIG 指向的 JSON）。
 
     格式与 .mcp.json 一致：{"mcpServers": {"<名称>": {"command": ..., "args": [...],
     "env": {...}}} 或 {"url": ..., "headers": {...}}}。返回
     {名称: 配置dict}（即 SDK mcp_servers 形状）；文件缺失/为空/格式错返回 None，
     不让 MCP 配置问题拖垮任务执行。
+
+    return_warnings=True（doctor 自检用）：返回 ``(servers, warnings)`` 二元组，
+    warnings 逐条说明被过滤/损坏的条目；默认 False 保持原有返回值形状不变。
     """
+    warnings: list[str] = []
     if not path:
-        return None
+        return (None, warnings) if return_warnings else None
     p = Path(path)
     if not p.is_file():
-        return None
+        warnings.append(f"MCP 配置文件不存在：{path}")
+        return (None, warnings) if return_warnings else None
     try:
         data = json.loads(p.read_text(encoding="utf-8"))
         servers = data.get("mcpServers") or {}
         if not isinstance(servers, dict) or not servers:
-            return None
+            warnings.append("MCP 配置缺少有效的 mcpServers 映射（为空或类型错误）")
+            return (None, warnings) if return_warnings else None
         cleaned = {}
         for name, cfg in servers.items():
             if not isinstance(cfg, dict):
+                warnings.append(f"MCP 条目 '{name}' 不是对象（dict），已跳过")
                 continue
             if not (cfg.get("command") or cfg.get("url")):
-                continue  # 缺 command/url 的条目跳过
+                warnings.append(f"MCP 条目 '{name}' 缺少 command/url 字段，已跳过")
+                continue
             cleaned[name] = cfg
-        return cleaned or None
-    except Exception:
-        return None
+        result = cleaned or None
+        if not cleaned:
+            warnings.append("MCP 配置中没有可用条目（全部被过滤）")
+        return (result, warnings) if return_warnings else result
+    except Exception as e:
+        warnings.append(f"MCP 配置 JSON 解析失败：{e}")
+        return (None, warnings) if return_warnings else None
 
 
 # ---- 记忆后端：local 直连本地 store，remote 经 brain HTTP API ----
@@ -85,6 +126,36 @@ def _runtime_dir(config) -> Path:
     """定位大脑 runtime 目录（memory_store / experience_store 所在），供本地后端 import。"""
     return (Path(config.project_root) / "workspace" / "agent"
             / "orchestrator" / "runtime")
+
+
+def _load_embedding_model(config):
+    """按 config 解析 ExperienceStore 的 embedding 模型（阶段四记忆修复）。
+
+    - config.embedding_model 为空：沿用 runtime embedding_model.
+      create_embedding_model() 的默认逻辑（ORCH_EMBEDDING_MODEL，缺省
+      all-MiniLM-L6-v2）；
+    - "none"/"off"：显式禁用语义检索（纯关键词）；
+    - 其他值：作为模型名直接构造。
+    任何加载失败（依赖缺失/模型下载失败）都降级返回 None，关键词检索照常可用。
+    须在 runtime 目录已加入 sys.path 后调用（import 依赖 runtime 模块）。
+    """
+    name = (getattr(config, "embedding_model", "") or "").strip()
+    key = name.lower()
+    if key in _EMBEDDING_MODEL_CACHE:
+        return _EMBEDDING_MODEL_CACHE[key]
+    model: object | None = None
+    if key not in ("none", "off"):
+        try:
+            from embedding_model import (SentenceTransformerModel,
+                                         create_embedding_model)
+            model = (SentenceTransformerModel(name) if name
+                     else create_embedding_model())
+        except Exception:
+            log.warning("embedding 模型加载失败，经验检索降级为纯关键词",
+                        exc_info=True)
+            model = None
+    _EMBEDDING_MODEL_CACHE[key] = model
+    return model
 
 
 def _make_local_backend(config):
@@ -100,7 +171,10 @@ def _make_local_backend(config):
     from experience_store import ExperienceStore  # noqa: E402
 
     mem = FileMemoryStore(config.memory_core_dir, config.memory_context_dir)
-    exp = ExperienceStore(config.experience_store_dir)
+    # 阶段四记忆修复：注入 embedding 模型启用语义检索（与 brain 侧 brain_api
+    # 构造 ExperienceStore 的方式对齐）；加载失败降级为纯关键词，行为不变
+    exp = ExperienceStore(config.experience_store_dir,
+                          embedding_model=_load_embedding_model(config))
 
     async def search_experiences(query, role=None, successful_only=True, limit=5):
         recs = exp.search(query, role=role, successful_only=successful_only,
@@ -110,14 +184,22 @@ def _make_local_backend(config):
                 for r in recs]
 
     async def read_core_memory(name):
+        if not valid_memory_name(name):
+            raise ValueError(f"非法记忆名：{name!r}")
         content = mem.read_core(name)
         return {"name": name, "content": content}
 
     async def write_core_memory(name, content):
+        if not valid_memory_name(name):
+            raise ValueError(f"非法记忆名：{name!r}")
         mem.write_core(name, content)
         return {"status": "written", "name": name}
 
     async def write_task_context(task_id, key, content):
+        if not valid_memory_name(task_id):
+            raise ValueError(f"非法任务 ID：{task_id!r}")
+        if not valid_memory_name(key):
+            raise ValueError(f"非法上下文键：{key!r}")
         mem.write_context(task_id, key, content)
         return {"status": "written", "task_id": task_id, "key": key}
 
@@ -200,7 +282,8 @@ _TOOL_SPECS = [
     {
         "name": "write_core_memory",
         "description": "写核心记忆（持久、跨任务共识写入的高价值内容）。"
-                       "临时过程信息请用 write_task_context，不要写进核心记忆。",
+                       "临时过程信息请用 write_task_context，不要写进核心记忆。"
+                       "写入成功后向用户复述记忆名与内容，确认已保存。",
         "schema": {"name": str, "content": str},
         "call": lambda be, a: be["write_core_memory"](
             a.get("name", ""), a.get("content", "")),

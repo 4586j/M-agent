@@ -1,0 +1,10 @@
+{
+  "id": "csv-filter-rows",
+  "name": "CSV 条件过滤并落文件（文件转换）",
+  "prompt": "下面是一段 CSV 文本（表头为逗号分隔首行）：\n\ncity,score\nBeijing,90\nShanghai,98\nShenzhen,72\nHangzhou,45\n\n请过滤出 score 大于等于 80 的行，保留表头，按原顺序写入当前目录的 high.csv。写入后可用 python 读取校验行数（应为表头 + 2 行数据）。文件必须落在当前目录（作为产物）。",
+  "role": "executor",
+  "expected": {
+    "judge_mode": "artifact",
+    "artifact_glob": ["high.csv"]
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "id": "date-diff",
+  "name": "日期天数差（结构化精确答案）",
+  "prompt": "计算从 2026-03-01 到 2026-03-31 之间相隔多少天（即两个日期之差，31 减 1）。\n\n把结果填入 DAYS=<整数> 的格式，只回复这一行，等号两边不要有空格，不要任何解释或 markdown。",
+  "role": "executor",
+  "expected": {
+    "judge_mode": "exact",
+    "output_exact": "DAYS=30"
+  }
+}

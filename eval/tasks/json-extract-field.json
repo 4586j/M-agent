@@ -1,0 +1,10 @@
+{
+  "id": "json-extract-field",
+  "name": "JSON 嵌套字段提取（结构化精确答案）",
+  "prompt": "下面是一段 JSON 配置：\n\n{\"server\": {\"host\": \"localhost\", \"port\": 8080}, \"debug\": false, \"tags\": [\"a\", \"b\"]}\n\n请提取 server.port 的值，填入 PORT=<值> 的格式，只回复这一行，等号两边不要有空格，不要任何解释或 markdown。",
+  "role": "executor",
+  "expected": {
+    "judge_mode": "exact",
+    "output_exact": "PORT=8080"
+  }
+}

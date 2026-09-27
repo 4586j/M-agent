@@ -1,0 +1,10 @@
+{
+  "id": "list-unique-count",
+  "name": "列表去重计数（结构化答案）",
+  "prompt": "下面是一组整数：\n\n3, 1, 3, 2, 1, 5, 2, 3\n\n统计其中不同（去重后）整数的个数。\n\n把结果填入 UNIQUE=<整数> 的格式，只回复这一行，等号两边不要有空格，不要任何解释或 markdown。",
+  "role": "executor",
+  "expected": {
+    "judge_mode": "contains",
+    "output_contains": ["UNIQUE=4"]
+  }
+}

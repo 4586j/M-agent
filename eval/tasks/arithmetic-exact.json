@@ -1,0 +1,10 @@
+{
+  "id": "arithmetic-exact",
+  "name": "精确输出算术结果",
+  "prompt": "计算 128 乘以 47 的结果。最终回复必须只包含一行：RESULT=6016 这样的形式（用实际计算结果替换数字，等号两侧不要有空格）。除这一行外不要输出任何其他内容，不要使用代码块或 markdown 格式。",
+  "role": "executor",
+  "expected": {
+    "judge_mode": "exact",
+    "output_exact": "RESULT=6016"
+  }
+}

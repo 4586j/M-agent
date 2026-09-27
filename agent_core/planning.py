@@ -31,6 +31,9 @@ class Plan:
     steps: list[PlanStep] = field(default_factory=list)
     risks: list[str] = field(default_factory=list)
     created_at: str = ""
+    # 产生本计划的原始任务 prompt：断点续跑按 prompt 匹配未完成计划（旧进度
+    # 文件缺该字段时 from_dict 兜底为空串，匹配自然失败，不影响旧数据）
+    source_prompt: str = ""
 
     def to_dict(self) -> dict:
         """序列化为可 JSON 化的 dict。"""
@@ -48,6 +51,7 @@ class Plan:
             ],
             "risks": list(self.risks),
             "created_at": self.created_at,
+            "source_prompt": self.source_prompt,
         }
 
     @classmethod
@@ -81,6 +85,7 @@ class Plan:
             steps=steps,
             risks=risks,
             created_at=str(d.get("created_at", "")),
+            source_prompt=str(d.get("source_prompt", "")),
         )
 
     def next_pending_step(self) -> PlanStep | None:
@@ -93,11 +98,51 @@ class Plan:
                 return s
         return None
 
+    def next_pending_steps(self) -> list[PlanStep]:
+        """返回所有可并行执行的 pending 步骤（依赖均已 done）。
+
+        用于 plan_parallel_steps=True 时批量取步骤；返回的列表按原始
+        顺序排列（id 升序），调用方需自行检查步骤间是否有相互依赖
+        （并行步骤之间不应有依赖关系）。
+        """
+        done_ids = {s.id for s in self.steps if s.status == "done"}
+        return [
+            s for s in self.steps
+            if s.status == "pending"
+            and all(dep in done_ids for dep in s.depends_on)
+        ]
+
     def is_complete(self) -> bool:
         """所有步骤都非 pending/in_progress 即视为完成（含 failed 收尾）。"""
         if not self.steps:
             return False
         return all(s.status in ("done", "failed") for s in self.steps)
+
+    def all_done(self) -> bool:
+        """所有步骤均为 done（无 failed/pending/in_progress）才算真正完成。
+
+        与 is_complete() 区分：is_complete 表示「执行循环已停」（步骤都落终态，
+        含 failed 收尾）；all_done 表示「每个必需步骤都成功完成」。收尾判定任务
+        成功与否必须用 all_done——绝不把含 failed 步骤的计划谎报为成功。
+        """
+        if not self.steps:
+            return False
+        return all(s.status == "done" for s in self.steps)
+
+    def max_step_id(self) -> int:
+        """当前步骤 id 最大值（无步骤返回 0）：重规划接续分配新 id 用。"""
+        return max((s.id for s in self.steps), default=0)
+
+    def done_summaries(self, max_chars: int = 200) -> list[str]:
+        """已完成步骤的产出摘要列表（供后续步骤 prompt 注入上下文）。"""
+        lines = []
+        for s in self.steps:
+            if s.status != "done":
+                continue
+            out = (s.output or "").strip()
+            lines.append(f"步骤 {s.id}（{s.action}）：{out[:max_chars]}"
+                         + ("…" if len(out) > max_chars else ""))
+        return lines
 
 
 PLANNING_PROMPT_PREFIX = """在开始执行之前，请先分析任务并产出一个结构化执行计划。
@@ -122,6 +167,24 @@ REFLECTION_PROMPT = """请评估上述任务产出的质量：
 
 以 JSON 格式输出：{"complete": bool, "quality": "high|medium|low", "issues": [...], "suggestions": [...]}
 """
+
+
+# 计划 created_at 的时间格式（save_plan 用 time.strftime 写入的本地时间）
+_PLAN_TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
+
+
+def _plan_age_hours(created_at: str) -> float | None:
+    """按 created_at 计算计划年龄（小时）；缺失或格式非法返回 None。
+
+    返回 None 时调用方按「无法判定年龄」处理（断点续跑场景视同超龄，保守不续）。
+    """
+    if not created_at:
+        return None
+    try:
+        ts = time.mktime(time.strptime(created_at, _PLAN_TIME_FORMAT))
+    except (ValueError, OverflowError, OSError):
+        return None
+    return max(0.0, (time.time() - ts) / 3600.0)
 
 
 class PlanningManager:
@@ -160,6 +223,40 @@ class PlanningManager:
             return Plan.from_dict(data)
         except Exception:  # noqa: BLE001 - 损坏的进度文件不拖垮执行
             return None
+
+    def find_resumable(self, prompt: str, max_age_hours: float | None = None
+                       ) -> tuple[str, Plan] | None:
+        """断点续跑：按原始 prompt 匹配未完成计划，返回 (session_id, plan)。
+
+        扫描进度目录下全部计划，条件：source_prompt 与 prompt 一致且存在
+        pending/in_progress 步骤（未完成）。命中多个时取 created_at 最新的。
+
+        max_age_hours（可选）：计划年龄上限（小时，按 created_at 计算）——
+        超龄不续跑（返回 None，让调用方开新计划），避免定时任务/评测用同
+        prompt 错配陈旧计划；created_at 缺失或无法解析时同样视同超龄。
+        None 或 <=0 表示不限年龄（保持旧行为）。
+        """
+        if not prompt or not self.progress_dir.is_dir():
+            return None
+        best: tuple[str, Plan] | None = None
+        for path in self.progress_dir.glob("*.json"):
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+                plan = Plan.from_dict(data)
+            except Exception:  # noqa: BLE001 - 损坏文件跳过
+                continue
+            if plan.source_prompt != prompt:
+                continue
+            if all(s.status in ("done", "failed") for s in plan.steps):
+                continue
+            if max_age_hours is not None and max_age_hours > 0:
+                age = _plan_age_hours(plan.created_at)
+                if age is None or age > max_age_hours:
+                    continue
+            sid = path.stem
+            if best is None or plan.created_at > best[1].created_at:
+                best = (sid, plan)
+        return best
 
     def update_step(self, session_id: str, step_id: int, status: str,
                     output: str = "") -> None:
@@ -201,6 +298,39 @@ def build_planning_prompt(original_prompt: str) -> str:
     return f"{PLANNING_PROMPT_PREFIX}\n{original_prompt}"
 
 
+STEP_PROMPT_PREFIX = """当前任务采用 Plan-Execute 模式推进：整体计划已拆分为多个步骤，
+本次只需要完成下面这一个步骤，不要越权执行其它步骤。
+"""
+
+
+def build_step_prompt(original_prompt: str, plan: Plan, step: PlanStep,
+                      failure_hint: str = "", context_memory: str = "") -> str:
+    """构造单步骤执行提示：任务原文 + 当前步骤 + 已完成步骤摘要 + 失败教训。
+
+    - original_prompt：用户的原始任务 prompt（保持目标完整可见）；
+    - context_memory：调用方传入的上下文记忆，与规划轮同源注入——保证首跑
+      与断点续跑（跳过规划轮）的步骤轮输入一致；空串不注入，行为不变；
+    - 已完成步骤摘要：来自 plan.done_summaries()（依赖产物提示）；
+    - failure_hint：上一次该步骤失败的原因/输出（重试时注入，避免重蹈覆辙）。
+    """
+    lines = [STEP_PROMPT_PREFIX]
+    if context_memory:
+        lines.append(f"\n[上下文记忆]\n{context_memory}")
+    lines.append(f"\n[任务]\n{original_prompt}")
+    lines.append("")
+    lines.append(f"[当前步骤 {step.id}]\n{step.action}")
+    if step.depends_on:
+        lines.append(f"（依赖步骤：{step.depends_on}，其产出见下方已完成步骤摘要）")
+    summaries = plan.done_summaries()
+    if summaries:
+        lines.append("\n[已完成步骤摘要（供参考的依赖产物）]")
+        lines.extend(f"- {s}" for s in summaries)
+    if failure_hint:
+        lines.append("\n[上次执行该步骤失败，教训如下，请调整方案避免同样的问题]")
+        lines.append(failure_hint[:1000])
+    return "\n".join(lines)
+
+
 def parse_plan_from_output(output: str) -> Plan | None:
     """从 agent 输出中解析结构化计划 JSON。
 
@@ -236,3 +366,17 @@ def parse_plan_from_output(output: str) -> Plan | None:
 def build_reflection_prompt(task_output: str) -> str:
     """构造反思提示，让 agent 评估自身产出质量。"""
     return f"{task_output}\n\n{REFLECTION_PROMPT}"
+
+
+FAILURE_REFLECTION_PROMPT = """上述任务执行失败了。请作为事后复盘分析：
+1. 失败的根本原因是什么？
+2. 哪些做法或假设导致了失败？
+3. 下次重试该任务时，给出具体的改进建议（避免重蹈覆辙）。
+
+以简洁的要点输出，不超过 200 字。
+"""
+
+
+def build_failure_reflection_prompt(error_output: str) -> str:
+    """构造失败反思提示：分析失败原因与改进建议（重试时作为教训注入）。"""
+    return f"{error_output}\n\n{FAILURE_REFLECTION_PROMPT}"

@@ -1,0 +1,10 @@
+{
+  "id": "text-upper-file",
+  "name": "文本逐行大写并落文件（文件转换）",
+  "prompt": "把下面三行文本逐行转换为全大写，写入当前目录的 upper.txt（保持三行、原顺序）：\n\nagent\nkernel\ndispatcher\n\n即 upper.txt 内容应为三行：AGENT、KERNEL、DISPATCHER。文件必须落在当前目录（作为产物）。",
+  "role": "executor",
+  "expected": {
+    "judge_mode": "artifact",
+    "artifact_glob": ["upper.txt"]
+  }
+}

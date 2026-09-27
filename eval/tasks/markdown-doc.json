@@ -1,0 +1,10 @@
+{
+  "id": "markdown-doc",
+  "name": "生成 Markdown 说明文档",
+  "prompt": "在当前目录创建 EVAL_DOC.md，内容为一个虚构命令行工具 orch-eval 的说明文档，必须包含两个二级标题：## Overview（概述，至少一行文字）和 ## Usage（用法，至少一条以 $ 开头的示例命令）。文件必须留在当前目录作为产物。",
+  "role": "executor",
+  "expected": {
+    "judge_mode": "artifact",
+    "artifact_glob": ["EVAL_DOC.md"]
+  }
+}
