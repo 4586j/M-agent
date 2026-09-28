@@ -41,6 +41,11 @@ def client(monkeypatch, tmp_path, project_root):
                         {"runs": 0, "errors": 0, "total_cost_usd": 0.0,
                          "total_turns": 0})
     monkeypatch.setattr(service, "_HEALTH_CHECKS", None)
+    # 工作区隔离到 tmp（模块级全局，测试间必须重置）
+    ws_dir = tmp_path / "ws"
+    ws_dir.mkdir(parents=True, exist_ok=True)
+    (ws_dir / "sub").mkdir(exist_ok=True)
+    monkeypatch.setattr(service, "_WORKSPACE", {"path": ws_dir.resolve()})
     with TestClient(service.create_app("executor")) as c:
         c.kernel = kernel
         yield c
@@ -186,11 +191,12 @@ def test_terminal_ws_run_and_cd_persist(client, monkeypatch):
         assert done["code"] == 0 and "term_ok" in out
 
         before = done["cwd"]
-        _, done = run("cd ..")
-        assert done["cwd"] != before  # cwd 已变更（向上）
+        _, done = run("cd sub")           # 工作区内切换
+        assert done["cwd"] != before
+        assert done["cwd"].endswith("sub")
         after = done["cwd"]
         _, done = run("cd .")
-        assert done["cwd"] == after  # 会话 cwd 持久
+        assert done["cwd"] == after       # 会话 cwd 持久
 
 
 def test_terminal_ws_bad_cd_reports_error(client, monkeypatch):
@@ -220,3 +226,97 @@ def test_panel_has_terminal_ui(client):
     r = client.get("/panel")
     assert "⌨ 终端" in r.text
     assert "switchView" in r.text and "termRun" in r.text
+
+
+# ---- 工作区边界 ----
+
+def test_workspace_get_and_set(client, tmp_path):
+    ws = client.get("/agent/workspace").json()
+    assert ws["path"] and ws["exists"] is True
+    other = tmp_path / "other_ws"
+    other.mkdir()
+    r = client.put("/agent/workspace", json={"path": str(other)})
+    assert r.status_code == 200 and r.json()["path"].endswith("other_ws")
+    assert client.put("/agent/workspace",
+                      json={"path": str(tmp_path / "nope")}).status_code == 400
+
+
+def test_terminal_blocks_outside_path(client, monkeypatch, tmp_path):
+    """命令涉及工作区外绝对路径 → 回 confirm 帧而非直接执行。"""
+    monkeypatch.setenv("AGENT_API_KEY", "k1")
+    outside = tmp_path / "outside_dir"
+    outside.mkdir(exist_ok=True)
+    with client.websocket_connect("/agent/terminal?api_key=k1") as ws:
+        ready = ws.receive_json()
+        assert ready["workspace"]  # ready 帧带工作区
+        ws.send_json({"type": "run", "cmd": f"dir {outside}"})
+        msgs = []
+        while True:
+            m = ws.receive_json()
+            msgs.append(m)
+            if m["type"] == "done":
+                break
+        confirm = next((m for m in msgs if m["type"] == "confirm"), None)
+        assert confirm is not None, "越界命令应触发 confirm"
+        assert confirm["kind"] == "path"
+        assert any("outside_dir" in p for p in confirm["paths"])
+
+        # 用户同意（allow_once）后应真正执行
+        ws.send_json({"type": "run", "cmd": f"dir {outside}", "allow_once": True})
+        msgs = []
+        while True:
+            m = ws.receive_json()
+            msgs.append(m)
+            if m["type"] == "done":
+                break
+        assert msgs[-1]["code"] == 0
+        assert not any(m["type"] == "confirm" for m in msgs)
+
+
+def test_terminal_blocks_cd_outside(client, monkeypatch, tmp_path):
+    monkeypatch.setenv("AGENT_API_KEY", "k1")
+    with client.websocket_connect("/agent/terminal?api_key=k1") as ws:
+        ws.receive_json()
+        ws.send_json({"type": "run", "cmd": f"cd {tmp_path}"})
+        msgs = []
+        while True:
+            m = ws.receive_json()
+            msgs.append(m)
+            if m["type"] == "done":
+                break
+        confirm = next((m for m in msgs if m["type"] == "confirm"), None)
+        assert confirm is not None and confirm["kind"] == "cd"
+
+
+def test_terminal_allow_session(client, monkeypatch, tmp_path):
+    monkeypatch.setenv("AGENT_API_KEY", "k1")
+    outside = tmp_path / "o2"
+    outside.mkdir(exist_ok=True)
+    with client.websocket_connect("/agent/terminal?api_key=k1") as ws:
+        ws.receive_json()
+        ws.send_json({"type": "run", "cmd": f"cd {outside}",
+                      "allow_once": True, "allow_session": True})
+        while True:
+            m = ws.receive_json()
+            if m["type"] == "done":
+                break
+        # 会话级授权后，后续越界命令不再 confirm
+        ws.send_json({"type": "run", "cmd": f"cd {tmp_path}"})
+        msgs = []
+        while True:
+            m = ws.receive_json()
+            msgs.append(m)
+            if m["type"] == "done":
+                break
+        assert not any(m["type"] == "confirm" for m in msgs)
+        assert msgs[-1]["code"] == 0
+
+
+def test_prepare_cwd_rejects_outside():
+    """显式 cwd 越界 → HTTP 400（服务层直接拒绝）。"""
+    import agent_core.service as service
+    from fastapi import HTTPException
+    import pytest as _pytest
+    with _pytest.raises(HTTPException) as ei:
+        service._prepare_cwd(str(Path(service._workspace_path()).parent), tag="x")
+    assert ei.value.status_code == 400

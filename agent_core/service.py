@@ -94,6 +94,9 @@ _RATE_LIMIT_STORE: dict[str, list[float]] = {}
 # 运行历史存储（惰性初始化）
 _HISTORY_STORE: RunHistoryStore | None = None
 
+# 工作区边界（agent 默认只能在工作区内操作；越界需用户显式同意）
+_WORKSPACE: dict = {"path": None}
+
 
 # ---- 请求体模型 ----
 
@@ -280,15 +283,81 @@ def resolve_persona(name: str) -> Persona:
     return persona
 
 
+def _workspace_path() -> Path:
+    """当前工作区（agent 默认只能在此范围内操作）。
+
+    优先级：运行时设置 > AGENT_WORKSPACE 环境变量 > 项目根。
+    """
+    if _WORKSPACE["path"] is None:
+        env = os.environ.get("AGENT_WORKSPACE", "")
+        base = Path(env) if env else Path(get_config().project_root or os.getcwd())
+        try:
+            _WORKSPACE["path"] = base.expanduser().resolve()
+        except OSError:
+            _WORKSPACE["path"] = Path.cwd()
+    return _WORKSPACE["path"]
+
+
+def _in_workspace(p: Path, root: Path | None = None) -> bool:
+    """p 是否位于工作区内（含工作区自身）。"""
+    root = root or _workspace_path()
+    try:
+        p = p.resolve()
+        root = root.resolve()
+    except OSError:
+        return False
+    return p == root or root in p.parents
+
+
+def _scan_outside_paths(text: str, root: Path | None = None) -> list[str]:
+    """扫描文本中的绝对路径，返回越出工作区的前缀（去重，最多 3 个）。
+
+    用于终端命令/参数的工作区边界检查：宁可多问一次，不放过越界写入。
+    识别 Windows 盘符路径（C:\\x、C:/x）与类 Unix 绝对路径（/x）。
+    """
+    root = root or _workspace_path()
+    hits: list[str] = []
+    pattern = r'[A-Za-z]:[\\/][^\s"\'|&;<>)]*|(?<![\w.\\/-])/[^\s"\'|&;<>)]+'
+    for m in re.finditer(pattern, text):
+        raw = m.group(0)
+        try:
+            p = Path(raw).expanduser()
+            if not p.is_absolute():
+                continue
+            p = p.resolve()
+        except OSError:
+            continue
+        if _in_workspace(p, root):
+            continue
+        prefix = str(p if p.is_dir() else p.parent)
+        if prefix not in hits:
+            hits.append(prefix)
+        if len(hits) >= 3:
+            break
+    return hits
+
+
 def _prepare_cwd(explicit: str | None, tag: str) -> str:
-    """确定任务工作目录：显式指定则用之（并确保存在），否则在内核 work_dir
-    下开一个带 tag 的独立子目录，避免多次调用的产物互相污染。"""
-    config = get_config()
+    """确定任务工作目录：显式指定则用之（须在工作区内），否则在**工作区**下开
+    独立子目录，避免多次调用的产物互相污染。
+
+    工作区边界（安全默认）：agent 的任务目录与终端默认 cwd 都限定在 workspace 内；
+    显式指定工作区外的路径直接拒绝（HTTP 无交互确认通道，由前端引导用户改选工作区）。
+    """
+    ws_root = _workspace_path()
     if explicit:
-        p = Path(explicit)
+        p = Path(explicit).expanduser()
+        try:
+            p = p.resolve()
+        except OSError:
+            raise HTTPException(status_code=400, detail=f"路径无效: {explicit}")
+        if not _in_workspace(p, ws_root):
+            raise HTTPException(
+                status_code=400,
+                detail=f"cwd 越出工作区（{ws_root}）：{p}；请先切换工作区或改用工作区内路径")
         p.mkdir(parents=True, exist_ok=True)
         return str(p)
-    base = Path(config.work_dir or (config.project_root or ".") + "/.agent_work")
+    base = ws_root / ".agent_work"
     p = base / f"{tag}-{uuid.uuid4().hex[:8]}"
     p.mkdir(parents=True, exist_ok=True)
     return str(p)
@@ -754,20 +823,28 @@ def create_app(default_persona: str = "executor") -> FastAPI:
             return
         await ws.accept()
         cfg = get_config()
-        cwd = str(Path(cfg.project_root or os.getcwd()))
+        ws_root = _workspace_path()
+        cwd = str(ws_root)
         shell = os.environ.get("AGENT_TERMINAL_SHELL") or (
             "cmd.exe" if os.name == "nt" else (os.environ.get("SHELL") or "/bin/sh"))
-        session = {"cwd": cwd, "proc": None}
-        await ws.send_json({"type": "ready", "cwd": cwd, "shell": shell})
+        session = {"cwd": cwd, "proc": None, "outside_allowed": False}
+        await ws.send_json({"type": "ready", "cwd": cwd, "shell": shell,
+                            "workspace": str(ws_root)})
         current: asyncio.Task | None = None
 
-        async def _stream(cmd: str) -> None:
-            """执行一条命令并流式回传输出（cd 特判保持会话目录）。"""
+        async def _stream(cmd: str, allow_once: bool = False) -> None:
+            """执行一条命令并流式回传输出（cd 特判保持会话目录）。
+
+            工作区边界（安全默认）：cd 目标或命令中的绝对路径越出工作区时，
+            先回 confirm 帧请用户确认；同意后重发（allow_once / allow_session）
+            才真正执行。
+            """
             raw = cmd.strip()
             if not raw:
                 await ws.send_json({"type": "done", "code": 0, "cwd": session["cwd"]})
                 return
-            # cd 特判：更新会话 cwd（支持 cd /d 跨盘、~、相对路径、引号）
+            allowed = allow_once or session.get("outside_allowed")
+            # cd 特判优先（含越界确认），支持 cd /d 跨盘、~、相对路径、引号
             m = re.match(r'^(cd|chdir|set-location)\s*(.*)$', raw, re.I)
             if m:
                 target = m.group(2).strip().strip('"').strip("'")
@@ -782,6 +859,14 @@ def create_app(default_persona: str = "executor") -> FastAPI:
                 except OSError:
                     p = None
                 if p is not None and p.is_dir():
+                    if not allowed and not _in_workspace(p, ws_root):
+                        await ws.send_json({
+                            "type": "confirm", "kind": "cd", "cmd": raw,
+                            "paths": [str(p)], "workspace": str(ws_root),
+                            "message": "目标目录在工作区之外，是否允许进入？"})
+                        await ws.send_json({"type": "done", "code": 1,
+                                            "cwd": session["cwd"]})
+                        return
                     session["cwd"] = str(p)
                     await ws.send_json({"type": "output", "data": str(p) + "\n"})
                     await ws.send_json({"type": "done", "code": 0, "cwd": session["cwd"]})
@@ -789,6 +874,17 @@ def create_app(default_persona: str = "executor") -> FastAPI:
                     await ws.send_json({"type": "error", "message": f"目录不存在: {target}"})
                     await ws.send_json({"type": "done", "code": 1, "cwd": session["cwd"]})
                 return
+            # 其他命令：扫描绝对路径，越界先确认
+            if not allowed:
+                outside = _scan_outside_paths(raw, ws_root)
+                if outside:
+                    await ws.send_json({
+                        "type": "confirm", "kind": "path", "cmd": raw,
+                        "paths": outside, "workspace": str(ws_root),
+                        "message": "该命令涉及工作区外的路径，是否允许访问？"})
+                    await ws.send_json({"type": "done", "code": 1,
+                                        "cwd": session["cwd"]})
+                    return
 
             loop = asyncio.get_running_loop()
             queue: asyncio.Queue = asyncio.Queue()
@@ -833,7 +929,14 @@ def create_app(default_persona: str = "executor") -> FastAPI:
                         await ws.send_json({"type": "error",
                                             "message": "有命令正在执行，请先中断（Ctrl+C）"})
                         continue
-                    current = asyncio.create_task(_stream(str(msg.get("cmd") or "")))
+                    if msg.get("allow_session"):
+                        session["outside_allowed"] = True
+                        await ws.send_json({"type": "output",
+                                            "data": "[本次会话已允许访问工作区外]\n",
+                                            "cls": "info"})
+                    current = asyncio.create_task(
+                        _stream(str(msg.get("cmd") or ""),
+                                allow_once=bool(msg.get("allow_once"))))
                 elif mtype == "interrupt":
                     proc = session.get("proc")
                     if proc is not None:
@@ -857,6 +960,28 @@ def create_app(default_persona: str = "executor") -> FastAPI:
                     proc.terminate()
                 except Exception:  # noqa: BLE001
                     pass
+
+    # ---- 工作区（agent 默认操作边界） ----
+
+    class WorkspaceReq(BaseModel):
+        path: str = Field(..., description="工作区绝对路径（须已存在的目录）")
+
+    @app.get("/agent/workspace")
+    def get_workspace() -> dict:
+        """当前工作区：agent 的任务目录与终端默认 cwd 都限定在此范围内。"""
+        ws = _workspace_path()
+        return {"path": str(ws), "name": ws.name or str(ws),
+                "exists": ws.is_dir()}
+
+    @app.put("/agent/workspace")
+    def set_workspace(req: WorkspaceReq) -> dict:
+        """切换工作区（须为已存在目录）。"""
+        p = Path(req.path).expanduser()
+        if not p.is_dir():
+            raise HTTPException(status_code=400, detail=f"目录不存在: {req.path}")
+        _WORKSPACE["path"] = p.resolve()
+        logger.info("工作区已切换为 %s", _WORKSPACE["path"])
+        return {"path": str(_WORKSPACE["path"]), "name": _WORKSPACE["path"].name}
 
     # ---- 运行事件回放 / 产物只读 / 面板（Agent 面板数据源） ----
 

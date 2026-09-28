@@ -55,7 +55,7 @@
   header h1{font-size:14px;font-weight:650;letter-spacing:.2px}
   header .sub{color:var(--fg-4);font-weight:400;font-size:12px;margin-left:2px}
   header .conn{
-    margin-left:auto;display:flex;align-items:center;gap:7px;font-size:12px;color:var(--fg-2);
+    margin-left:10px;display:flex;align-items:center;gap:7px;font-size:12px;color:var(--fg-2);
     background:var(--bg-2);border:1px solid var(--bd);border-radius:999px;padding:5px 12px;
   }
   .dot{width:7px;height:7px;border-radius:50%;background:var(--ac);position:relative;flex-shrink:0}
@@ -309,6 +309,30 @@
   body.resizing{cursor:col-resize}
   body.resizing *{user-select:none !important}
 
+  /* 工作区选择器 */
+  .ws-chip{display:flex;align-items:center;gap:6px;margin-left:auto;background:var(--bg-2);
+    border:1px solid var(--bd);border-radius:999px;padding:5px 12px;font-size:12px;
+    color:var(--fg-2);cursor:pointer;transition:.15s;max-width:240px}
+  .ws-chip:hover{border-color:var(--bd-ac);color:var(--ac)}
+  .ws-chip #ws-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+
+  /* 通用模态框（工作区切换 / 越界授权） */
+  .modal-mask{display:none;position:fixed;inset:0;background:rgba(0,0,0,.55);
+    backdrop-filter:blur(2px);z-index:100;align-items:center;justify-content:center}
+  .modal-mask.show{display:flex;animation:evIn .15s}
+  .modal{width:min(540px,92vw);background:var(--bg-2);border:1px solid var(--bd-hi);
+    border-radius:var(--radius-lg);box-shadow:0 20px 60px -12px rgba(0,0,0,.75);padding:18px}
+  .modal-title{font-size:14px;font-weight:700;color:var(--fg);margin-bottom:12px}
+  .modal-body{font-size:12.5px;color:var(--fg-2);line-height:1.7}
+  .modal-hint{color:var(--fg-3);margin-bottom:10px}
+  .modal-kv{display:flex;gap:10px;margin-bottom:6px;align-items:baseline}
+  .modal-kv > span{color:var(--fg-4);font-size:11px;flex-shrink:0;width:46px}
+  .modal-kv > code{font:400 11.5px var(--mono);color:var(--fg-2);background:var(--bg-0);
+    border:1px solid var(--bd);border-radius:6px;padding:3px 8px;word-break:break-all;flex:1}
+  .modal-btns{display:flex;justify-content:flex-end;gap:8px;margin-top:16px}
+  .modal-btns .btn-art{width:auto;padding:7px 14px}
+  .modal-btns .btn-primary{margin-left:0}
+
   /* 视图切换 Tab */
   .viewtabs{display:flex;gap:2px;padding:0 18px;flex-shrink:0;background:var(--bg-1);
     border-bottom:1px solid var(--bd)}
@@ -360,6 +384,9 @@
 <header>
   <div class="logo">⚡</div>
   <h1>Agent 面板 <span class="sub">· 单机 Agent 运行实况</span></h1>
+  <div class="ws-chip" id="ws-chip" onclick="editWorkspace()" title="工作区（点击切换）">
+    <span>📁</span><span id="ws-name">—</span>
+  </div>
   <div class="conn"><span class="dot" id="conn-dot"></span><span id="conn-text">就绪</span></div>
   <div class="layout-menu">
     <button class="btn-ico" onclick="toggleMenu(event)" title="布局设置">▦</button>
@@ -436,6 +463,14 @@
   <aside class="rightbar" id="rightbar">
     <div class="empty"><div class="glyph">📊</div>运行开始后显示<br/>用量统计 · 产物预览 · trace</div>
   </aside>
+</div>
+
+<div class="modal-mask" id="modal-mask">
+  <div class="modal">
+    <div class="modal-title" id="modal-title"></div>
+    <div class="modal-body" id="modal-body"></div>
+    <div class="modal-btns" id="modal-btns"></div>
+  </div>
 </div>
 
 <script>
@@ -858,6 +893,73 @@ function resetLayout(){
   });
 })();
 
+/* ================= 通用模态框 ================= */
+function showModal({ title, bodyHTML, buttons }){
+  $('modal-title').textContent = title || '';
+  $('modal-body').innerHTML = bodyHTML || '';
+  const box = $('modal-btns'); box.innerHTML = '';
+  (buttons || []).forEach(b => {
+    const btn = document.createElement('button');
+    btn.className = b.cls || 'btn-art';
+    btn.textContent = b.label;
+    btn.onclick = () => { hideModal(); if(b.onClick) b.onClick(); };
+    box.appendChild(btn);
+  });
+  $('modal-mask').classList.add('show');
+}
+function hideModal(){ $('modal-mask').classList.remove('show'); }
+document.addEventListener('keydown', e => {
+  if(e.key === 'Escape' && $('modal-mask').classList.contains('show')) hideModal();
+});
+
+/* ================= 工作区（agent 默认操作边界） ================= */
+function setWsChip(path){
+  const name = String(path || '').split(/[\\/]/).filter(Boolean).pop() || path || '—';
+  $('ws-name').textContent = name;
+  $('ws-chip').title = '工作区: ' + path + '（点击切换）';
+}
+function loadWorkspace(){
+  fetch('/agent/workspace').then(r => r.json())
+    .then(d => { if(d.path) setWsChip(d.path); })
+    .catch(() => {});
+}
+function editWorkspace(){
+  fetch('/agent/workspace').then(r => r.json()).then(d => {
+    showModal({
+      title: '📁 工作区',
+      bodyHTML:
+        '<div class="modal-hint">Agent 的任务产物与终端默认目录都限定在工作区内；' +
+        '访问工作区外的路径需要逐次授权确认。</div>' +
+        '<div class="modal-kv"><span>当前</span><code>' + esc(d.path || '—') + '</code></div>' +
+        '<div style="margin-top:10px"><input id="ws-input" class="term-input" ' +
+        'placeholder="输入新的工作区绝对路径" value="' + esc(d.path || '') + '"/></div>',
+      buttons: [
+        { label: '取消' },
+        { label: '切换', cls: 'btn-primary', onClick: () => {
+            const inp = $('ws-input');
+            const p = inp ? inp.value.trim() : '';
+            if(!p) return;
+            fetch('/agent/workspace', {
+              method: 'PUT', headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ path: p })
+            }).then(r => r.json()).then(res => {
+              if(res.path){
+                setWsChip(res.path);
+                termPrint('[工作区已切换: ' + res.path + ']\n', 'info');
+                if(termWS){ try{ termWS.close(); }catch(e){} termWS = null; termConnect(); }
+              } else {
+                showModal({ title: '切换失败', bodyHTML: esc(res.detail || res.message || '未知错误'),
+                            buttons: [{ label: '知道了', cls: 'btn-primary' }] });
+              }
+            }).catch(e => showModal({ title: '切换失败', bodyHTML: esc(e.message),
+                                      buttons: [{ label: '知道了', cls: 'btn-primary' }] }));
+          } }
+      ]
+    });
+    setTimeout(() => { const i = $('ws-input'); if(i) i.focus(); }, 60);
+  }).catch(() => {});
+}
+
 /* ================= 内嵌终端（WebSocket 直连，持久 cwd 会话） ================= */
 let termWS = null, termBusy = false, termHistory = [], termHistIdx = 0;
 const TERM_HIST_KEY = 'agent_panel_term_history';
@@ -885,11 +987,14 @@ function termConnect(){
     let m; try{ m = JSON.parse(ev.data); }catch(e){ return; }
     if(m.type === 'ready'){
       $('term-cwd').textContent = m.cwd;
-      termPrint('[shell: ' + m.shell + ']\n', 'info');
+      if(m.workspace) setWsChip(m.workspace);
+      termPrint('[shell: ' + m.shell + ' · 工作区: ' + (m.workspace || '—') + ']\n', 'info');
     } else if(m.type === 'output'){
-      termPrint(m.data);
+      termPrint(m.data, m.cls);
     } else if(m.type === 'error'){
       termPrint(m.message + '\n', 'err');
+    } else if(m.type === 'confirm'){
+      termConfirm(m);
     } else if(m.type === 'done'){
       termBusy = false;
       if(m.cwd) $('term-cwd').textContent = m.cwd;
@@ -917,9 +1022,7 @@ function termRun(){
     termPrint('[未连接，正在重连…]\n', 'err'); termConnect(); return;
   }
   if(termBusy){ termPrint('[有命令正在执行，Ctrl+C 可中断]\n', 'err'); return; }
-  termPrint('$ ' + cmd + '\n', 'cmd');
-  termWS.send(JSON.stringify({ type:'run', cmd }));
-  termBusy = true;
+  termSend(cmd, false, false);
   if(termHistory[termHistory.length - 1] !== cmd){
     termHistory.push(cmd);
     if(termHistory.length > 200) termHistory.shift();
@@ -927,6 +1030,31 @@ function termRun(){
   }
   termHistIdx = termHistory.length;
   inp.value = '';
+}
+function termSend(cmd, allowOnce, allowSession){
+  if(!termWS || termWS.readyState !== 1){ termPrint('[未连接]\n', 'err'); return; }
+  const tag = allowSession ? '   [已授权本次会话]' : (allowOnce ? '   [已授权一次]' : '');
+  termPrint('$ ' + cmd + tag + '\n', 'cmd');
+  const payload = { type: 'run', cmd };
+  if(allowOnce) payload.allow_once = true;
+  if(allowSession) payload.allow_session = true;
+  termWS.send(JSON.stringify(payload));
+  termBusy = true;
+}
+function termConfirm(m){
+  showModal({
+    title: '⚠ 工作区外访问授权',
+    bodyHTML:
+      '<div class="modal-hint">' + esc(m.message || '该操作越出工作区') + '</div>' +
+      '<div class="modal-kv"><span>工作区</span><code>' + esc(m.workspace || '—') + '</code></div>' +
+      '<div class="modal-kv"><span>目标</span><code>' + esc((m.paths || []).join('\n')) + '</code></div>' +
+      '<div class="modal-kv"><span>命令</span><code>' + esc(m.cmd || '') + '</code></div>',
+    buttons: [
+      { label: '拒绝' },
+      { label: '允许一次', onClick: () => termSend(m.cmd, true, false) },
+      { label: '本次会话允许', cls: 'btn-primary', onClick: () => termSend(m.cmd, true, true) }
+    ]
+  });
 }
 function termInterrupt(){
   if(termWS && termWS.readyState === 1) termWS.send(JSON.stringify({ type:'interrupt' }));
@@ -959,6 +1087,7 @@ $('prompt').addEventListener('keydown', e => {
   if((e.ctrlKey || e.metaKey) && e.key === 'Enter') dispatch();
 });
 loadRuns();
+loadWorkspace();
 fetch('/health').then(r => r.json())
   .then(() => setConn('ok', '就绪'))
   .catch(() => setConn('off', '服务离线'));
