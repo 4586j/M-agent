@@ -32,12 +32,14 @@ class FakeDispatcher:
         self.calls = []
         self.result_status = result_status
 
-    def dispatch(self, role, prompt, context_memory=None, model=None):
-        self.calls.append({"role": role, "prompt": prompt})
+    def dispatch(self, role, prompt, context_memory=None, model=None,
+                 worker_id=None):
+        self.calls.append({"role": role, "prompt": prompt, "worker_id": worker_id})
         return DispatchResult(task_id="task-new", status=self.result_status)
 
-    def redispatch(self, task_id, model=None):
-        return self.dispatch(role="executor", prompt="redispatched")
+    def redispatch(self, task_id, model=None, worker_id=None):
+        return self.dispatch(role="executor", prompt="redispatched",
+                             worker_id=worker_id)
 
 
 def test_sweep_leaves_awaiting_approval_untouched(tmp_path):
@@ -188,6 +190,8 @@ def test_check_worker_healing_redispatches_lost_tasks(tmp_path):
     healed = mgr.check_worker_healing("worker-A")
     assert healed == 1
     assert len(fake_disp.calls) == 1
+    # role 一致时新派发定点回刚恢复的节点（与 old 记录 worker_id 改写一致）
+    assert fake_disp.calls[0]["worker_id"] == "worker-A"
     rec = store.get("task-1")
     assert rec.status == "running"
     assert rec.retry_count == 1

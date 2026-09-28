@@ -86,6 +86,70 @@ def test_all_workers_includes_timed_out():
     assert len(reg.all_workers()) == 1
 
 
+def test_resolve_pinned_alive():
+    reg = WorkerRegistry(heartbeat_timeout=45)
+    reg.register(make_info("A"))
+    reg.register(make_info("B"))
+    w = reg.resolve_worker("executor", worker_id="A")
+    assert w.worker_id == "A"
+
+
+def test_resolve_pinned_unknown_raises():
+    reg = WorkerRegistry(heartbeat_timeout=45)
+    reg.register(make_info("A"))
+    try:
+        reg.resolve_worker("executor", worker_id="NOPE")
+    except RuntimeError as e:
+        assert "从未注册" in str(e)
+    else:
+        raise AssertionError("未知节点定点应抛 RuntimeError")
+
+
+def test_resolve_pinned_dead_raises():
+    times = [100.0]
+    reg = WorkerRegistry(heartbeat_timeout=45, now_fn=lambda: times[0])
+    reg.register(make_info("A"))
+    reg.register(make_info("B"))
+    reg.heartbeat("A")
+    reg.heartbeat("B")
+    times[0] = 200.0  # 全部超时
+    try:
+        reg.resolve_worker("executor", worker_id="A")
+    except RuntimeError as e:
+        msg = str(e)
+        assert "心跳超时" in msg
+        assert "从未注册" not in msg
+    else:
+        raise AssertionError("超时节点定点应抛 RuntimeError")
+
+
+def test_resolve_pinned_role_ignored():
+    """定点时以 worker_id 为准，不看请求的 role（role 替换由 dispatch 层负责）。"""
+    reg = WorkerRegistry(heartbeat_timeout=45)
+    reg.register(make_info("A", role="executor"))
+    reg.register(make_info("G", role="security-guard"))
+    w = reg.resolve_worker("executor", worker_id="G")
+    assert w.worker_id == "G"
+
+
+def test_resolve_no_pin_round_robin():
+    reg = WorkerRegistry(heartbeat_timeout=45)
+    reg.register(make_info("A"))
+    reg.register(make_info("B"))
+    picked = [reg.resolve_worker("executor").worker_id for _ in range(4)]
+    assert picked == ["A", "B", "A", "B"]
+
+
+def test_resolve_no_pin_no_worker_raises():
+    reg = WorkerRegistry(heartbeat_timeout=45)
+    try:
+        reg.resolve_worker("executor")
+    except RuntimeError as e:
+        assert "无可用" in str(e)
+    else:
+        raise AssertionError("无可用节点时应抛 RuntimeError")
+
+
 def test_concurrent_register_heartbeat_select():
     """并发注册/心跳/选择不再触发 dict changed size / cycle 竞态。"""
     reg = WorkerRegistry(heartbeat_timeout=45)

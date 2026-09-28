@@ -73,6 +73,7 @@ class AsyncRemoteDispatcher:
         model: str | None = None,
         use_experience: bool = True,
         enable_subagents: bool | None = None,
+        worker_id: str | None = None,
     ) -> str:
         """异步派发：写 pending、POST worker、起后台轮询，立即返回 task_id。
 
@@ -82,21 +83,28 @@ class AsyncRemoteDispatcher:
           experience_store.record_from_task，与同步 RemoteDispatcher 对齐。
         enable_subagents：远程异步模式下每次请求覆盖暂不转发到 worker，
         worker 侧统一受全局 AGENT_/ORCH_SUBAGENTS_ENABLED 闸（kernel._build_options）控制。
+        worker_id 非空时定点派发到该节点（resolve_worker 抛错则零任务落库）。
         """
-        worker = self.registry.select_worker(role, strategy=self.select_strategy)
-        if worker is None:
-            raise RuntimeError(f"无可用 {role} worker")
+        worker = self.registry.resolve_worker(
+            role, strategy=self.select_strategy, worker_id=worker_id)
+        # 定点时以节点真实 role 为准（同同步 RemoteDispatcher，保下游数据真实）
+        pinned = worker_id is not None
+        if pinned:
+            role = worker.role
         task_id = f"task-{uuid.uuid4().hex[:8]}"
         trace_id = new_trace_id()
         ts = self._now()
+        meta = {**({"model": model} if model else {}),
+                "use_experience": bool(use_experience)}
+        if pinned:
+            meta["pinned"] = True
         self.task_store.write(TaskRecord(
             task_id=task_id, role=role, prompt=prompt,
             worker_id=worker.worker_id, status="pending",
             created_at=ts, updated_at=ts,
             max_retries=self.max_retries,
             trace_id=trace_id,
-            meta={**({"model": model} if model else {}),
-                  "use_experience": bool(use_experience)},
+            meta=meta,
         ))
         log.info("[trace=%s] async dispatch role=%s -> worker=%s task=%s",
                  trace_id, role, worker.worker_id, task_id)

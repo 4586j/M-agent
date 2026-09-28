@@ -4,11 +4,16 @@ import type {
   MemoryCoreItem, ContextNotesResponse, ExperienceRecord, ExperienceSearchBody,
   ProposalRecord, ReflectionReport, ScheduleRecord, ScheduleBody, AuditEntry,
 } from '../types'
+import { getActiveConnection } from './connections'
 
 // 相对路径：dev 走 vite proxy，prod 同源直调。
+// 多 brain：活动连接的 baseUrl 非空时（跨源绝对地址）拼在相对路径前；
+// 空串时行为与旧版完全一致（相对路径）。切换连接后 getActiveConnection()
+// 立即返回新地址，后续请求自动打到新 brain。
 // 鉴权：配置了 ORCH_API_KEY 的部署要求所有非 public 请求携带 X-API-Key 头，
 // 否则 /stats /tasks approve/reject 等全部 401。取值与 sseUrl() 同源
-// （localStorage.orch_api_key）；key 为空时不发头，本机无 key 部署行为不变
+// （localStorage.orch_api_key，由 connections.ts 按活动连接镜像保持）；
+// key 为空时不发头，本机无 key 部署行为不变
 export function getApiKey(): string {
   try {
     return localStorage.getItem('orch_api_key') || ''
@@ -17,11 +22,16 @@ export function getApiKey(): string {
   }
 }
 
+function pref(path: string): string {
+  const base = getActiveConnection().baseUrl
+  return base ? base + path : path
+}
+
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
   const headers: Record<string, string> = { 'Content-Type': 'application/json' }
   const key = getApiKey()
   if (key) headers['X-API-Key'] = key
-  const r = await fetch(url, {
+  const r = await fetch(pref(url), {
     ...init,
     headers,
   })
@@ -168,8 +178,11 @@ export const api = {
 // SSE 实时事件流地址。EventSource 无法携带自定义 header，
 // 部署了 api_key 时从 localStorage.orch_api_key 读取并走 ?api_key= 查询参数
 // （brain 的 auth 中间件同时接受 X-API-Key 头与查询参数；未设 key 的部署无需配置）
+// 多 brain：与 REST 请求同源走活动连接的 baseUrl 前缀
 export function sseUrl(taskId: string): string {
+  const base = getActiveConnection().baseUrl
   const key = getApiKey()
   const q = key ? `?api_key=${encodeURIComponent(key)}` : ''
-  return `/tasks/${encodeURIComponent(taskId)}/events${q}`
+  const relative = `/tasks/${encodeURIComponent(taskId)}/events${q}`
+  return base ? base + relative : relative
 }

@@ -91,3 +91,30 @@ class WorkerRegistry:
                 if cand in alive:
                     return cand
         return alive[0]
+
+    def resolve_worker(self, role: str = "executor",
+                       strategy: str = "round_robin",
+                       worker_id: str | None = None) -> WorkerInfo:
+        """定点解析：worker_id 非空时按 ID 定点，否则按 role+strategy 选择。
+
+        定点失败（从未注册 / 注册过但心跳超时）抛 RuntimeError，不静默回退。
+        两种错误消息刻意区分——「从没注册」和「注册过但掉线」是运维要排查的
+        两件事。调用方（dispatcher）在 task_store.write 之前调用，保证失败时
+        零任务落库。
+        """
+        if worker_id is not None:
+            w = self.get_worker(worker_id)
+            if w is None:
+                raise RuntimeError(f"节点从未注册: {worker_id}")
+            alive = self._alive()
+            alive_ids = {x.worker_id for x in alive}
+            if worker_id not in alive_ids:
+                detail = ", ".join(
+                    f"{x.worker_id}({x.role}@{x.host}:{x.port})" for x in alive)
+                raise RuntimeError(
+                    f"节点心跳超时: {worker_id}；当前活跃节点: [{detail or '无'}]")
+            return w
+        w = self.select_worker(role, strategy=strategy)
+        if w is None:
+            raise RuntimeError(f"无可用 {role} worker")
+        return w

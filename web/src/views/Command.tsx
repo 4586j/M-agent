@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
+import { useLocation } from 'react-router-dom'
 import { api } from '../api/client'
-import type { ApprovalMeta, DispatchAsyncResponse, DispatchResult, ExperienceRecord, TaskRecord, RecommendResponse, TranslateResponse } from '../types'
+import type { ApprovalMeta, DispatchAsyncResponse, DispatchResult, ExperienceRecord, TaskRecord, RecommendResponse, TranslateResponse, WorkerInfo } from '../types'
 import { usePolling } from '../hooks/usePolling'
 import { formatTime, timeAgo } from '../utils'
 import StatusBadge from '../components/StatusBadge'
@@ -12,6 +13,17 @@ export default function Command() {
   const [ctx, setCtx] = useState('')
   const [result, setResult] = useState<DispatchResult | null>(null)
   const [busy, setBusy] = useState(false)
+
+  // 定点派发：从 NodeManage「派发到此节点」跳转带 workerId，或本页下拉选择
+  const location = useLocation()
+  const [workerId, setWorkerId] = useState<string>(() => (location.state as { workerId?: string } | null)?.workerId ?? '')
+  const { data: workers } = usePolling<WorkerInfo[]>(() => api.workers(), 5000)
+
+  // 从 NodeManage 跳转带 workerId 时，工人列表异步返回后回填其真实 role（role 输入已随定点禁用）
+  useEffect(() => {
+    const w = workerId ? (workers ?? []).find((x) => x.worker_id === workerId) : undefined
+    if (w) setRole(w.role)
+  }, [workerId, workers])
 
   // 二期：同步阻塞 / 异步+SSE 两种派发模式（异步适合 web-expert/back-expert 长流程）
   const [mode, setMode] = useState<'sync' | 'async'>('sync')
@@ -56,6 +68,7 @@ export default function Command() {
         force,
         enable_subagents: enableSubagents,
         context_task_ids: ctxTaskIds.length > 0 ? ctxTaskIds : undefined,
+        worker_id: workerId || null,
       }
       if (mode === 'async') {
         const res = await api.dispatchAsync(body)
@@ -193,17 +206,41 @@ export default function Command() {
           className="mt-1 w-full px-2 py-1 text-sm border border-slate-300 rounded font-mono"
           placeholder="例如：分析 workspace/test.csv 并报告行数"
         />
-        <div className="grid grid-cols-2 gap-2 mt-2">
+        <div className="grid grid-cols-3 gap-2 mt-2">
           <label className="text-xs text-slate-500">
             role
-            <input value={role} onChange={(e) => setRole(e.target.value)}
-              className="mt-1 w-full px-2 py-1 text-sm border border-slate-300 rounded" />
+            <input value={role} disabled={!!workerId} onChange={(e) => setRole(e.target.value)}
+              className="mt-1 w-full px-2 py-1 text-sm border border-slate-300 rounded disabled:bg-slate-50 disabled:text-slate-400"
+              title="定点后由节点真实 role 决定，自动回填" />
           </label>
           <label className="text-xs text-slate-500">
             model（可选）
             <input value={model} onChange={(e) => setModel(e.target.value)}
               className="mt-1 w-full px-2 py-1 text-sm border border-slate-300 rounded"
               placeholder="sonnet" />
+          </label>
+          <label className="text-xs text-slate-500">
+            目标节点
+            <select
+              value={workerId}
+              onChange={(e) => {
+                const id = e.target.value
+                setWorkerId(id)
+                if (id) {
+                  const w = (workers ?? []).find((x) => x.worker_id === id)
+                  if (w) setRole(w.role) // 选中节点自动回填其真实 role
+                }
+              }}
+              className="mt-1 w-full px-2 py-1 text-sm border border-slate-300 rounded bg-white"
+              title="空 = 自动按 role 轮询；选中即定点派发，role 跟随节点"
+            >
+              <option value="">自动（按 role 轮询）</option>
+              {(workers ?? []).map((w) => (
+                <option key={w.worker_id} value={w.worker_id}>
+                  {w.worker_id} · {w.role} · {w.host}:{w.port}
+                </option>
+              ))}
+            </select>
           </label>
         </div>
         <div className="mt-2 flex items-center justify-between">

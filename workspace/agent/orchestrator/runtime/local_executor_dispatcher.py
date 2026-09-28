@@ -211,14 +211,21 @@ class LocalExecutorDispatcher(Dispatcher):
                  context_memory: str | None = None,
                  model: str | None = None,
                  use_experience: bool = True,
-                 enable_subagents: bool | None = None) -> DispatchResult:
+                 enable_subagents: bool | None = None,
+                 worker_id: str | None = None) -> DispatchResult:
         """本地同步执行一个任务：写 pending → run_oneshot → 收尾更新。
 
         use_experience=False 为评测消融组的硬关：不检索/不注入历史经验（读关），
         且内核与派发层均不沉淀经验（写关）——真正禁用读写，而非仅靠提示词。
         enable_subagents：每次请求覆盖子代理派发开关；None=跟随全局
         config.subagents_enabled（AGENT_/ORCH_SUBAGENTS_ENABLED）。
+        worker_id：本地执行无 worker 概念，只接受 None 或伪定点 "local"，
+        其余一律报错（不区分角色，本地全部进程内执行）。
         """
+        if worker_id is not None and worker_id != "local":
+            raise RuntimeError(
+                f"本地执行不支持定点节点 {worker_id}（进程内直跑，没有独立 worker）。"
+                "单机本地执行请省略 worker_id，或在 ORCH_MODE=remote 下注册 worker 后按节点派发。")
         task_id = f"task-{uuid.uuid4().hex[:8]}"
         trace_id = new_trace_id()
         ts = self._now()
@@ -338,10 +345,12 @@ class LocalExecutorDispatcher(Dispatcher):
                               artifacts=artifacts, error=error, verdict=verdict,
                               trace_id=trace_id)
 
-    def redispatch(self, task_id: str, model: str | None = None) -> DispatchResult:
+    def redispatch(self, task_id: str, model: str | None = None,
+                   worker_id: str | None = None) -> DispatchResult:
         """按已存在任务的 role/prompt 重新本地执行，返回新 DispatchResult。"""
         rec = self.task_store.get(task_id)
         if rec is None:
             raise KeyError(f"task not found: {task_id}")
         return self.dispatch(role=rec.role, prompt=rec.prompt,
-                             context_memory=None, model=model)
+                             context_memory=None, model=model,
+                             worker_id=worker_id)

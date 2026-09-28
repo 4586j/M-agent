@@ -51,6 +51,38 @@ def test_dispatch_falls_back_to_agent_api_key(monkeypatch):
     assert captured["headers"]["X-API-Key"] == "agent-key"
 
 
+def test_dispatch_passes_worker_id(monkeypatch):
+    """定点派发：worker_id 进请求体；缺省不传。"""
+    captured = {}
+    _patch_post(monkeypatch, captured)
+    monkeypatch.delenv("ORCH_API_KEY", raising=False)
+    monkeypatch.delenv("AGENT_API_KEY", raising=False)
+
+    cli_dispatch("hello", worker_id="w-b")
+    assert captured["body"].get("worker_id") == "w-b"
+
+    cli_dispatch("hello")
+    assert "worker_id" not in captured["body"]
+
+
+def test_main_reads_worker_target_env(monkeypatch, capsys):
+    """main：ORCH_WORKER_TARGET 环境变量带进请求体。"""
+    import requests
+    import dispatch_cli
+
+    captured = {}
+
+    def fake_post(url, json=None, headers=None, timeout=None):
+        captured["body"] = json
+        return _FakeResp({"status": "done", "task_id": "task-x"})
+
+    monkeypatch.setattr(requests, "post", fake_post)
+    monkeypatch.setattr(sys, "argv", ["dispatch_cli.py", "hello"])
+    monkeypatch.setenv("ORCH_WORKER_TARGET", "w-b")
+    assert dispatch_cli.main() == 0
+    assert captured["body"].get("worker_id") == "w-b"
+
+
 def test_dispatch_prefers_orch_api_key(monkeypatch):
     """两个变量都配置时 ORCH_API_KEY 优先。"""
     captured = {}

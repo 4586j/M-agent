@@ -138,12 +138,13 @@ class CapturingDispatcher(Dispatcher):
         self.calls = []
 
     def dispatch(self, role, prompt, context_memory=None, model=None,
-                 use_experience=True, enable_subagents=None):
+                 use_experience=True, enable_subagents=None,
+                 worker_id=None):
         self.calls.append({"role": role, "prompt": prompt,
                            "context_memory": context_memory, "model": model})
         return DispatchResult("task-cap1", "done", output="ok", artifacts=[], error=None)
 
-    def redispatch(self, task_id, model=None):
+    def redispatch(self, task_id, model=None, worker_id=None):
         raise KeyError(task_id)
 
 
@@ -217,11 +218,12 @@ def test_model_routing_routes_simple_task(tmp_path):
         calls = []
 
         def dispatch(self, role, prompt, context_memory=None, model=None,
-                     use_experience=True, enable_subagents=None):
+                     use_experience=True, enable_subagents=None,
+                     worker_id=None):
             Cap.calls.append(model)
             return DispatchResult("task-r1", "done", output="ok", artifacts=[], error=None)
 
-        def redispatch(self, task_id, model=None):
+        def redispatch(self, task_id, model=None, worker_id=None):
             raise KeyError(task_id)
 
     disp = Cap()
@@ -238,11 +240,12 @@ def test_model_routing_skips_skill_and_long_tasks(tmp_path):
         calls = []
 
         def dispatch(self, role, prompt, context_memory=None, model=None,
-                     use_experience=True, enable_subagents=None):
+                     use_experience=True, enable_subagents=None,
+                     worker_id=None):
             Cap.calls.append(model)
             return DispatchResult("task-r2", "done", output="ok", artifacts=[], error=None)
 
-        def redispatch(self, task_id, model=None):
+        def redispatch(self, task_id, model=None, worker_id=None):
             raise KeyError(task_id)
 
     disp = Cap()
@@ -260,11 +263,12 @@ def test_model_routing_respects_explicit_model(tmp_path):
         calls = []
 
         def dispatch(self, role, prompt, context_memory=None, model=None,
-                     use_experience=True, enable_subagents=None):
+                     use_experience=True, enable_subagents=None,
+                     worker_id=None):
             Cap.calls.append(model)
             return DispatchResult("task-r3", "done", output="ok", artifacts=[], error=None)
 
-        def redispatch(self, task_id, model=None):
+        def redispatch(self, task_id, model=None, worker_id=None):
             raise KeyError(task_id)
 
     disp = Cap()

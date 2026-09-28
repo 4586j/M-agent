@@ -1,6 +1,7 @@
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import type { TaskRecord, TaskStatus } from '../types'
 import { usePolling } from '../hooks/usePolling'
+import { useActiveConnectionId } from '../api/connections'
 import { api } from '../api/client'
 import { timeAgo } from '../utils'
 import StatusBadge from '../components/StatusBadge'
@@ -29,6 +30,13 @@ export default function Tasks() {
   const [q, setQ] = useState('')
   const [runningOnly, setRunningOnly] = useState(false)
   const [selected, setSelected] = useState<TaskRecord | null>(null)
+  const connId = useActiveConnectionId()
+  // 切换连接：关掉陈旧抽屉（否则抽屉里的 task.worker_id 指向旧 brain，
+  // artifact 请求会 404 / 展示错脑的数据）
+  useEffect(() => {
+    setSelected(null)
+  }, [connId])
+
 
   const roles = useMemo(
     () => [...new Set((tasks || []).map((t) => t.role))].sort(),

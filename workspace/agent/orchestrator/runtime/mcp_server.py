@@ -81,14 +81,16 @@ def _strip_embedding(rec: dict) -> dict:
 @mcp.tool()
 def dispatch_task(prompt: str, role: str = "executor", model: str | None = None,
                   context_memory: str | None = None,
-                  context_task_ids: list[str] | None = None) -> Any:
+                  context_task_ids: list[str] | None = None,
+                  worker_id: str | None = None) -> Any:
     """同步派发一个任务给编排框架执行，返回最终结果（output/artifacts/verdict/用量）。
 
     prompt 是给 executor 的完整任务说明（必要信息最小集，token 纪律：大段背景
     放 context_memory 或用 context_task_ids 引用历史任务，不要整段粘贴）。
     role: executor（执行）/ security-guard（只读检验）。model: 覆盖模型（如
     sonnet/haiku），不传走默认路由。context_task_ids: 引用历史任务的上下文
-    记忆笔记并入本次派发（续做任务时用它）。
+    记忆笔记并入本次派发（续做任务时用它）。worker_id: 定点派发到指定节点
+    （节点不存在/心跳超时返回 failed，不静默换节点）；缺省按 role 轮询。
     """
     body: dict = {"prompt": prompt, "role": role}
     if model:
@@ -97,16 +99,19 @@ def dispatch_task(prompt: str, role: str = "executor", model: str | None = None,
         body["context_memory"] = context_memory
     if context_task_ids:
         body["context_task_ids"] = context_task_ids
+    if worker_id:
+        body["worker_id"] = worker_id
     return get_client().call("POST", "/dispatch", json_body=body)
 
 
 @mcp.tool()
 def dispatch_task_async(prompt: str, role: str = "executor", model: str | None = None,
                         context_memory: str | None = None,
-                        context_task_ids: list[str] | None = None) -> Any:
+                        context_task_ids: list[str] | None = None,
+                        worker_id: str | None = None) -> Any:
     """异步派发：立即返回 task_id，结果经 get_task_status 轮询。
 
-    参数含义同 dispatch_task。适合长任务（前端页面/后端服务开发）。
+    参数含义同 dispatch_task。worker_id 定点语义同 dispatch_task。适合长任务。
     """
     body: dict = {"prompt": prompt, "role": role}
     if model:
@@ -115,6 +120,8 @@ def dispatch_task_async(prompt: str, role: str = "executor", model: str | None =
         body["context_memory"] = context_memory
     if context_task_ids:
         body["context_task_ids"] = context_task_ids
+    if worker_id:
+        body["worker_id"] = worker_id
     return get_client().call("POST", "/dispatch/async", json_body=body)
 
 

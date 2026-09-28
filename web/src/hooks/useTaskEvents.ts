@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import type { TaskRecord } from '../types'
 import { api, sseUrl } from '../api/client'
+import { useActiveConnectionId } from '../api/connections'
 
 /** SSE 事件时间线行 */
 export interface TaskEventLine {
@@ -29,6 +30,7 @@ export function useTaskEvents(
   const esRef = useRef<EventSource | null>(null)
   const pollRef = useRef<number | null>(null)
   const onChangeRef = useRef(onChange)
+  const connId = useActiveConnectionId()
   onChangeRef.current = onChange
 
   useEffect(() => {
@@ -101,9 +103,10 @@ export function useTaskEvents(
       }
       esRef.current = null
     }
-    // 仅在任务变化时重建订阅（task.status 取打开时刻快照）
+    // 任务或连接变化时重建订阅（task.status 取打开时刻快照）。
+    // connId：切换多 brain 连接时旧 EventSource 指向旧脑，必须关掉重订。
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [task.task_id])
+  }, [task.task_id, connId])
 
   return { current: live ?? task, timeline, channel }
 }

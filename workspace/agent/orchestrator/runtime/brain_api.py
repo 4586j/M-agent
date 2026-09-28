@@ -64,6 +64,9 @@ class DispatchReq(BaseModel):
     # 子代理派发每次请求覆盖：None=跟随全局 AGENT_/ORCH_SUBAGENTS_ENABLED；
     # True/False=本次派发强制启用/禁用子代理（单机本地执行生效；远程受全局闸）。
     enable_subagents: bool | None = None
+    # 定点派发：非空时按 worker_id 指定节点（定向指挥单机多 agent 的某个实例）。
+    # 节点不存在/心跳超时直接 failed 返回，不静默换节点；格式非法归 400。
+    worker_id: str | None = None
 
 
 class AdvisorReq(BaseModel):
@@ -100,6 +103,8 @@ class ProceduralVoteReq(BaseModel):
 
 class RedispatchReq(BaseModel):
     model: str | None = None
+    # 定点重派：非空时强制指到该节点；缺省后端按原任务 meta.pinned 继承。
+    worker_id: str | None = None
 
 
 class ApproveReq(BaseModel):
@@ -409,6 +414,8 @@ def create_brain_app(registry: WorkerRegistry, task_store: TaskStore, cfg: Confi
     def redispatch_task(task_id: str, req: RedispatchReq):
         if dispatcher is None:
             raise HTTPException(status_code=400, detail="dispatcher 未配置（local 模式不支持重派）")
+        if req.worker_id:
+            validate_id(req.worker_id, "worker_id")
         # 待审批/派发占位中的任务不可重派：需先走 approve/reject 人工裁决流程
         rec0 = task_store.get(task_id)
         if rec0 is not None and rec0.status == "awaiting_approval":
@@ -424,7 +431,8 @@ def create_brain_app(registry: WorkerRegistry, task_store: TaskStore, cfg: Confi
                 raise HTTPException(status_code=400,
                                     detail="被人工拒绝的指令不可重派，请修订后重新派发")
         try:
-            res = dispatcher.redispatch(task_id, model=req.model)
+            res = dispatcher.redispatch(task_id, model=req.model,
+                                        worker_id=req.worker_id)
         except KeyError as e:
             raise HTTPException(status_code=404, detail=str(e))
         except RuntimeError as e:
@@ -464,6 +472,7 @@ def create_brain_app(registry: WorkerRegistry, task_store: TaskStore, cfg: Confi
                 "context_memory": req.context_memory,
                 "context_task_ids": req.context_task_ids,
                 "model": model,
+                "worker_id": req.worker_id,  # 定点续传：approve 时恢复对同一节点派发
                 "requested_by": _request_operator(request),
             }},
         ))
@@ -534,9 +543,13 @@ def create_brain_app(registry: WorkerRegistry, task_store: TaskStore, cfg: Confi
             context = assemble_context(memory_store, context, ctx_task_ids)
         context = clamp_context(context, cfg.context_memory_max_chars)
         model = approval.get("model")
+        # 定点续传：被拦截时缓存了 worker_id，approve 时恢复对同一节点派发；
+        # 老任务该键缺失 → None → 自动选节点（向后兼容）
+        worker_id = approval.get("worker_id")
         try:
             res = dispatcher.dispatch(role=rec.role, prompt=prompt,
-                                      context_memory=context or None, model=model)
+                                      context_memory=context or None, model=model,
+                                      worker_id=worker_id)
         except Exception as e:  # noqa: BLE001 - 派发失败回滚占位，任务回到待审批
             task_store.transition(task_id, "dispatching", "awaiting_approval")
             publish_task_event(bus, task_id, event="status", state="awaiting_approval",
@@ -603,6 +616,9 @@ def create_brain_app(registry: WorkerRegistry, task_store: TaskStore, cfg: Confi
     def dispatch(req: DispatchReq, request: Request):
         if dispatcher is None:
             return {"status": "failed", "error": "dispatcher 未配置（local 模式不提供 /dispatch）"}
+        # 定点 worker_id 格式校验放最前：非法输入 400，且不烧 security_check 的 LLM 调用
+        if req.worker_id:
+            validate_id(req.worker_id, "worker_id")
         # security-guard 指令检验；force=true 跳过（用于放行 block 指令）
         if not req.force:
             v = security_check(req.prompt, use_llm=cfg.security_llm)
@@ -634,7 +650,8 @@ def create_brain_app(registry: WorkerRegistry, task_store: TaskStore, cfg: Confi
             res = dispatcher.dispatch(role=req.role, prompt=req.prompt,
                                       context_memory=context or None, model=model,
                                       use_experience=req.use_experience,
-                                      enable_subagents=req.enable_subagents)
+                                      enable_subagents=req.enable_subagents,
+                                      worker_id=req.worker_id)
         except RuntimeError as e:
             return {"status": "failed", "error": str(e)}
         return {
@@ -647,6 +664,8 @@ def create_brain_app(registry: WorkerRegistry, task_store: TaskStore, cfg: Confi
     async def dispatch_async(req: DispatchReq, request: Request):
         if async_dispatcher is None:
             return {"status": "failed", "error": "async_dispatcher 未配置"}
+        if req.worker_id:
+            validate_id(req.worker_id, "worker_id")
         if not req.force:
             # security_llm 同步等待秒级：挪到线程池执行，避免阻塞 brain 事件循环
             # （同步 /dispatch 路径保持原样不动）
@@ -682,6 +701,7 @@ def create_brain_app(registry: WorkerRegistry, task_store: TaskStore, cfg: Confi
                 context_memory=context or None, model=model,
                 use_experience=req.use_experience,
                 enable_subagents=req.enable_subagents,
+                worker_id=req.worker_id,
             )
         except RuntimeError as e:
             return {"status": "failed", "error": str(e)}

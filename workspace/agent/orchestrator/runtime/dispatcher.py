@@ -36,10 +36,13 @@ class Dispatcher(ABC):
                  context_memory: str | None = None,
                  model: str | None = None,
                  use_experience: bool = True,
-                 enable_subagents: bool | None = None) -> DispatchResult: ...
+                 enable_subagents: bool | None = None,
+                 worker_id: str | None = None) -> DispatchResult:
+        """worker_id 非空时定点派发到该节点（失败抛 RuntimeError，不静默回退）。"""
 
     @abstractmethod
-    def redispatch(self, task_id: str, model: str | None = None) -> DispatchResult:
+    def redispatch(self, task_id: str, model: str | None = None,
+                   worker_id: str | None = None) -> DispatchResult:
         """按已存在任务的 role/prompt 重新派发，返回新 DispatchResult。"""
 
 
@@ -57,7 +60,12 @@ class LocalDispatcher(Dispatcher):
     def dispatch(self, role: str, prompt: str,
                  context_memory: str | None = None, model: str | None = None,
                  use_experience: bool = True,
-                 enable_subagents: bool | None = None) -> DispatchResult:
+                 enable_subagents: bool | None = None,
+                 worker_id: str | None = None) -> DispatchResult:
+        # V1 本地派发无 worker 概念：只能接受伪定点 "local"。
+        if worker_id is not None and worker_id != "local":
+            raise RuntimeError(
+                f"local 派发不支持定点节点 {worker_id}（本地执行没有独立 worker）")
         task_id = f"task-{uuid.uuid4().hex[:8]}"
         trace_id = new_trace_id()
         ts = self._now()
@@ -79,12 +87,14 @@ class LocalDispatcher(Dispatcher):
                               output=rec.output, artifacts=[], error=None,
                               verdict=rec.verdict, trace_id=trace_id)
 
-    def redispatch(self, task_id: str, model: str | None = None) -> DispatchResult:
+    def redispatch(self, task_id: str, model: str | None = None,
+                   worker_id: str | None = None) -> DispatchResult:
         rec = self.task_store.get(task_id)
         if rec is None:
             raise KeyError(f"task not found: {task_id}")
         return self.dispatch(role=rec.role, prompt=rec.prompt,
-                             context_memory=None, model=model)
+                             context_memory=None, model=model,
+                             worker_id=worker_id)
 
 
 class RemoteDispatcher(Dispatcher):
@@ -114,21 +124,31 @@ class RemoteDispatcher(Dispatcher):
     def dispatch(self, role: str, prompt: str,
                  context_memory: str | None = None, model: str | None = None,
                  use_experience: bool = True,
-                 enable_subagents: bool | None = None) -> DispatchResult:
+                 enable_subagents: bool | None = None,
+                 worker_id: str | None = None) -> DispatchResult:
         # enable_subagents：远程模式下每次请求覆盖暂不转发到 worker，
         # worker 侧统一受全局 AGENT_/ORCH_SUBAGENTS_ENABLED 闸（kernel._build_options）控制。
-        worker = self.registry.select_worker(role, strategy=self.select_strategy)
-        if worker is None:
-            raise RuntimeError(f"无可用 {role} worker")
+        # worker_id 定点：resolve_worker 会抛 RuntimeError（从未注册/心跳超时），
+        # 在落库之前，保证失败零任务产生。
+        worker = self.registry.resolve_worker(role, strategy=self.select_strategy,
+                                              worker_id=worker_id)
+        # 定点时以节点的真实 role 为准（覆盖请求 role）：下游经验库/成本聚合/
+        # _route_model 按 TaskRecord.role 消费，写错会污染数据。
+        pinned = worker_id is not None
+        if pinned:
+            role = worker.role
         task_id = f"task-{uuid.uuid4().hex[:8]}"
         trace_id = new_trace_id()
         ts = self._now()
+        meta = {"model": model} if model else {}
+        if pinned:
+            meta["pinned"] = True
         self.task_store.write(TaskRecord(
             task_id=task_id, role=role, prompt=prompt, worker_id=worker.worker_id,
             status="pending", created_at=ts, updated_at=ts,
             output=None, artifacts=[], error=None,
             max_retries=self.max_retries,
-            trace_id=trace_id, meta={"model": model} if model else {},
+            trace_id=trace_id, meta=meta,
         ))
         log.info("[trace=%s] dispatch role=%s -> worker=%s task=%s",
                  trace_id, role, worker.worker_id, task_id)
@@ -169,9 +189,12 @@ class RemoteDispatcher(Dispatcher):
                     # 产物后置关卡审计（写入失败不阻断）
                     record_verdict_event(task_id, verdict)
                 # worker 回传 meta（usage/cost_usd/num_turns）并入 TaskRecord；
-                # brain 侧已记录路由 model，callback 同名字段以 worker 为准
+                # brain 侧已记录路由 model，callback 同名字段以 worker 为准；
+                # 定点标记须保留——redispatch 继承逻辑靠它判别
                 meta = {**({"model": model} if model else {}),
                         **(data.get("meta") or {})}
+                if pinned:
+                    meta["pinned"] = True
                 self.task_store.update(
                     task_id, status=st, output=out,
                     artifacts=arts, error=data.get("error"), verdict=verdict,
@@ -222,9 +245,16 @@ class RemoteDispatcher(Dispatcher):
                                 context_memory: str | None) -> str:
         return enrich_experience(self.experience_store, prompt, role, context_memory)
 
-    def redispatch(self, task_id: str, model: str | None = None) -> DispatchResult:
+    def redispatch(self, task_id: str, model: str | None = None,
+                   worker_id: str | None = None) -> DispatchResult:
+        """重派：显式 worker_id 优先；原任务若定点派发则沿用原节点。"""
         rec = self.task_store.get(task_id)
         if rec is None:
             raise KeyError(f"task not found: {task_id}")
+        # 定点继承：显式 worker_id 优先；否则原任务是定点派发（meta.pinned）
+        # 则沿用原节点，保持「重派 = 同一节点」语义。轮询派发的任务仍轮询。
+        if worker_id is None and rec.meta.get("pinned"):
+            worker_id = rec.worker_id
         return self.dispatch(role=rec.role, prompt=rec.prompt,
-                             context_memory=None, model=model)
+                             context_memory=None, model=model,
+                             worker_id=worker_id)

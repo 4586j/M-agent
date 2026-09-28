@@ -2,6 +2,7 @@ import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { Routes, Route, NavLink, useLocation, Link } from 'react-router-dom'
 import { usePolling } from './hooks/usePolling'
 import { api } from './api/client'
+import { useActiveConnection } from './api/connections'
 import Dashboard from './views/Dashboard'
 import Tasks from './views/Tasks'
 import NodeManage from './views/NodeManage'
@@ -62,6 +63,7 @@ function TopBar() {
   }, [])
 
   const connected = !stats.error
+  const activeConn = useActiveConnection()
 
   return (
     <header className="h-14 bg-white/85 backdrop-blur-md border-b border-mint-100 sticky top-0 z-40 px-6 flex items-center justify-between shadow-mint-sm">
@@ -102,6 +104,16 @@ function TopBar() {
       </div>
 
       <div className="flex items-center gap-3">
+        {/* 当前连接的 brain 名（多 brain 切换后跟随） */}
+        <div
+          className="hidden md:flex items-center gap-1.5 px-3 py-1 rounded-full text-xs border border-slate-200/70 bg-white/70 text-slate-600 max-w-[10rem]"
+          title="当前连接的 brain；点 🔑 管理/切换"
+        >
+          <span className="truncate">{activeConn.name || '默认'}</span>
+          {activeConn.baseUrl && (
+            <span className="text-[10px] text-slate-400 font-mono truncate">{activeConn.baseUrl}</span>
+          )}
+        </div>
         {/* SSE / 大脑连接状态：呼吸脉冲点 */}
         <div
           className={`hidden sm:flex items-center gap-2 px-3 py-1 rounded-full text-xs border ${

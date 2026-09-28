@@ -248,3 +248,161 @@ def test_remote_with_experience_enriches_and_records(tmp_path):
     assert exp.search_calls == 1
     assert len(exp.recorded) == 1
 
+
+# ---- 定点派发（worker_id）----
+
+def _remote_pinned_http(captured):
+    """捕获 POST 目标 URL 的假 http_call。"""
+    def fake_http(method, url, **kwargs):
+        if method == "POST":
+            captured["post_url"] = url
+            return {"status_code": 200,
+                    "json": {"task_id": "task-pin", "status": "accepted"}}
+        return {"status_code": 200, "json": {
+            "task_id": "task-pin", "status": "done",
+            "output": "ok", "artifacts": [], "error": None}}
+    return fake_http
+
+
+def test_remote_dispatcher_pinned_posts_to_target(tmp_path):
+    store = TaskStore(str(tmp_path))
+    reg = WorkerRegistry(heartbeat_timeout=45, now_fn=lambda: 0.0)
+    reg.register(make_info("A"))  # 127.0.0.1:8000
+    reg.register(WorkerInfo(
+        worker_id="B", role="executor", host="10.0.0.5", port=9001,
+        capabilities={}, last_heartbeat=0.0))
+    captured = {}
+    d = RemoteDispatcher(task_store=store, registry=reg,
+                         http_call=_remote_pinned_http(captured), now_fn=lambda: "t0")
+    res = d.dispatch(role="executor", prompt="do x", worker_id="B")
+    assert res.status == "done"
+    assert captured["post_url"] == "http://10.0.0.5:9001/task"
+    rec = store.get(res.task_id)
+    assert rec.worker_id == "B"
+    assert rec.meta.get("pinned") is True
+
+
+def test_remote_dispatcher_pinned_unknown_raises_no_task(tmp_path):
+    store = TaskStore(str(tmp_path))
+    reg = WorkerRegistry(heartbeat_timeout=45, now_fn=lambda: 0.0)
+    reg.register(make_info("A"))
+    calls = {"post": 0}
+
+    def fake_http(method, url, **kwargs):
+        calls["post"] += 1
+        return {"status_code": 200, "json": {}}
+
+    d = RemoteDispatcher(task_store=store, registry=reg, http_call=fake_http,
+                         now_fn=lambda: "t0")
+    try:
+        d.dispatch(role="executor", prompt="do x", worker_id="NOPE")
+        raise AssertionError("未知节点定点应抛 RuntimeError")
+    except RuntimeError as e:
+        assert "从未注册" in str(e)
+    assert calls["post"] == 0
+    assert store.list_all() == []  # 零任务落库
+
+
+def test_remote_dispatcher_pinned_dead_raises(tmp_path):
+    times = [100.0]
+    store = TaskStore(str(tmp_path))
+    reg = WorkerRegistry(heartbeat_timeout=45, now_fn=lambda: times[0])
+    reg.register(make_info("A"))
+    times[0] = 200.0
+    d = RemoteDispatcher(task_store=store, registry=reg,
+                         http_call=lambda *a, **k: None, now_fn=lambda: "t0")
+    try:
+        d.dispatch(role="executor", prompt="do x", worker_id="A")
+        raise AssertionError("超时节点定点应抛 RuntimeError")
+    except RuntimeError as e:
+        assert "心跳超时" in str(e)
+
+
+def test_remote_dispatcher_pinned_role_follows_worker(tmp_path):
+    """定点时以节点真实 role 为准（role 替换），经验/成本聚合数据真实。"""
+    store = TaskStore(str(tmp_path))
+    reg = WorkerRegistry(heartbeat_timeout=45, now_fn=lambda: 0.0)
+    reg.register(make_info("A"))  # executor
+    reg.register(WorkerInfo(
+        worker_id="G", role="security-guard", host="127.0.0.1", port=8001,
+        capabilities={}, last_heartbeat=0.0))
+    captured = {}
+    d = RemoteDispatcher(task_store=store, registry=reg,
+                         http_call=_remote_pinned_http(captured), now_fn=lambda: "t0")
+    res = d.dispatch(role="executor", prompt="do x", worker_id="G")
+    rec = store.get(res.task_id)
+    assert rec.worker_id == "G"
+    assert rec.role == "security-guard"  # 不是请求的 executor
+    assert rec.meta.get("pinned") is True
+
+
+def test_remote_dispatcher_pinned_redispatch_inherits_node(tmp_path):
+    """redispatch 沿用定点节点（meta.pinned 判别），不显式传也打回同一节点。"""
+    store = TaskStore(str(tmp_path))
+    reg = WorkerRegistry(heartbeat_timeout=45, now_fn=lambda: 0.0)
+    reg.register(make_info("A"))
+    reg.register(WorkerInfo(
+        worker_id="B", role="executor", host="10.0.0.5", port=9001,
+        capabilities={}, last_heartbeat=0.0))
+    captured = []
+
+    def fake_http(method, url, **kwargs):
+        if method == "POST":
+            captured.append(url)
+            return {"status_code": 200,
+                    "json": {"task_id": "task-r", "status": "accepted"}}
+        return {"status_code": 200, "json": {
+            "task_id": "task-r", "status": "done",
+            "output": "ok", "artifacts": [], "error": None}}
+
+    d = RemoteDispatcher(task_store=store, registry=reg, http_call=fake_http,
+                         now_fn=lambda: "t0")
+    first = d.dispatch(role="executor", prompt="orig", worker_id="B")
+    assert "10.0.0.5:9001" in captured[0]
+    second = d.redispatch(first.task_id)  # 不传 worker_id，应继承 B
+    assert len(captured) == 2
+    assert "10.0.0.5:9001" in captured[1]
+    assert store.get(second.task_id).worker_id == "B"
+
+
+def test_remote_dispatcher_unpinned_redispatch_round_robin(tmp_path):
+    """未定点任务 redispatch 不继承节点，仍走正常选择。"""
+    store = TaskStore(str(tmp_path))
+    reg = WorkerRegistry(heartbeat_timeout=45, now_fn=lambda: 0.0)
+    reg.register(make_info("A"))
+    captured = []
+
+    def fake_http(method, url, **kwargs):
+        if method == "POST":
+            captured.append(url)
+            return {"status_code": 200,
+                    "json": {"task_id": "task-u", "status": "accepted"}}
+        return {"status_code": 200, "json": {
+            "task_id": "task-u", "status": "done",
+            "output": "ok", "artifacts": [], "error": None}}
+
+    d = RemoteDispatcher(task_store=store, registry=reg, http_call=fake_http,
+                         now_fn=lambda: "t0")
+    first = d.dispatch(role="executor", prompt="orig")
+    assert store.get(first.task_id).meta.get("pinned") is None
+    d.redispatch(first.task_id)
+    assert "127.0.0.1:8000" in captured[1]
+
+
+def test_local_dispatcher_rejects_pin(tmp_path):
+    store = TaskStore(str(tmp_path))
+    d = LocalDispatcher(task_store=store, now_fn=lambda: "t0")
+    try:
+        d.dispatch(role="executor", prompt="do x", worker_id="A")
+        raise AssertionError("local 派发应拒绝外部定点")
+    except RuntimeError as e:
+        assert "不支持" in str(e) or "local" in str(e)
+    assert store.list_all() == []
+
+
+def test_local_dispatcher_accepts_local_pin(tmp_path):
+    store = TaskStore(str(tmp_path))
+    d = LocalDispatcher(task_store=store, now_fn=lambda: "t0")
+    res = d.dispatch(role="executor", prompt="do x", worker_id="local")
+    assert res.status == "done"
+

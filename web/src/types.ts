@@ -118,6 +118,8 @@ export interface DispatchBody {
   context_memory: string | null
   model: string | null
   force?: boolean
+  // 定点派发：指定目标节点 id（null/省略 = 按 role+strategy 自动选节点）
+  worker_id?: string | null
   // 子代理派发每次请求覆盖：null/省略=跟随全局；true/false=本次强制启用/禁用
   enable_subagents?: boolean | null
   // 引用历史任务的上下文记忆笔记并入本次派发（续做任务）

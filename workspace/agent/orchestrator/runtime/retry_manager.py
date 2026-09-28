@@ -135,9 +135,14 @@ class RetryManager:
         count = 0
         for rec in lost:
             try:
+                # 修复节点一致性：新派发定点到刚恢复的 worker（仅当 role 一致，
+                # 否则轮询选节点），因为下面 old 记录的 worker_id 会改写为该节点——
+                # 新任务若落到别处，任务记录与事实不符。
+                heal_pin = worker_id if w.role == rec.role else None
                 res = self.dispatcher.dispatch(
                     role=rec.role, prompt=rec.prompt,
-                    context_memory=self._retry_context(rec))
+                    context_memory=self._retry_context(rec),
+                    worker_id=heal_pin)
                 self.task_store.update(
                     rec.task_id, status="running",
                     worker_id=worker_id,

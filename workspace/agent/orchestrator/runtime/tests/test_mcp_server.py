@@ -52,6 +52,26 @@ def test_registered_tools_cover_framework_capabilities():
     assert len(names) <= 20  # 工具面收敛，防止 context 膨胀
 
 
+def test_dispatch_task_forwards_worker_id():
+    """定点派发经 MCP 工具透传 worker_id 进请求体。"""
+    from mcp_server import dispatch_task, dispatch_task_async
+    http = FakeHttp()
+    set_client(BrainClient(brain_url="http://brain:7000", http=http))
+    try:
+        dispatch_task("hello", worker_id="w-b")
+        assert http.calls[-1]["url"].endswith("/dispatch")
+        assert http.calls[-1]["json"]["worker_id"] == "w-b"
+
+        dispatch_task_async("hello", worker_id="w-b")
+        assert http.calls[-1]["url"].endswith("/dispatch/async")
+        assert http.calls[-1]["json"]["worker_id"] == "w-b"
+
+        dispatch_task("hello")  # 缺省不传
+        assert "worker_id" not in http.calls[-1]["json"]
+    finally:
+        set_client(None)
+
+
 def test_tools_route_through_client():
     from mcp_server import list_core_memories, list_recent_tasks, search_experiences
     http = FakeHttp(responses={

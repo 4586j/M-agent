@@ -417,3 +417,74 @@ def test_async_ablation_skips_experience_read(tmp_path):
     _run(d.dispatch_async(role="executor",
                           prompt="compute the total order amount"))
     assert "历史经验参考" in (seen.get("context_memory") or "")
+
+
+# ---- 定点派发（worker_id）----
+
+def test_dispatch_async_pinned_posts_to_target(tmp_path):
+    store = TaskStore(str(tmp_path))
+    reg = WorkerRegistry(heartbeat_timeout=45, now_fn=lambda: 0.0)
+    reg.register(make_info("A"))  # 127.0.0.1:8000
+    reg.register(WorkerInfo(
+        worker_id="B", role="executor", host="10.0.0.5", port=9001,
+        capabilities={}, last_heartbeat=0.0))
+    seen = {}
+
+    async def fake_http(method, url, **kwargs):
+        if method == "POST":
+            seen["post_url"] = url
+            return {"status_code": 200, "json": {"status": "accepted"}}
+        return {"status_code": 200, "json": {"status": "running"}}
+
+    d = AsyncRemoteDispatcher(
+        task_store=store, registry=reg, async_http=fake_http,
+        now_fn=lambda: "t0", poll_interval=0.01, poll_max=5,
+    )
+    task_id = _run(d.dispatch_async(role="executor", prompt="do x",
+                                    worker_id="B"))
+    assert seen["post_url"] == "http://10.0.0.5:9001/task"
+    rec = store.get(task_id)
+    assert rec.worker_id == "B"
+    assert rec.meta.get("pinned") is True
+
+
+def test_dispatch_async_pinned_unknown_raises_no_task(tmp_path):
+    store = TaskStore(str(tmp_path))
+    reg = WorkerRegistry(heartbeat_timeout=45, now_fn=lambda: 0.0)
+    reg.register(make_info("A"))
+
+    async def fake_http(method, url, **kwargs):
+        return {"status_code": 200, "json": {}}
+
+    d = AsyncRemoteDispatcher(
+        task_store=store, registry=reg, async_http=fake_http,
+        now_fn=lambda: "t0",
+    )
+    try:
+        _run(d.dispatch_async(role="executor", prompt="do x", worker_id="NOPE"))
+        raise AssertionError("未知节点异步定点应抛 RuntimeError")
+    except RuntimeError as e:
+        assert "从未注册" in str(e)
+    assert store.list_all() == []  # 零任务落库
+
+
+def test_dispatch_async_pinned_role_follows_worker(tmp_path):
+    store = TaskStore(str(tmp_path))
+    reg = WorkerRegistry(heartbeat_timeout=45, now_fn=lambda: 0.0)
+    reg.register(make_info("A"))  # executor
+    reg.register(WorkerInfo(
+        worker_id="G", role="data-expert", host="127.0.0.1", port=8005,
+        capabilities={}, last_heartbeat=0.0))
+
+    async def fake_http(method, url, **kwargs):
+        return {"status_code": 200, "json": {"status": "accepted"}}
+
+    d = AsyncRemoteDispatcher(
+        task_store=store, registry=reg, async_http=fake_http,
+        now_fn=lambda: "t0", poll_interval=0.01, poll_max=5,
+    )
+    task_id = _run(d.dispatch_async(role="executor", prompt="do x",
+                                    worker_id="G"))
+    rec = store.get(task_id)
+    assert rec.role == "data-expert"  # 节点真实 role 覆盖请求 role
+    assert rec.meta.get("pinned") is True

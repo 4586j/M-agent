@@ -1105,3 +1105,160 @@ def test_build_local_core_config_parity(tmp_path, monkeypatch):
     assert hasattr(core, "rag_enabled")
     assert hasattr(core, "task_budget_usd")
 
+
+
+# ── 定点派发（worker_id）──
+
+def test_dispatch_pinned_targets_worker(tmp_path):
+    """worker_id 定点：POST 打到目标节点，TaskRecord 落 worker_id + meta.pinned。"""
+    from dispatcher import RemoteDispatcher
+    from worker_registry import WorkerInfo
+    reg = WorkerRegistry(heartbeat_timeout=45, now_fn=lambda: 0.0)
+    reg.register(WorkerInfo(worker_id="A", role="executor", host="127.0.0.1",
+                            port=8001, capabilities={}, last_heartbeat=0.0))
+    reg.register(WorkerInfo(worker_id="B", role="executor", host="10.0.0.5",
+                            port=8002, capabilities={}, last_heartbeat=0.0))
+    store = TaskStore(str(tmp_path))
+    cfg = Config(mode="remote", task_store_dir=str(tmp_path), security_llm=False)
+    seen = {"post": []}
+
+    def fake_http(method, url, **kwargs):
+        if method == "POST":
+            seen["post"].append(url)
+            return {"status_code": 200, "json": {"status": "accepted"}}
+        return {"status_code": 200, "json": {"status": "done", "output": "ok",
+                                             "artifacts": [], "error": None}}
+
+    disp = RemoteDispatcher(task_store=store, registry=reg, http_call=fake_http,
+                            now_fn=lambda: "t0")
+    client = TestClient(create_brain_app(reg, store, cfg, dispatcher=disp))
+    r = client.post("/dispatch", json={"prompt": "hello", "role": "executor",
+                                       "worker_id": "B", "force": True})
+    assert r.status_code == 200
+    assert r.json()["status"] == "done"
+    assert seen["post"][0] == "http://10.0.0.5:8002/task"
+    rec = store.get(r.json()["task_id"])
+    assert rec.worker_id == "B"
+    assert rec.meta.get("pinned") is True
+
+
+def test_dispatch_pinned_dead_fails_no_task(tmp_path):
+    """定点到心跳超时节点：status failed 报错且不产生新任务。"""
+    from dispatcher import RemoteDispatcher
+    times = [100.0]
+
+    def now_fn():
+        return times[0]
+
+    reg = WorkerRegistry(heartbeat_timeout=45, now_fn=now_fn)
+    reg.register(WorkerInfo(worker_id="A", role="executor", host="127.0.0.1",
+                            port=8001, capabilities={}, last_heartbeat=0.0))
+    times[0] = 200.0  # 超时
+    store = TaskStore(str(tmp_path))
+    cfg = Config(mode="remote", task_store_dir=str(tmp_path), security_llm=False)
+    disp = RemoteDispatcher(task_store=store, registry=reg,
+                            http_call=lambda *a, **k: {"status_code": 200, "json": {}},
+                            now_fn=lambda: "t0")
+    client = TestClient(create_brain_app(reg, store, cfg, dispatcher=disp))
+    r = client.post("/dispatch", json={"prompt": "hello", "role": "executor",
+                                       "worker_id": "A", "force": True})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["status"] == "failed"
+    assert "心跳超时" in body["error"]
+    assert store.list_all() == []  # 零任务落库
+
+
+def test_dispatch_pinned_unknown_fails(tmp_path):
+    """定点到从未注册的节点：status failed 且错误信息说明从未注册。"""
+    from dispatcher import RemoteDispatcher
+    reg = WorkerRegistry(heartbeat_timeout=45, now_fn=lambda: 0.0)
+    reg.register(WorkerInfo(worker_id="A", role="executor", host="127.0.0.1",
+                            port=8001, capabilities={}, last_heartbeat=0.0))
+    store = TaskStore(str(tmp_path))
+    cfg = Config(mode="remote", task_store_dir=str(tmp_path), security_llm=False)
+    disp = RemoteDispatcher(task_store=store, registry=reg,
+                            http_call=lambda *a, **k: {"status_code": 200, "json": {}},
+                            now_fn=lambda: "t0")
+    client = TestClient(create_brain_app(reg, store, cfg, dispatcher=disp))
+    r = client.post("/dispatch", json={"prompt": "hello", "role": "executor",
+                                       "worker_id": "NOPE", "force": True})
+    assert r.json()["status"] == "failed"
+    assert "从未注册" in r.json()["error"]
+
+
+def test_dispatch_pinned_malformed_id_400(tmp_path):
+    """非法 worker_id 格式：400（validate_id 拒绝，不走 dispatcher）。"""
+    client, _, _ = make_app_remote(tmp_path)
+    r = client.post("/dispatch", json={"prompt": "hello", "role": "executor",
+                                       "worker_id": "A/B/../etc", "force": True})
+    assert r.status_code == 400
+
+
+def test_dispatch_async_pinned_targets_worker(tmp_path):
+    """异步定点派发：POST 打到目标节点并落 pinned。"""
+    import asyncio
+    from async_dispatcher import AsyncRemoteDispatcher
+    reg = WorkerRegistry(heartbeat_timeout=45, now_fn=lambda: 0.0)
+    reg.register(WorkerInfo(worker_id="A", role="executor", host="127.0.0.1",
+                            port=8001, capabilities={}, last_heartbeat=0.0))
+    reg.register(WorkerInfo(worker_id="B", role="executor", host="10.0.0.9",
+                            port=8003, capabilities={}, last_heartbeat=0.0))
+    store = TaskStore(str(tmp_path))
+    cfg = Config(mode="remote", task_store_dir=str(tmp_path), security_llm=False)
+    seen = {"post": []}
+
+    async def fake_async_http(method, url, **kwargs):
+        if method == "POST":
+            seen["post"].append(url)
+        return {"status_code": 200, "json": {"status": "accepted"}}
+
+    async_disp = AsyncRemoteDispatcher(
+        task_store=store, registry=reg, async_http=fake_async_http,
+        now_fn=lambda: "t0")
+    client = TestClient(create_brain_app(reg, store, cfg, async_dispatcher=async_disp))
+    r = client.post("/dispatch/async", json={"prompt": "hello", "role": "executor",
+                                             "worker_id": "B", "force": True})
+    assert r.status_code == 200
+    assert r.json()["status"] == "accepted"
+    assert seen["post"][0] == "http://10.0.0.9:8003/task"
+    rec = store.get(r.json()["task_id"])
+    assert rec.worker_id == "B"
+    assert rec.meta.get("pinned") is True
+
+
+def test_approval_restores_pinned_worker(tmp_path, monkeypatch):
+    """审批连续性：被拦截的定点派发，批准后仍打到原定点节点。"""
+    from dispatcher import RemoteDispatcher
+    from unittest.mock import patch
+    reg = WorkerRegistry(heartbeat_timeout=45, now_fn=lambda: 0.0)
+    reg.register(WorkerInfo(worker_id="A", role="executor", host="127.0.0.1",
+                            port=8001, capabilities={}, last_heartbeat=0.0))
+    reg.register(WorkerInfo(worker_id="B", role="executor", host="10.0.0.5",
+                            port=8002, capabilities={}, last_heartbeat=0.0))
+    store = TaskStore(str(tmp_path))
+    cfg = Config(mode="remote", task_store_dir=str(tmp_path), security_llm=False)
+    seen = {"post": []}
+
+    def fake_http(method, url, **kwargs):
+        if method == "POST":
+            seen["post"].append(url)
+            return {"status_code": 200, "json": {"status": "accepted"}}
+        return {"status_code": 200, "json": {"status": "done", "output": "ok",
+                                             "artifacts": [], "error": None}}
+
+    disp = RemoteDispatcher(task_store=store, registry=reg, http_call=fake_http,
+                            now_fn=lambda: "t0")
+    client = TestClient(create_brain_app(reg, store, cfg, dispatcher=disp))
+    with patch("brain_api.security_check",
+               return_value={"verdict": "block", "reason": "dangerous"}):
+        r = client.post("/dispatch", json={"prompt": "rm -rf /", "role": "executor",
+                                           "worker_id": "B"})
+    assert r.json()["status"] == "awaiting_approval"
+    task_id = r.json()["task_id"]
+    assert store.get(task_id).meta["approval"]["worker_id"] == "B"
+    assert seen["post"] == []  # 拦截未产生真实派发
+    r2 = client.post(f"/tasks/{task_id}/approve", json={})
+    assert r2.status_code == 200
+    assert r2.json()["approved"] is True
+    assert seen["post"][0] == "http://10.0.0.5:8002/task"  # approve 恢复原定点
