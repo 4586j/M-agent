@@ -69,16 +69,20 @@ class FakeKernel:
         self.oneshot_calls = []       # (prompt, cancel_event)
         self.sessions = []
 
-    def stream(self, prompt, persona, cwd, context_memory=""):
+    def stream(self, prompt, persona, cwd, context_memory="",
+               run_id=None, event_sink=None):
         events = self.events
 
         async def gen():
             for ev in events:
+                if event_sink is not None and run_id:
+                    event_sink(run_id, {"seq": 0, "ts": 0, "type": ev.type,
+                                        "data": ev.data})
                 yield ev
         return gen()
 
     def run_oneshot(self, prompt, persona, cwd, context_memory="",
-                    cancel_event=None):
+                    cancel_event=None, run_id=None, event_sink=None):
         self.oneshot_calls.append((prompt, cancel_event))
         if self.oneshot_delay:
             deadline = time.monotonic() + self.oneshot_delay

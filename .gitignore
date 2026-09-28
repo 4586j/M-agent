@@ -42,3 +42,8 @@ workspace/agent/orchestrator/runtime/.tasks-run/
 workspace/agent/orchestrator/runtime/.exp-run/
 workspace/agent/orchestrator/runtime/.sched-run/
 workspace/agent/orchestrator/runtime/.proc-run/
+
+# Agent 面板/服务运行时
+.zcode/
+workspace/agent/skills/orchestrator/memory/context/task-*/
+result/.last_run_id
