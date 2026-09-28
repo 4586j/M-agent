@@ -42,6 +42,27 @@ export interface NodeStatus {
 // awaiting_approval：安全拦截后等待人工审批（非终态，不参与重试/回收）
 export type TaskStatus = 'pending' | 'running' | 'done' | 'failed' | 'lost' | 'cancelled' | 'awaiting_approval'
 
+/** 终态（任务生命周期终结，不再有状态迁移）：done/failed/lost/cancelled。awaiting_approval 非终态 */
+export const TERMINAL_STATUSES: readonly TaskStatus[] = ['done', 'failed', 'lost', 'cancelled']
+
+// 状态 → 渲染 class 单点权威（docs/客户端界面设计.md §5 语义）：
+// done=Emerald(mint) · running/pending=Sky/Slate · awaiting_approval=Amber · failed=Rose。
+// dot=状态圆点背景，badge=小徽章（bg+fg），两处 UI 共用同一映射，防色值漂移。
+export const STATUS_RENDER: Record<TaskStatus, { dot: string; badge: string }> = {
+  pending: { dot: 'bg-slate-300', badge: 'bg-slate-100 text-slate-600' },
+  running: { dot: 'bg-sky-400', badge: 'bg-sky-100 text-sky-700' },
+  done: { dot: 'bg-mint-500', badge: 'bg-mint-100 text-mint-700' },
+  failed: { dot: 'bg-rose-500', badge: 'bg-rose-100 text-rose-700' },
+  lost: { dot: 'bg-slate-400', badge: 'bg-slate-200 text-slate-600' },
+  cancelled: { dot: 'bg-zinc-400', badge: 'bg-zinc-200 text-zinc-600' },
+  awaiting_approval: { dot: 'bg-amber-400', badge: 'bg-amber-100 text-amber-700' },
+}
+
+/** 状态 → 圆点 class（未知状态兜底 slate） */
+export const statusDot = (s: string): string => STATUS_RENDER[s as TaskStatus]?.dot ?? 'bg-slate-300'
+/** 状态 → 徽章 class（未知状态兜底 slate） */
+export const statusBadge = (s: string): string => STATUS_RENDER[s as TaskStatus]?.badge ?? 'bg-slate-100 text-slate-600'
+
 /** worker 回传的 token 明细（口径与 eval/run_eval 一致） */
 export interface TaskUsage {
   input_tokens?: number

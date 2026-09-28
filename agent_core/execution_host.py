@@ -1,3 +1,7 @@
+# NOTE: 预留模块（仅被 agent_core/tests 引用，无生产代码引用）。
+# 未接入内核的执行路径；若未来启用需接线到 kernel/worker，且删除时
+# 仅删本文件与对应测试。是否有必要保留由项目组评估。
+
 """Owned execution host：进程所有权、有界准入与 Windows 安全的进程树清理。
 
 可靠性方案 Slice 3「bounded execution」的执行侧原语：

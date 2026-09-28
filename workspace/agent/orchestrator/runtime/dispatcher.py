@@ -1,4 +1,4 @@
-"""派发抽象。LocalDispatcher 保留 V1；RemoteDispatcher 走 HTTP 到 worker。"""
+"""派发抽象。RemoteDispatcher 走 HTTP 到 worker（首选）；LocalDispatcher 为 V1 兼容。"""
 import logging
 import time
 import uuid
@@ -6,7 +6,8 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from dispatch_common import is_text_artifact, enrich_experience, write_result_note
+from dispatch_common import (is_text_artifact, enrich_experience,
+                             write_result_note, put_provider_name, provider_body)
 from event_bus import TaskEventBus, publish_task_event
 from task_store import TaskStore, TaskRecord, new_trace_id
 from worker_registry import WorkerRegistry
@@ -53,7 +54,12 @@ class Dispatcher(ABC):
 
 
 class LocalDispatcher(Dispatcher):
-    """V1 兼容：记录任务并标记 done。真实本地执行由主会话 Agent 工具完成。"""
+    """[deprecated] V1 兼容：记录任务并标记 done。
+
+    仅主会话 Agent 工具直连的历史约定保留（tests/test_dispatcher 覆盖其
+    本地派发语义）；生产装配一律走 RemoteDispatcher / LocalExecutorDispatcher。
+    本地真实执行请用 LocalExecutorDispatcher（进程内跑 AgentKernel），不要新接本类。
+    """
 
     def __init__(self, task_store: TaskStore, now_fn: Callable[[], str] | None = None,
                  product_check: Callable[[str], dict] | None = None,
@@ -79,8 +85,7 @@ class LocalDispatcher(Dispatcher):
         meta: dict = {}
         if model:
             meta["model"] = model
-        if provider and provider.get("name"):
-            meta["provider"] = provider["name"]
+        put_provider_name(meta, provider)
         rec = TaskRecord(
             task_id=task_id, role=role, prompt=prompt, worker_id="local",
             status="done", created_at=ts, updated_at=ts,
@@ -155,11 +160,11 @@ class RemoteDispatcher(Dispatcher):
         trace_id = new_trace_id()
         ts = self._now()
         meta = {"model": model} if model else {}
+        meta["use_experience"] = bool(use_experience)  # 与 async/local 统一口径
         if pinned:
             meta["pinned"] = True
         # 只记 provider 名进 meta（密钥绝不落盘）；三元组走瞬时 body
-        if provider and provider.get("name"):
-            meta["provider"] = provider["name"]
+        put_provider_name(meta, provider)
         self.task_store.write(TaskRecord(
             task_id=task_id, role=role, prompt=prompt, worker_id=worker.worker_id,
             status="pending", created_at=ts, updated_at=ts,
@@ -181,12 +186,7 @@ class RemoteDispatcher(Dispatcher):
         if model:
             body["model"] = model
         # provider 三元组瞬时转发 worker（内存仅本次任务；不落任何持久化）
-        if provider:
-            body["provider"] = provider.get("name")
-            if provider.get("base_url"):
-                body["provider_base_url"] = provider["base_url"]
-            if provider.get("auth_token"):
-                body["provider_auth_token"] = provider["auth_token"]
+        body.update(provider_body(provider))
         resp = self.http_call("POST", f"{base}/task", json=body)
         if resp.get("status_code") != 200:
             log.warning("[trace=%s] task=%s post failed: %s", trace_id, task_id, resp)
@@ -213,14 +213,14 @@ class RemoteDispatcher(Dispatcher):
                     # 产物后置关卡审计（写入失败不阻断）
                     record_verdict_event(task_id, verdict)
                 # worker 回传 meta（usage/cost_usd/num_turns）并入 TaskRecord；
-                # brain 侧已记录路由 model，callback 同名字段以 worker 为准；
-                # 定点标记须保留——redispatch 继承逻辑靠它判别
-                meta = {**({"model": model} if model else {}),
-                        **(data.get("meta") or {})}
+                # brain 侧已记录路由 model/callback 同名字段以 worker 为准；定点标记与
+                # use_experience 须保留（redispatch 继承 / 消融状态口径靠它判别）
+                meta = {"model": model} if model else {}
+                meta["use_experience"] = bool(use_experience)
                 if pinned:
                     meta["pinned"] = True
-                if provider and provider.get("name"):
-                    meta["provider"] = provider["name"]
+                put_provider_name(meta, provider)
+                meta = {**meta, **(data.get("meta") or {})}
                 self.task_store.update(
                     task_id, status=st, output=out,
                     artifacts=arts, error=data.get("error"), verdict=verdict,

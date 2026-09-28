@@ -1,4 +1,5 @@
 import type { CostStats } from '../types'
+import { fmtNum, fmtUsd } from '../utils'
 
 /** 成本看板：按日（近 7 天）条形 + 按模型占比列表，数据来自 /stats.cost */
 export default function CostPanel({ cost }: { cost?: CostStats }) {
@@ -70,18 +71,6 @@ export default function CostPanel({ cost }: { cost?: CostStats }) {
 function barPct(v: number | null, max: number): number {
   if (v == null || max <= 0) return 0
   return Math.max(2, Math.round((v / max) * 100))
-}
-
-function fmtUsd(v: number | null): string {
-  if (v == null) return '-'
-  return `$${v >= 0.01 || v === 0 ? v.toFixed(2) : v.toFixed(4)}`
-}
-
-function fmtNum(v: number | null): string {
-  if (v == null) return '-'
-  if (v >= 1e6) return `${(v / 1e6).toFixed(1)}M`
-  if (v >= 1e3) return `${(v / 1e3).toFixed(1)}K`
-  return String(v)
 }
 
 function Empty({ text }: { text: string }) {

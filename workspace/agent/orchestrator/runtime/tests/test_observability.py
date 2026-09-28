@@ -426,7 +426,7 @@ def test_aggregate_quality_pure_function():
     """meta=None/空/非法 degenerate/model 缺失归空键/rate 精度（round 4 位）。"""
     import pytest
     from types import SimpleNamespace
-    from brain_api import _aggregate_quality
+    from brain_routers import _aggregate_quality
     tasks = [
         SimpleNamespace(meta={"model": "sonnet",
                               "degenerate": {"detected": True}}),
@@ -453,7 +453,7 @@ def test_aggregate_costs_pure_function_edges():
     import pytest
     from datetime import datetime
     from types import SimpleNamespace
-    from brain_api import _aggregate_costs
+    from brain_routers import _aggregate_costs
     now = time.time()
     ts = now - 1800  # 窗口内（近 7 天）
     tasks = [

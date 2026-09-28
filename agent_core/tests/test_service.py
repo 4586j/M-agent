@@ -388,19 +388,19 @@ def test_memory_core_invalid_name_rejected(client):
     assert r.status_code == 400
     assert r.json()["code"] == "invalid_name"
     # 直接调用校验函数验证穿越名
-    assert not service._valid_memory_name("a/b")
-    assert not service._valid_memory_name("..")
+    assert not service.valid_memory_name("a/b")
+    assert not service.valid_memory_name("..")
     # Windows 保留设备名一律拒绝（大小写不敏感）：写入会被设备吞
     for bad in ("NUL", "nul", "CON", "con", "AUX", "PRN",
                 "com1", "COM1", "lpt9", "LPT9"):
-        assert not service._valid_memory_name(bad), bad
+        assert not service.valid_memory_name(bad), bad
     # 保留名走 HTTP 层同样 400（GET/PUT 一致）
     assert client.get("/agent/memory/core/NUL").status_code == 400
     r = client.put("/agent/memory/core/CON", json={"content": "x"})
     assert r.status_code == 400
     assert r.json()["code"] == "invalid_name"
     # 含保留名子串的正常名字不受影响
-    assert service._valid_memory_name("nul_backup")
+    assert service.valid_memory_name("nul_backup")
 
 
 # ---- /agent/status 拆分 ----

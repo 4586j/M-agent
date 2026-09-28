@@ -73,6 +73,10 @@ class ExperienceStore:
         self.max_count = max_count
         self.ttl_days = ttl_days
         self._cache: list[ExperienceRecord] | None = None
+        # 查询 embedding 缓存（query 相同跳过重编码）：重试/同 prompt 派发是热点
+        self._query_embeddings: dict[str, object] = {}
+        # 向量打分粗筛上限：关键词 TOP-K 之外的记录不再做余弦（召回有界折衷）
+        self._COARSE_TOP_K = 128
         # 命中计数批量刷盘：内存即时更新，磁盘落盘延后到阈值批量执行，消除写放大
         self._pending_dump: dict[str, ExperienceRecord] = {}
         self._hits_counter = 0
@@ -226,7 +230,10 @@ class ExperienceStore:
 
         kw_ranked = self._search_keyword(query, candidates, limit=len(candidates))
         if self.embedding_model:
-            vec_ranked = self._search_vector(query, candidates, limit=len(candidates))
+            # 向量打分只跑关键词粗筛 top-K，避免对全库逐条余弦（检索热点；
+            # 库小于粗筛 K 时等价于旧的全量行为，召回无损失）
+            coarse = kw_ranked[:self._COARSE_TOP_K] or candidates[:self._COARSE_TOP_K]
+            vec_ranked = self._search_vector(query, coarse, limit=len(coarse))
             fused = _rrf_fuse([kw_ranked, vec_ranked])
             results = [rec for rec, _ in fused]
         else:
@@ -237,7 +244,12 @@ class ExperienceStore:
 
     def _search_vector(self, query: str, candidates: list[ExperienceRecord],
                        limit: int) -> list[ExperienceRecord]:
-        query_vec = self.embedding_model.encode(query)
+        # 同 query 跳过重编码（重试/同 prompt 派发命中缓存），编码是本地 embedding
+        # 模型的核心成本
+        query_vec = self._query_embeddings.get(query)
+        if query_vec is None:
+            query_vec = self.embedding_model.encode(query)
+            self._query_embeddings[query] = query_vec
         scored = []
         for rec in candidates:
             if rec.embedding is None:

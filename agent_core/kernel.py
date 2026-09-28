@@ -16,7 +16,7 @@ import logging
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Callable
 
 from agent_core.config import AgentConfig
 from agent_core.context import build_system_prompt, build_user_message_prefix
@@ -25,11 +25,15 @@ from agent_core.output_guard import detect_degenerate
 from agent_core.persona import Persona, replace_persona
 from agent_core.result_validator import validate_output, build_correction_hint
 from agent_core.prompt_guard import detect_injection
-from agent_core.tools import build_memory_mcp_server, load_mcp_servers, scan_skills
+from agent_core.tools import (build_memory_mcp_server, ensure_runtime_on_path,
+                              load_mcp_servers, scan_skills)
 from agent_core.trace import ExecutionTracer
 
 # 进程内记忆工具挂载为 SDK MCP server 时用的服务名（工具全名前缀 mcp__agent_memory__）
 _MEMORY_SERVER_NAME = "agent_memory"
+
+# 产物扫描排除目录：repo/缓存/依赖树与任务产物无关，跳过避免全量递归拖慢收尾
+_EXCLUDED_ARTIFACT_DIRS = {".git", "__pycache__", "node_modules"}
 
 # RAG 拼接到 prompt 前的经验块限幅（字符）：上下文是稀缺注意力预算，防噪声注入。
 # 从 cli.py 下沉至此，kernel 是唯一 prompt 拼装点（oneshot / stream / session 共用）。
@@ -50,13 +54,63 @@ _GUARD_RETRY_HINT = ("[系统提示] 上一次输出异常（{reason}）。"
 # 防底层子进程卡死时排空无限阻塞
 _DRAIN_WAIT_SECONDS = 5.0
 
-# 守卫重试的预算闸门：累计花费达 task_budget_usd 的该比例后不再重试
+# 守卫重试的预算闸门：累计花费达 task_budget_usd 的该比例后不再重试（硬停止）
 _BUDGET_GUARD_STOP_RATIO = 0.8
 
-# 自纠错闭环：修正提示前缀（注入 prompt 引导 Agent 修正）
-_CORRECTION_HINT_PREFIX = "[验证反馈] 上次输出存在以下问题，请修正后重新输出："
+# 会话预算软预警阈值（占 task_budget_usd 比例）：达到即触发一次提醒，
+# 与 _BUDGET_GUARD_STOP_RATIO 语义不同——这只是告警，不改 SDK 硬熔断行为
+_BUDGET_WARN_RATIOS = (0.8, 0.95)
 
 log = logging.getLogger(__name__)
+
+# 指纹缓存空值哨兵：与 None 区分（None 也是合法缓存结果，如 MCP 配置缺失）
+_OPT_MISS = object()
+
+
+def _loc_signature(root: str | Path | None, pattern: str) -> tuple:
+    """轻量目录指纹：(相对路径, mtime_ns, size) 排序元组。只 stat 不读内容。
+
+    供跨 run 稳定输入（skills 目录 / 核心记忆目录）的指纹缓存失效判定——
+    文件增删改都会改变签名从而重建，比 scan/read 内容便宜得多；
+    目录不存在返回空元组。
+    """
+    if not root:
+        return ()
+    base = Path(root)
+    if not base.is_dir():
+        return ()
+    parts = []
+    for p in sorted(base.glob(pattern)):
+        try:
+            st = p.stat()
+        except OSError:
+            continue
+        parts.append((str(p.relative_to(base)), st.st_mtime_ns, st.st_size))
+    return tuple(parts)
+
+
+def _file_signature(path: str | Path | None) -> tuple:
+    """单文件指纹（mtime_ns + size）；路径缺失返回空元组。"""
+    if not path:
+        return ()
+    try:
+        st = Path(path).stat()
+    except OSError:
+        return ()
+    return (str(Path(path).resolve()), st.st_mtime_ns, st.st_size)
+
+
+def _collect_artifacts(cwd_path: Path) -> list[str]:
+    """递归收集 cwd 下产物文件相对路径；跳过排除目录子树。"""
+    excluded = _EXCLUDED_ARTIFACT_DIRS
+    out: list[str] = []
+    for p in cwd_path.rglob("*"):
+        if not p.is_file():
+            continue
+        if any(part in excluded for part in p.relative_to(cwd_path).parts[:-1]):
+            continue
+        out.append(str(p.relative_to(cwd_path)))
+    return out
 
 
 def _retrieve_experiences(prompt: str, config: AgentConfig) -> list[tuple[str, str]]:
@@ -66,11 +120,7 @@ def _retrieve_experiences(prompt: str, config: AgentConfig) -> list[tuple[str, s
     检索失败返回空列表，不拖垮主流程。独立成函数便于测试 monkeypatch。
     """
     try:
-        import sys
-        rt = (Path(config.project_root) / "workspace" / "agent"
-              / "orchestrator" / "runtime")
-        if str(rt) not in sys.path:
-            sys.path.insert(0, str(rt))
+        ensure_runtime_on_path(config)
         from experience_store import ExperienceStore
         store = ExperienceStore(config.experience_store_dir)
         similar = store.search(prompt, successful_only=True, limit=3)
@@ -159,6 +209,30 @@ class KernelResult:
     meta: dict = field(default_factory=dict)
 
 
+def _tool_use_event(block: Any) -> AgentEvent:
+    """把 SDK 的 ToolUseBlock 构造为 tool_use 事件（完整消息与增量过滤共用）。"""
+    return AgentEvent("tool_use", {
+        "name": getattr(block, "name", None),
+        "input": getattr(block, "input", None),
+    })
+
+
+def _error_result_frame(error_type: str, session_id=None,
+                        result: str = "", **extra) -> dict:
+    """统一错误终结 result 事件帧（流式超时 / 流异常 no_result / 质检挡下共用）。
+
+    各「异常收场」路径填写同一组字段，避免错误分类（error_type）或统计字段
+    在某一处漏填差异化（此前超时与 no_result 两帧逐字重复）。
+    """
+    data = {
+        "result": result, "num_turns": 0, "is_error": True,
+        "usage": None, "cost_usd": None, "duration_ms": 0,
+        "session_id": session_id, "error_type": error_type,
+    }
+    data.update(extra)
+    return data
+
+
 def _msg_to_events(msg: Any) -> list[AgentEvent]:
     """把一条 SDK 消息翻译成 0..n 个 AgentEvent。
 
@@ -175,10 +249,7 @@ def _msg_to_events(msg: Any) -> list[AgentEvent]:
             elif kind == "ThinkingBlock":
                 events.append(AgentEvent("thinking", getattr(block, "thinking", "") or ""))
             elif kind == "ToolUseBlock":
-                events.append(AgentEvent("tool_use", {
-                    "name": getattr(block, "name", None),
-                    "input": getattr(block, "input", None),
-                }))
+                events.append(_tool_use_event(block))
     elif name == "UserMessage":
         # 工具执行结果通常以 UserMessage(ToolResultBlock) 形式回流
         for block in getattr(msg, "content", []) or []:
@@ -262,10 +333,7 @@ class _StreamFilter:
             for block in getattr(msg, "content", []) or []:
                 kind = type(block).__name__
                 if kind == "ToolUseBlock":
-                    events.append(AgentEvent("tool_use", {
-                        "name": getattr(block, "name", None),
-                        "input": getattr(block, "input", None),
-                    }))
+                    events.append(_tool_use_event(block))
                 elif kind == "TextBlock" and not saw_text:
                     events.append(AgentEvent("text_delta", getattr(block, "text", "") or ""))
                 elif kind == "ThinkingBlock" and not saw_think:
@@ -347,6 +415,17 @@ def _plan_summary(plan) -> str:
     return "\n".join(lines)
 
 
+def _persist_plan(mgr, session_id: str, plan, emitter) -> None:
+    """保存计划到磁盘并向外发出 plan_update 事件（两步固定组合）。
+
+    Plan-Execute 多处状态迁移需要「持久化 + 通知」成对执行，统一入口避免
+    漏掉某一边（此前续跑重置/规划/步骤成功/失败/重规划各有一次复制）。
+    """
+    mgr.save_plan(session_id, plan)
+    if emitter:
+        emitter.emit("plan_update", plan.to_dict())
+
+
 class AgentSession:
     """多轮交互会话。包装 ClaudeSDKClient，维持 session_id 与累计用量。"""
 
@@ -376,7 +455,7 @@ class AgentSession:
         await self._client.connect()
 
     def _check_budget_warnings(self) -> list[dict]:
-        """按累计 cost 检查 task_budget_usd 的 80% / 95% 软预警。
+        """按累计 cost 检查 task_budget_usd 的软预警（_BUDGET_WARN_RATIOS）。
 
         每个阈值最多提醒一次（_warned 去重），不改 SDK 硬熔断行为。
         无预算配置或累计为 0 时返回空。
@@ -385,7 +464,7 @@ class AgentSession:
         if not budget or self._total_cost <= 0:
             return []
         out: list[dict] = []
-        for threshold in (0.8, 0.95):
+        for threshold in _BUDGET_WARN_RATIOS:
             if threshold not in self._warned and self._total_cost >= budget * threshold:
                 self._warned.add(threshold)
                 out.append({
@@ -419,7 +498,7 @@ class AgentSession:
                 session_id=d.get("session_id") or self._session_id,
                 meta={"degenerate": degen} if degen else {},
             )
-            self._kernel._record_experience(raw_prompt, self._persona, kr, self._cwd)
+            self._kernel._record_experience(raw_prompt, self._persona, kr)
         except Exception:  # noqa: BLE001 - 经验沉淀失败不影响会话
             pass
 
@@ -500,12 +579,9 @@ class AgentSession:
         injection_result = self._kernel._check_prompt_injection(prompt)
         if injection_result is not None:
             yield AgentEvent("error", injection_result.output)
-            yield AgentEvent("result", {
-                "result": injection_result.output, "num_turns": 0,
-                "is_error": True, "usage": None, "cost_usd": None,
-                "duration_ms": 0, "session_id": self._session_id,
-                "injection": injection_result.meta.get("injection"),
-            })
+            yield AgentEvent("result", _error_result_frame(
+                "", self._session_id, result=injection_result.output,
+                injection=injection_result.meta.get("injection")))
             return
         # session_id 是流内消息路由标识，SDK 约定用 "default"；
         # 会话续接靠 connect() 时把 self._session_id 作为 resume 选项，与此无关。
@@ -656,6 +732,9 @@ class AgentKernel:
         self._last_progress: dict = {}
         # 结果翻译服务（惰性构造）：仅 result_translate_enabled 开启时首次用到才建。
         self._translator = None
+        # 跨 run 稳定输入指纹缓存（skills / 核心记忆 / MCP 配置）：_build_options
+        # 每 run/每 step 复用，避免 5 步任务 ≈6 次重复全量初始化 → 1 次。
+        self._build_cache: dict[tuple, Any] = {}
 
     def _check_prompt_injection(self, prompt: str) -> "KernelResult | None":
         """Prompt Injection 检测。返回 None 表示通过，否则返回拒绝/告警结果。
@@ -704,6 +783,64 @@ class AgentKernel:
         path.write_text(json.dumps(settings, indent=2), encoding="utf-8")
         return str(path)
 
+    # ---- 跨 run 稳定输入指纹缓存（批次三性能）----
+
+    def _get_or_build(self, key: tuple, builder: Callable[[], Any]) -> Any:
+        """按指纹键取缓存；未命中则构建并缓存。用哨兵而非 None 判命中。"""
+        v = self._build_cache.get(key, _OPT_MISS)
+        if v is _OPT_MISS:
+            v = builder()
+            self._build_cache[key] = v
+        return v
+
+    def _skills_dir(self) -> Path:
+        return Path(self.config.project_root) / "workspace" / "agent" / "skills"
+
+    def _cached_scan_skills(self) -> list[dict]:
+        """scan_skills 按 skills 目录指纹缓存：内容增删改自动重建。"""
+        sig = _loc_signature(self._skills_dir(), "*/SKILL.md")
+        return self._get_or_build(("skills", sig),
+                                  lambda: scan_skills(self.config.project_root))
+
+    def _cached_system_prompt(self, persona: Persona, skills: list[dict],
+                              query: str = "") -> str:
+        """build_system_prompt 按输入指纹缓存：persona 正文/子代理、skills 内容、
+        核心记忆目录指纹、memory_backend 与 query（retrieval 开启时）都入键。
+
+        query 为空（retrieval 关闭）时同一人设全程复用同一 system_prompt；
+        retrieval 开启时随任务 query 变化，缓存退化为按 query 分桶。
+        """
+        persona_part = (persona.name or "", persona.system_prompt or "",
+                        json.dumps(persona.sub_agents or [], sort_keys=True,
+                                   ensure_ascii=False, default=str))
+        skills_part = json.dumps(skills, sort_keys=True, ensure_ascii=False,
+                                 default=str)
+        mem_sig = _loc_signature(self.config.memory_core_dir, "*.md")
+        key = ("sysprompt", persona_part, skills_part, mem_sig,
+               self.config.memory_backend, query)
+        return self._get_or_build(
+            key,
+            lambda: build_system_prompt(
+                persona, self.config.project_root, self.config.memory_core_dir,
+                skills, memory_backend=self.config.memory_backend, query=query))
+
+    def _cached_disk_mcp_servers(self) -> Any:
+        """磁盘 MCP 配置（.mcp.json）按文件指纹缓存；config.mcp_servers 注入覆盖不经此缓存。"""
+        sig = _file_signature(self.config.mcp_config_path)
+        return self._get_or_build(
+            ("mcp_disk", sig),
+            lambda: load_mcp_servers(self.config.mcp_config_path))
+
+    def _cached_memory_mcp_server(self) -> Any:
+        """进程内记忆 MCP server 按核心记忆目录指纹 + 后端配置缓存（构建成本高）。"""
+        mem_sig = _loc_signature(self.config.memory_core_dir, "*.md")
+        conf = (self.config.memory_backend, self.config.memory_core_dir,
+                self.config.memory_context_dir, self.config.experience_store_dir,
+                getattr(self.config, "embedding_model", "") or "",
+                self.config.brain_url if self.config.memory_backend == "remote" else "")
+        return self._get_or_build(("mem_tools", mem_sig, conf),
+                                  lambda: build_memory_mcp_server(self.config))
+
     def _build_options(self, persona: Persona, cwd: str,
                        resume_session_id: str | None = None,
                        query: str = "") -> Any:
@@ -720,12 +857,12 @@ class AgentKernel:
         """
         import claude_agent_sdk as sdk
 
-        skills = scan_skills(self.config.project_root)
-        system_prompt = build_system_prompt(
-            persona, self.config.project_root, self.config.memory_core_dir, skills,
-            memory_backend=self.config.memory_backend,
-            query=query if self.config.memory_core_retrieval else "",
-        )
+        # 稳定输入经指纹缓存复用（扫描 topics、核心记忆、MCP 配置在任务期间
+        # 几乎不变；任何文件增删改都会改变指纹自动重建，行为等价）
+        skills = self._cached_scan_skills()
+        system_prompt = self._cached_system_prompt(
+            persona, skills,
+            query=query if self.config.memory_core_retrieval else "")
         model = persona.model or self.config.model
 
         # 无人值守权限：bypassPermissions（Windows 不可用）→ 任务目录 settings + acceptEdits
@@ -786,12 +923,12 @@ class AgentKernel:
         # 传对象会在 SDK 序列化 CLI 参数时 str.join 报错，且会顶掉全部内置工具）。
         mcp_servers = dict(
             self.config.mcp_servers
-            or load_mcp_servers(self.config.mcp_config_path)
+            or self._cached_disk_mcp_servers()
             or {}
         )
         # 记忆工具构建可能因 runtime 不可达/依赖缺失而报错，不能拖垮整个选项构建
         try:
-            mem_server = build_memory_mcp_server(self.config)
+            mem_server = self._cached_memory_mcp_server()
             if mem_server:
                 mcp_servers[_MEMORY_SERVER_NAME] = mem_server
         except Exception:  # noqa: BLE001 - 记忆工具失败不阻断主执行
@@ -952,19 +1089,17 @@ class AgentKernel:
                 result, prompt, persona, cwd, context_memory, cancel_event, tracer,
                 deadline, emitter=emitter)
 
-        # artifacts 收集：仅在未取消/未报错且 cwd 存在时扫描产物文件
+        # artifacts 收集：仅在未取消/未报错且 cwd 存在时扫描产物文件。
+        # 排除 .git/__pycache__/node_modules 子树，避免成功收尾被无关大目录拖慢
         if not result.cancelled and not result.is_error:
             cwd_path = Path(cwd)
             if cwd_path.is_dir():
-                result.artifacts = [
-                    str(p.relative_to(cwd_path))
-                    for p in cwd_path.rglob("*") if p.is_file()
-                ]
+                result.artifacts = _collect_artifacts(cwd_path)
         # 经验自动沉淀（record_experience=False 为评测消融组的硬关：即使
         # config.auto_record_experience 为真也不写，确保「无经验」组不落库）。
         if (self.config.auto_record_experience and record_experience
                 and not result.cancelled):
-            self._record_experience(prompt, persona, result, cwd)
+            self._record_experience(prompt, persona, result)
         # 自我反思
         reflection = self._run_reflection(result, persona, cwd)
         if reflection:
@@ -1081,30 +1216,22 @@ class AgentKernel:
         """
         if not session_id:
             return
-        import sys
-        rt = (Path(self.config.project_root) / "workspace" / "agent"
-              / "orchestrator" / "runtime")
-        if str(rt) not in sys.path:
-            sys.path.insert(0, str(rt))
+        ensure_runtime_on_path(self.config)
         from memory_store import FileMemoryStore
         mem = FileMemoryStore(self.config.memory_core_dir,
                               self.config.memory_context_dir)
         mem.write_context(session_id, "reflection", reflection)
 
     def _record_experience(self, prompt: str, persona: Persona,
-                           result: KernelResult, cwd: str) -> None:
+                           result: KernelResult) -> None:
         """任务完成后自动沉淀经验到 experience_store。失败静默，不拖垮主流程。
 
         延迟导入 runtime 的 ExperienceStore（把 runtime 目录加入 sys.path），
-        避免 agent_core 对 runtime 形成包级强依赖。cwd 暂未参与记录，保留形参
-        以便未来按工作目录归类经验。
+        避免 agent_core 对 runtime 形成包级强依赖。cwd 曾作预留形参，未参与
+        记录故移除——如需按工作目录归类经验，改在 ExperienceStore 层扩展。
         """
         try:
-            import sys
-            rt = (Path(self.config.project_root) / "workspace" / "agent"
-                  / "orchestrator" / "runtime")
-            if str(rt) not in sys.path:
-                sys.path.insert(0, str(rt))
+            ensure_runtime_on_path(self.config)
             from experience_store import ExperienceStore
 
             exp_store = ExperienceStore(self.config.experience_store_dir)
@@ -1120,6 +1247,41 @@ class AgentKernel:
             )
         except Exception:  # noqa: BLE001 - 经验沉淀失败不影响任务结果
             pass
+
+    def _resume_plan(self, mgr, prompt: str, emitter: Any) -> tuple[str | None, Any | None]:
+        """断点检测与续跑自愈：返回 (session_id, plan)。
+
+        同 prompt 未完成计划（超龄不续跑，避免定时/评测同 prompt 错配陈旧计划）；
+        命中后重新校验依赖图（不通过则放弃续跑、回落重新规划），再把失败步骤
+        重置为 pending 并持久化+通知（续跑自愈）。无可用计划返回 (None, None)。
+        """
+        resumed = mgr.find_resumable(
+            prompt, max_age_hours=self.config.plan_resume_max_age_hours)
+        if resumed is None:
+            return None, None
+        session_id, plan = resumed
+        # 续跑前重新校验依赖图（P1：陈旧/损坏的持久化计划不得盲目续跑）；
+        # 校验不通过则放弃续跑、回落到重新规划（plan=None → 走规划轮）。
+        if getattr(self.config, "plan_validation_enabled", True):
+            from agent_core.plan_validator import validate_plan
+            rv = validate_plan(plan)
+            if not rv.is_valid:
+                log.warning("续跑计划校验失败（%s），放弃续跑改为重新规划",
+                            "; ".join(rv.issues))
+                return None, None
+        # 续跑自愈：failed 步骤重置为 pending 重新执行——否则失败步骤及其
+        # 依赖会被静默跳过；重试再耗尽则按下方失败口径如实上报
+        reset = False
+        for s in plan.steps:
+            if s.status == "failed":
+                s.status = "pending"
+                s.output = ""
+                reset = True
+        if reset:
+            _persist_plan(mgr, session_id, plan, emitter)
+        log.info("resume plan %s (%d steps, goal=%s)", session_id,
+                 len(plan.steps), plan.goal)
+        return session_id, plan
 
     async def _execute_plan_engine(self, prompt: str, persona: Persona, cwd: str,
                                    context_memory: str, cancel_event: Any,
@@ -1150,36 +1312,8 @@ class AgentKernel:
         session_id: str | None = None
         plan = None
 
-        # 1. 断点检测（同 prompt 未完成计划；resume 参数为显式声明，检测逻辑一致）。
-        #    超龄计划不续跑，避免定时任务/评测同 prompt 错配陈旧计划。
-        resumed = mgr.find_resumable(
-            prompt, max_age_hours=self.config.plan_resume_max_age_hours)
-        if resumed is not None:
-            session_id, plan = resumed
-            # 续跑前重新校验依赖图（P1：陈旧/损坏的持久化计划不得盲目续跑）；
-            # 校验不通过则放弃续跑、回落到重新规划（plan=None → 走规划轮）。
-            if getattr(self.config, "plan_validation_enabled", True):
-                from agent_core.plan_validator import validate_plan
-                rv = validate_plan(plan)
-                if not rv.is_valid:
-                    log.warning("续跑计划校验失败（%s），放弃续跑改为重新规划",
-                                "; ".join(rv.issues))
-                    plan = None
-                    session_id = None
-            if plan is not None:
-                # 续跑自愈：failed 步骤重置为 pending 重新执行——否则失败步骤及其
-                # 依赖会被静默跳过；重试再耗尽则按下方失败口径如实上报
-                reset_ids = [s.id for s in plan.steps if s.status == "failed"]
-                if reset_ids:
-                    for s in plan.steps:
-                        if s.status == "failed":
-                            s.status = "pending"
-                            s.output = ""
-                    mgr.save_plan(session_id, plan)
-                    if emitter:
-                        emitter.emit("plan_update", plan.to_dict())
-                log.info("resume plan %s (%d steps, goal=%s)", session_id,
-                         len(plan.steps), plan.goal)
+        # 1. 断点检测（命中则跳过规划轮直接续跑；未见可用计划 plan=None → 走规划轮）
+        session_id, plan = self._resume_plan(mgr, prompt, emitter)
 
         # 2. 规划轮
         if plan is None:
@@ -1201,13 +1335,9 @@ class AgentKernel:
             if plan is None or not plan.steps:
                 # 规划失败降级：普通单轮执行（不再注入规划指令），不报错
                 log.warning("规划轮未解析出有效计划，降级为普通单轮执行")
-                fallback = await self._execute_oneshot(prompt, persona, cwd,
-                                                       context_memory, cancel_event)
-                acc.absorb(fallback)
-                return acc.result(output=fallback.output,
-                                  session_id=fallback.session_id or plan_round.session_id,
-                                  is_error=fallback.is_error,
-                                  cancelled=fallback.cancelled)
+                return await self._fallback_oneshot(
+                    prompt, persona, cwd, context_memory, cancel_event, acc,
+                    emitter=emitter, fallback_session_id=plan_round.session_id)
             session_id = plan_round.session_id or f"plan-{int(time.time())}"
             plan.source_prompt = prompt
             # 计划验证（plan_validation_enabled 时）
@@ -1225,30 +1355,19 @@ class AgentKernel:
                         else:
                             log.warning("计划修复后仍存在问题：%s，降级为单轮",
                                         "; ".join(vresult2.issues))
-                            fallback = await self._execute_oneshot(
-                                prompt, persona, cwd, context_memory, cancel_event)
-                            acc.absorb(fallback)
-                            return acc.result(
-                                output=fallback.output,
-                                session_id=fallback.session_id or plan_round.session_id,
-                                is_error=fallback.is_error,
-                                cancelled=fallback.cancelled)
+                            return await self._fallback_oneshot(
+                                prompt, persona, cwd, context_memory, cancel_event,
+                                acc, emitter=emitter,
+                                fallback_session_id=plan_round.session_id)
                     else:
                         log.warning("计划无法自动修复，降级为单轮执行")
-                        fallback = await self._execute_oneshot(
+                        return await self._fallback_oneshot(
                             prompt, persona, cwd, context_memory, cancel_event,
-                            emitter=emitter)
-                        acc.absorb(fallback)
-                        return acc.result(
-                            output=fallback.output,
-                            session_id=fallback.session_id or plan_round.session_id,
-                            is_error=fallback.is_error,
-                            cancelled=fallback.cancelled)
+                            acc, emitter=emitter,
+                            fallback_session_id=plan_round.session_id)
                 if vresult.warnings:
                     log.info("计划验证警告：%s", "; ".join(vresult.warnings))
-            mgr.save_plan(session_id, plan)
-            if emitter:
-                emitter.emit("plan_update", plan.to_dict())
+            _persist_plan(mgr, session_id, plan, emitter)
 
         # 3. 步骤轮：逐步骤驱动
         replanned = False
@@ -1277,9 +1396,7 @@ class AgentKernel:
                 if not step_round.is_error:
                     step.status = "done"
                     step.output = step_round.output
-                    mgr.save_plan(session_id, plan)
-                    if emitter:
-                        emitter.emit("plan_update", plan.to_dict())
+                    _persist_plan(mgr, session_id, plan, emitter)
                     success = True
                     break
                 if attempt < _PLAN_STEP_MAX_RETRIES:
@@ -1290,9 +1407,7 @@ class AgentKernel:
             if not success:
                 step.status = "failed"
                 step.output = (last_output or "")[:500]
-                mgr.save_plan(session_id, plan)
-                if emitter:
-                    emitter.emit("plan_update", plan.to_dict())
+                _persist_plan(mgr, session_id, plan, emitter)
                 # 动态重规划（plan_replan_enabled 时尝试重新规划而非直接终止）
                 if (getattr(self.config, "plan_replan_enabled", True)
                         and not replanned):
@@ -1337,9 +1452,7 @@ class AgentKernel:
                                             "; ".join(rv.issues))
                         if replan_ok:
                             plan = merged
-                            mgr.save_plan(session_id, plan)
-                            if emitter:
-                                emitter.emit("plan_update", plan.to_dict())
+                            _persist_plan(mgr, session_id, plan, emitter)
                             replanned = True
                             log.info("重新规划成功，新计划 %d 个步骤",
                                      len(plan.steps))
@@ -1382,7 +1495,7 @@ class AgentKernel:
         result.meta["plan"] = plan.to_dict()
         return result
 
-    async def _execute_oneshot(self, prompt: str, persona: Persona, cwd: str,
+    async def _oneshot_round(self, prompt: str, persona: Persona, cwd: str,
                                context_memory: str, cancel_event: Any,
                                retry_hint: str = "",
                                emitter: Any = None) -> KernelResult:
@@ -1401,6 +1514,26 @@ class AgentKernel:
             full_prompt = f"{full_prompt}\n\n{retry_hint}"
         return await self._run_sdk_query(full_prompt, options, cancel_event,
                                          emitter=emitter)
+
+    async def _fallback_oneshot(self, prompt: str, persona: Persona, cwd: str,
+                                context_memory: str, cancel_event: Any,
+                                acc: _RoundAccumulator, emitter: Any = None,
+                                fallback_session_id: str | None = None) -> KernelResult:
+        """降级为普通单轮执行：吸收轮次指标，按统一口径返回汇总结果。
+
+        Plan-Execute 的多条回退路径（规划轮解析失败 / 计划验证无法修复）共用，
+        统一传 emitter 使降级轮的事件流与正常轮一致（此前部分分支漏传 emitter，
+        导致降级轮的 plan_update/事件落盘缺失）；fallback_session_id 提供
+        fallback 自身无 session_id 时的兜底（规划轮 session）。
+        """
+        fallback = await self._oneshot_round(prompt, persona, cwd,
+                                               context_memory, cancel_event,
+                                               emitter=emitter)
+        acc.absorb(fallback)
+        return acc.result(output=fallback.output,
+                          session_id=fallback.session_id or fallback_session_id,
+                          is_error=fallback.is_error,
+                          cancelled=fallback.cancelled)
 
     def _apply_provider(self, persona: Persona,
                         provider: dict | None) -> Persona:
@@ -1429,7 +1562,7 @@ class AgentKernel:
 
         流程：执行 → detect_degenerate 检测（tool 轮无文本/取消/错误轮跳过）
         → 命中则按 config.output_guard_max_retries 重试：
-        - 第 1 次重试：用户消息末尾追加纠偏提示，复用 _execute_oneshot；
+        - 第 1 次重试：用户消息末尾追加纠偏提示，复用 _oneshot_round；
         - 第 2 次重试：配置了 fallback_model 且与当前模型不同则换模型再试
           （构造 options 时按次覆盖 model），否则仍注入提示重试；
         - 每次重试前检查任务级预算：累计花费已达 task_budget_usd 的 80%
@@ -1445,7 +1578,7 @@ class AgentKernel:
         异常时 log.warning 并直接放行第一轮结果；重试轮检测异常按本轮通过
         （recovered）口径返回。
         """
-        result = await self._execute_oneshot(prompt, persona, cwd, context_memory,
+        result = await self._oneshot_round(prompt, persona, cwd, context_memory,
                                              cancel_event, emitter=emitter)
         if (not getattr(self.config, "output_guard_enabled", True)
                 or result.cancelled or result.is_error
@@ -1509,7 +1642,7 @@ class AgentKernel:
                 persona_try = persona
             # hint 用最近一次检出原因（第 2 次重试纠正的是上一轮的病）
             hint = _GUARD_RETRY_HINT.format(reason=reasons[-1])
-            retry = await self._execute_oneshot(prompt, persona_try, cwd,
+            retry = await self._oneshot_round(prompt, persona_try, cwd,
                                                 context_memory, cancel_event,
                                                 retry_hint=hint, emitter=emitter)
             acc.absorb(retry)
@@ -1647,7 +1780,7 @@ class AgentKernel:
                     break
                 hint = build_correction_hint(verdict)
                 corrected_prompt = f"{prompt}\n\n{hint}"
-                coro = self._execute_oneshot(corrected_prompt, persona, cwd,
+                coro = self._oneshot_round(corrected_prompt, persona, cwd,
                                              context_memory, cancel_event,
                                              emitter=emitter)
                 if remaining is not None:
@@ -1699,7 +1832,7 @@ class AgentKernel:
                              emitter: Any = None) -> KernelResult:
         """消费 sdk.query() 的消息流（prompt 已拼装好），聚合为 KernelResult。
 
-        从 _execute_oneshot 拆出的消息循环：单轮执行与 Plan-Execute 引擎
+        从 _oneshot_round 拆出的消息循环：单轮执行与 Plan-Execute 引擎
         （规划轮/步骤轮）共用，保证指标收集与取消语义一致。
         """
         import claude_agent_sdk as sdk
@@ -1747,7 +1880,7 @@ class AgentKernel:
                         "result": final_result, "num_turns": turns,
                         "is_error": is_error, "usage": usage,
                         "cost_usd": cost_usd, "duration_ms": duration_ms,
-                        "session_id": session_id})
+                        "session_id": session_id, "error_type": ""})
 
             # 协作式取消：在消息边界检查，当前 turn 结束即停
             if cancel_event is not None and cancel_event.is_set():
@@ -1769,6 +1902,11 @@ class AgentKernel:
         if no_result:
             kr.error_type = "no_result"
             kr.meta["no_result"] = True
+            # 事件流一致性：流异常提前结束也必须补发终态 result 帧（此前
+            # 有 sink 时该路径无终态帧，下游把 run 记成 interrupted 而非 failed）
+            if emitter is not None:
+                emitter.emit("error", "流式执行未收到终结结果（后端可能崩溃或被中断）。")
+                emitter.emit("result", _error_result_frame("no_result", session_id))
         return kr
 
     def open_session(self, persona: Persona, cwd: str) -> AgentSession:
@@ -1838,10 +1976,7 @@ class AgentKernel:
                     flt.reset()
                     yield AgentEvent("error", f"流式执行超时（>{task_timeout}s）。"
                                              "建议：调大 task_timeout 或检查后端负载。")
-                    yield AgentEvent("result", {
-                        "result": "", "num_turns": 0, "is_error": True,
-                        "usage": None, "cost_usd": None, "duration_ms": 0,
-                        "session_id": None, "error_type": "timeout"})
+                    yield AgentEvent("result", _error_result_frame("timeout"))
                     return
                 for ev in flt.translate(msg):
                     if ev.type == "result":
@@ -1858,10 +1993,7 @@ class AgentKernel:
         # 被杀/协议中断）。绝不把半截流当成功——补发 error + result（no_result）。
         if not saw_result:
             yield AgentEvent("error", "流式执行未收到终结结果（后端可能崩溃或被中断）。")
-            yield AgentEvent("result", {
-                "result": "", "num_turns": 0, "is_error": True,
-                "usage": None, "cost_usd": None, "duration_ms": 0,
-                "session_id": None, "error_type": "no_result"})
+            yield AgentEvent("result", _error_result_frame("no_result"))
 
     @staticmethod
     def _run_async(coro: Any) -> Any:

@@ -8,10 +8,9 @@
 """
 import json
 import logging
-import os
 import threading
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -27,13 +26,21 @@ class RunHistoryStore:
         self._dir = Path(history_dir)
         self._max_records = max(1, max_records)  # 至少保留 1 条
         self._lock = threading.Lock()
+        # 文件行数缓存：-1 = 未知（首个 append 时统计一次），此后按自身写入自增，
+        # 仅在达到上限触发整写时用 _load_records 实际行数校准。
+        self._size = -1
 
     @property
     def _path(self) -> Path:
         return self._dir / ".run_history.jsonl"
 
     def append(self, record: dict) -> None:
-        """追加一条运行记录。写入失败静默 log warning。"""
+        """追加一条运行记录。写入失败静默 log warning。
+
+        增量路径：文件未达上限时只做真追加（open "a" 写一行），O(1) 磁盘 IO，
+        不再每次全量读-写（旧实现累计 O(N²)）。仅当触顶需要截断时才整写一遍
+        （O(N)，每轮次至多一次），随后回到增量窗口。
+        """
         try:
             self._dir.mkdir(parents=True, exist_ok=True)
         except OSError as e:
@@ -44,16 +51,22 @@ class RunHistoryStore:
         record.setdefault("run_id", str(uuid.uuid4()))
         record.setdefault("timestamp", datetime.now(timezone.utc).isoformat())
 
+        line = json.dumps(record, ensure_ascii=False) + "\n"
         try:
             with self._lock:
-                # 先读取现有记录
-                records = self._load_records()
-                records.append(record)
-                # 截断旧记录
-                if len(records) > self._max_records:
-                    records = records[-self._max_records:]
-                # 写回文件
-                self._write_records(records)
+                if self._size < 0:
+                    self._size = self._count_lines()
+                if self._size < self._max_records:
+                    with self._path.open("a", encoding="utf-8") as f:
+                        f.write(line)
+                    self._size += 1
+                else:
+                    # 达到上限：截断整写（保留最新 max_records 条），行数以实际为准
+                    records = self._load_records()
+                    records.append(record)
+                    trimmed = records[-self._max_records:]
+                    self._write_records(trimmed)
+                    self._size = len(trimmed)
         except Exception as e:
             logger.warning("run_history: 追加记录失败: %s", e)
 
@@ -104,6 +117,17 @@ class RunHistoryStore:
             return []
         since_iso = since.isoformat()
         return [r for r in records if r.get("timestamp", "") >= since_iso]
+
+    def _count_lines(self) -> int:
+        """统计 JSONL 文件非空行数（截断判定的近似容量）。每进程首个 append 调用一次。"""
+        if not self._path.is_file():
+            return 0
+        n = 0
+        with self._path.open("r", encoding="utf-8") as f:
+            for line in f:
+                if line.strip():
+                    n += 1
+        return n
 
     def _load_records(self) -> list[dict]:
         """从 JSONL 文件加载所有记录。"""

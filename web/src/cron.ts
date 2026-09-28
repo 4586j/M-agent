@@ -37,33 +37,46 @@ export function isValidCron(expr: string): boolean {
   return fields.every((f, i) => parseField(f, RANGES[i][0], RANGES[i][1]) !== null)
 }
 
-/** 返回未来 count 次运行时间（epoch 秒）；表达式非法返回 []。逐分钟扫描，上限两年。 */
+/** 返回未来 count 次运行时间（epoch 秒）；表达式非法返回 []。按天跳进，上限两年。 */
 export function nextRuns(expr: string, count = 3, from?: Date): number[] {
   const fields = expr.trim().split(/\s+/)
   if (fields.length !== 5) return []
   const sets = fields.map((f, i) => parseField(f, RANGES[i][0], RANGES[i][1]))
   if (sets.some((s) => s === null)) return []
   const [min, hour, dom, mon, dow] = sets as Set<number>[]
+  const mins = [...min].sort((a, b) => a - b)
+  const hours = [...hour].sort((a, b) => a - b)
 
   const start = from ?? new Date()
-  const d = new Date(start.getTime())
-  d.setSeconds(0, 0)
-  d.setMinutes(d.getMinutes() + 1)
+  const startMs = start.getTime()
+  const domRestricted = fields[2] !== '*'
+  const dowRestricted = fields[4] !== '*'
 
   const out: number[] = []
-  const limit = 2 * 366 * 24 * 60 // 两年分钟数，防死循环
-  for (let i = 0; i < limit && out.length < count; i++) {
-    const domRestricted = fields[2] !== '*'
-    const dowRestricted = fields[4] !== '*'
-    const domOk = dom.has(d.getDate())
-    const dowOk = dow.has(d.getDay())
+  // 按天跳进（上限两年），只在候选日扫描 小时×分钟 组合：旧实现逐分钟扫
+  // （最坏 ~105 万次），对「当年无命中」的表达式（如 2 月 31 日）每次击键
+  // 都白跑全量；按天过滤后，非命中日直接跳过。
+  for (let day = 0; day < 2 * 366 && out.length < count; day++) {
+    const cur = new Date(start)
+    cur.setHours(0, 0, 0, 0)
+    cur.setDate(cur.getDate() + day)
+    // 日期级过滤：月/日/周任一不满足则整天跳过
+    if (!mon.has(cur.getMonth() + 1)) continue
+    const domOk = dom.has(cur.getDate())
+    const dowOk = dow.has(cur.getDay())
     // 标准 cron 语义：日与周都受限时取或，否则取与
     const dayOk = domRestricted && dowRestricted ? (domOk || dowOk) : (domOk && dowOk)
-    if (min.has(d.getMinutes()) && hour.has(d.getHours())
-      && mon.has(d.getMonth() + 1) && dayOk) {
-      out.push(Math.floor(d.getTime() / 1000))
+    if (!dayOk) continue
+    for (const h of hours) {
+      for (const m of mins) {
+        const ts = new Date(cur)
+        ts.setHours(h, m, 0, 0)
+        if (ts.getTime() <= startMs) continue
+        out.push(Math.floor(ts.getTime() / 1000))
+        if (out.length >= count) break
+      }
+      if (out.length >= count) break
     }
-    d.setMinutes(d.getMinutes() + 1)
   }
   return out
 }

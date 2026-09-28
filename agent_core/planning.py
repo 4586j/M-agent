@@ -99,11 +99,12 @@ class Plan:
         return None
 
     def next_pending_steps(self) -> list[PlanStep]:
-        """返回所有可并行执行的 pending 步骤（依赖均已 done）。
+        """[预留] 返回所有可并行执行的 pending 步骤（依赖均已 done）。
 
         用于 plan_parallel_steps=True 时批量取步骤；返回的列表按原始
         顺序排列（id 升序），调用方需自行检查步骤间是否有相互依赖
-        （并行步骤之间不应有依赖关系）。
+        （并行步骤之间不应有依赖关系）。当前 kernel 步骤循环恒单步执行，
+        此接口仅测试引用——预留待并行步骤功能接入。
         """
         done_ids = {s.id for s in self.steps if s.status == "done"}
         return [
@@ -113,7 +114,11 @@ class Plan:
         ]
 
     def is_complete(self) -> bool:
-        """所有步骤都非 pending/in_progress 即视为完成（含 failed 收尾）。"""
+        """[预留] 所有步骤都非 pending/in_progress 即视为完成（含 failed 收尾）。
+
+        仅测试引用；kernel 用 all_done() 判定（要求全部 done 才成功），
+        is_complete 兼容 failed 收尾语义，预留供外部判定使用。
+        """
         if not self.steps:
             return False
         return all(s.status in ("done", "failed") for s in self.steps)
@@ -172,6 +177,9 @@ REFLECTION_PROMPT = """请评估上述任务产出的质量：
 # 计划 created_at 的时间格式（save_plan 用 time.strftime 写入的本地时间）
 _PLAN_TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
 
+# find_resumable 缓存哨兵：区分「尚未扫描」与「扫描结果为无可用计划（None）」
+_SCAN_NOT_CACHED = object()
+
 
 def _plan_age_hours(created_at: str) -> float | None:
     """按 created_at 计算计划年龄（小时）；缺失或格式非法返回 None。
@@ -196,6 +204,27 @@ class PlanningManager:
     def __init__(self, progress_dir: str | Path):
         self.progress_dir = Path(progress_dir)
         self.progress_dir.mkdir(parents=True, exist_ok=True)
+        # find_resumable 扫描短路缓存：计划文件 stat 级无变化且入参一致时
+        # 复用上次结果，避免每 run/每入口重复 glob + 全量 json 解析。
+        self._scan_sig: int = -1
+        self._scan_prompt: str = ""
+        self._scan_max_age: float | None = None
+        self._scan_result: Any = _SCAN_NOT_CACHED
+
+    def _scan_signature(self) -> int:
+        """进度目录 stat 级指纹：全部 .json 的 (mtime_ns, size) 累和。
+
+        任何计划文件增删改都会改变指纹——比全量 json 解析便宜得多（只 stat）；
+        目录不可达返回 0 兜底（触发重扫）。
+        """
+        total = 0
+        try:
+            for p in self.progress_dir.glob("*.json"):
+                st = p.stat()
+                total += st.st_mtime_ns + st.st_size
+        except OSError:
+            return 0
+        return total
 
     def _path(self, session_id: str) -> Path:
         """session_id -> 进度文件路径。做最小路径安全清洗，避免越界。"""
@@ -238,6 +267,20 @@ class PlanningManager:
         """
         if not prompt or not self.progress_dir.is_dir():
             return None
+        sig = self._scan_signature()
+        # stat 级无变化 + 入参一致 → 复用上次扫描结果；缓存 Plan 返回深拷贝，
+        # 防调用方（断点续跑重置步骤）在返回对象上的修改污染缓存。
+        if (sig == self._scan_sig and prompt == self._scan_prompt
+                and max_age_hours == self._scan_max_age
+                and self._scan_result is not _SCAN_NOT_CACHED):
+            if self._scan_result is None:
+                return None
+            sid, plan = self._scan_result
+            return sid, Plan.from_dict(plan.to_dict())
+        self._scan_sig = sig
+        self._scan_prompt = prompt
+        self._scan_max_age = max_age_hours
+
         best: tuple[str, Plan] | None = None
         for path in self.progress_dir.glob("*.json"):
             try:
@@ -256,11 +299,16 @@ class PlanningManager:
             sid = path.stem
             if best is None or plan.created_at > best[1].created_at:
                 best = (sid, plan)
+        self._scan_result = best
         return best
 
     def update_step(self, session_id: str, step_id: int, status: str,
                     output: str = "") -> None:
-        """更新指定步骤的状态/产出并回写进度文件。步骤不存在则忽略。"""
+        """[预留] 更新指定步骤的状态/产出并回写进度文件。步骤不存在则忽略。
+
+        仅测试引用；kernel 走 save_plan 全量落盘（含 _persist_plan 合并），
+        单步更新接口预留供外部渐进式持久化使用。
+        """
         plan = self.load_plan(session_id)
         if plan is None:
             return

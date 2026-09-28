@@ -62,6 +62,12 @@ from pathlib import Path
 
 EVAL_ROOT = Path(__file__).resolve().parent
 PROJECT_ROOT = EVAL_ROOT.parent
+# 用量 token 键口径与 brain/worker 同源（runtime/dispatch_common.USAGE_KEYS）
+_RUNTIME_DIR = PROJECT_ROOT / "workspace" / "agent" / "orchestrator" / "runtime"
+if str(_RUNTIME_DIR) not in sys.path:
+    sys.path.insert(0, str(_RUNTIME_DIR))
+from dispatch_common import USAGE_KEYS  # noqa: E402
+
 DEFAULT_TASKS_DIR = EVAL_ROOT / "tasks"
 DEFAULT_RESULTS_DIR = EVAL_ROOT / "results"
 
@@ -383,9 +389,7 @@ def extract_metrics(record: dict, wall_duration_s: float) -> dict:
     usage = meta.get("usage") or record.get("usage") or {}
     tokens = None
     if isinstance(usage, dict):
-        nums = [usage[k] for k in ("input_tokens", "output_tokens",
-                                   "cache_read_input_tokens",
-                                   "cache_creation_input_tokens")
+        nums = [usage[k] for k in USAGE_KEYS
                 if isinstance(usage.get(k), (int, float))]
         tokens = int(sum(nums)) if nums else None
     duration = None

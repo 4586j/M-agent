@@ -26,6 +26,13 @@ python worker_api.py        # 经 ORCH_BRAIN_URL 注册并领任务
 python -m pytest agent_core/tests worker/tests workspace/agent/orchestrator/runtime/tests -q
 ```
 
+### 静态检查（ruff，增量质量门）
+
+```bash
+pip install "ruff>=0.9"
+ruff check <改动文件>     # 基础集 E9/F/B/I；新增/改动处零告警，存量不强求全绿
+```
+
 ## 评测（eval/）
 
 ```bash

@@ -56,15 +56,15 @@ class TaskStore:
     def __init__(self, store_dir: str):
         self.store_dir = Path(store_dir)
         self.store_dir.mkdir(parents=True, exist_ok=True)
-        self._cache: list[TaskRecord] | None = None
+        # 按 task_id 索引的内存缓存（dict）：装填（_all 全量一次）后 get 为 O(1)，
+        # 写路径只更新受影响条目，不再整表失效——异步轮询每次 tick 对在飞任务
+        # 逐个 get 的热路径不再反复读盘。None = 尚未全量装填（get 直接读单文件）。
+        self._cache: dict[str, TaskRecord] | None = None
         # 可重入写锁：get 返回缓存对象引用、update 原为无锁 setattr，而
         # approve/reject 在线程池并发运行——统一串行化写路径；transition 的
         # compare-and-set 依赖它保证原子性（可重入以支持 update/transition
         # 内部复用 write）。
         self._lock = threading.RLock()
-
-    def _invalidate(self) -> None:
-        self._cache = None
 
     def _path(self, task_id: str) -> Path:
         validate_id(task_id, "task_id")
@@ -76,14 +76,13 @@ class TaskStore:
         with self._lock:
             with open(self._path(record.task_id), "w", encoding="utf-8") as f:
                 json.dump(asdict(record), f, ensure_ascii=False, indent=2)
-            self._invalidate()
+            # 只更新受影响条目的缓存（若已装填），不整表失效
+            if self._cache is not None:
+                self._cache[record.task_id] = record
 
     def get(self, task_id: str) -> TaskRecord | None:
         if self._cache is not None:
-            for r in self._cache:
-                if r.task_id == task_id:
-                    return r
-            return None
+            return self._cache.get(task_id)  # 热路径 O(1)
         p = self._path(task_id)
         if not p.exists():
             return None
@@ -164,11 +163,14 @@ class TaskStore:
                 and r.retry_count < r.max_retries]
 
     def _all(self) -> list[TaskRecord]:
-        if self._cache is not None:
-            return list(self._cache)
-        out = []
-        for p in sorted(self.store_dir.glob("*.json")):
-            with open(p, encoding="utf-8") as f:
-                out.append(TaskRecord(**json.load(f)))
-        self._cache = out
-        return list(out)
+        with self._lock:
+            if self._cache is None:
+                loaded: dict[str, TaskRecord] = {}
+                for p in sorted(self.store_dir.glob("*.json")):
+                    with open(p, encoding="utf-8") as f:
+                        rec = TaskRecord(**json.load(f))
+                        loaded[rec.task_id] = rec
+                self._cache = loaded
+            # 按 task_id 排序返回，保持与 disk 文件名序一致的确定性输出（调用方
+            # 多会再按 updated_at 倒序，此处保证列表视图稳定不变）
+            return sorted(self._cache.values(), key=lambda r: r.task_id)

@@ -1,3 +1,7 @@
+# NOTE: 预留模块（仅被 agent_core/tests 引用，无生产代码引用）。
+# 未接入内核的执行路径；若未来启用需接线到 kernel/worker，且删除时
+# 仅删本文件与对应测试。是否有必要保留由项目组评估。
+
 """Isolated executor：不可信生成代码的 Docker Linux 隔离执行适配器。
 
 可靠性方案 Slice 3「execution isolation」：可信的原生工具走 scoped policy；不可信的

@@ -263,6 +263,40 @@ def test_build_options_config_provider_fallback(monkeypatch, project_root, tmp_p
     assert "env" not in captured2["options_kwargs"]
 
 
+# ---- 批次三性能：跨 run 稳定输入指纹缓存 ----
+
+def test_build_options_caches_stable_inputs(monkeypatch, project_root, tmp_path):
+    """同 person、无文件变化的二次 _build_options 不重扫 skills（指纹缓存命中）。
+
+    核心记忆目录新增文件 → 指纹变化 → system_prompt 重建即生效（失效判定正确，
+    行为等价：绝不用陈旧记忆糊弄）。
+    """
+    captured = _install_fake_sdk(monkeypatch, [])
+    cfg = _kernel_config(project_root, tmp_path)
+    kernel = AgentKernel(cfg)
+    calls = {"n": 0}
+    real_scan = kernel_module.scan_skills
+
+    def counting_scan(proj):
+        calls["n"] += 1
+        return real_scan(proj)
+
+    monkeypatch.setattr(kernel_module, "scan_skills", counting_scan)
+
+    persona = Persona(name="executor", system_prompt="人设正文")
+    kernel._build_options(persona, str(tmp_path))
+    kernel._build_options(persona, str(tmp_path))
+    assert calls["n"] == 1  # 同输入第二次命中缓存，不重扫磁盘
+
+    # 核心记忆目录新增文件 → system_prompt 重建并带出新记忆（skills 仍缓存）
+    core = Path(tmp_path) / "mem" / "core"
+    core.mkdir(parents=True, exist_ok=True)
+    (core / "new-mem.md").write_text("# 新增记忆内容", encoding="utf-8")
+    kernel._build_options(persona, str(tmp_path))
+    assert calls["n"] == 1                     # skills 目录未变，仍命中
+    assert "新增记忆内容" in captured["options_kwargs"]["system_prompt"]
+
+
 def test_build_options_persona_env_wins_over_config(monkeypatch, project_root, tmp_path):
     """persona 三元组优先于 config（任务级/人设级 > 全局默认）。"""
     captured = _install_fake_sdk(monkeypatch, [])
@@ -1002,9 +1036,9 @@ def test_agent_session_rag_disabled_unchanged(monkeypatch, project_root, tmp_pat
 def _capture_record_experience(monkeypatch):
     calls = []
 
-    def fake(self, prompt, persona, result, cwd):
+    def fake(self, prompt, persona, result):
         calls.append({"prompt": prompt, "persona": persona,
-                      "result": result, "cwd": cwd})
+                      "result": result})
 
     monkeypatch.setattr(AgentKernel, "_record_experience", fake)
     return calls

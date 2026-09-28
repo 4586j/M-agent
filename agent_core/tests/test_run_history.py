@@ -126,6 +126,25 @@ class TestRunHistoryStore:
         # 不应该抛异常
         store.append({"run_id": "test", "is_error": False})
 
+    def test_append_below_cap_is_incremental_not_full_rewrite(self, tmp_history_dir):
+        """批次三性能：容量未满时的追加是真追加（不整写全量），旧行原样保留。
+
+        真追加语义的判别哨兵：手动留在文件尾部的损坏 JSON 行在追加后仍原样
+        存在——若退化回每写一次「读-全量-重写」，损坏行会被重写抹掉。
+        """
+        store = RunHistoryStore(tmp_history_dir, max_records=10)
+        store.append({"run_id": "r1", "is_error": False})
+        store.append({"run_id": "r2", "is_error": False})
+        # 手动在文件尾追加一行损坏 JSON（模拟外部遗留记录）
+        with open(store._path, "a", encoding="utf-8") as f:
+            f.write("{poison\n")
+        store.append({"run_id": "r3", "is_error": False})
+        raw = store._path.read_text(encoding="utf-8")
+        non_empty = [l for l in raw.splitlines() if l.strip()]
+        assert "{poison" in raw                     # 损坏行未被重写抹掉
+        assert len(non_empty) == 4                  # r1 / r2 / poison / r3：r3 为追加行
+        assert '"run_id": "r3"' in raw
+
 
 class TestBuildRunRecord:
     def test_basic(self):

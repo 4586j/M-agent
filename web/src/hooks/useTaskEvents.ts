@@ -1,5 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
-import type { TaskRecord } from '../types'
+import type { TaskRecord, TaskStatus } from '../types'
+import { TERMINAL_STATUSES } from '../types'
+import { POLL } from '../polling'
 import { api, sseUrl } from '../api/client'
 import { useActiveConnectionId } from '../api/connections'
 
@@ -11,8 +13,6 @@ export interface TaskEventLine {
   summary?: string
   snapshot?: boolean
 }
-
-const TERMINAL_STATUSES = ['done', 'failed', 'lost', 'cancelled']
 
 export type EventChannel = 'sse' | 'poll' | 'off'
 
@@ -58,8 +58,9 @@ export function useTaskEvents(
         /* 忽略坏帧 */
       }
       // 订阅时任务已终态：服务端发完快照即关流，直接结束
+      // （data.state 来自 JSON 边界，cast 到 TaskStatus 后做终态判定）
       if (data.snapshot === true && typeof data.state === 'string'
-        && TERMINAL_STATUSES.includes(data.state)) {
+        && TERMINAL_STATUSES.includes(data.state as TaskStatus)) {
         es.close()
         esRef.current = null
         setChannel('off')
@@ -93,7 +94,7 @@ export function useTaskEvents(
       es.close()
       esRef.current = null
       setChannel('poll')
-      pollRef.current = window.setInterval(refresh, 5000)
+      pollRef.current = window.setInterval(refresh, POLL.tasks)
     }
     return () => {
       es.close()

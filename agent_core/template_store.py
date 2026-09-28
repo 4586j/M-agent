@@ -1,3 +1,7 @@
+# NOTE: 预留模块（仅被 agent_core/tests 引用，无生产代码引用）。
+# 未接入内核的执行路径；若未来启用需接线到 kernel/worker，且删除时
+# 仅删本文件与对应测试。是否有必要保留由项目组评估。
+
 """任务模板存储（Template Store）。
 
 CRUD 管理 prompt 模板，支持变量替换。模板持久化到 JSONL 文件。

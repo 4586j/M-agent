@@ -350,7 +350,7 @@ def test_dispatch_security_block_awaits_approval(tmp_path):
                             http_call=lambda *a, **k: {"status_code": 200, "json": {}},
                             now_fn=lambda: "t0")
     client = TestClient(create_brain_app(reg, store, cfg, dispatcher=disp))
-    with patch("brain_api.security_check", return_value={"verdict": "block", "reason": "dangerous"}):
+    with patch("brain_routers.security_check", return_value={"verdict": "block", "reason": "dangerous"}):
         r = client.post("/dispatch", json={"prompt": "rm -rf /"})
     body = r.json()
     assert body["status"] == "awaiting_approval"
@@ -383,8 +383,8 @@ def test_dispatch_force_skips_security(tmp_path):
                             port=8001, capabilities={}, last_heartbeat=0.0))
     client = TestClient(create_brain_app(reg, store, cfg, dispatcher=disp))
     called = []
-    original = __import__("brain_api").security_check
-    with patch("brain_api.security_check", side_effect=lambda *a, **k: called.append(1) or original(*a, **k)):
+    original = __import__("brain_routers").security_check
+    with patch("brain_routers.security_check", side_effect=lambda *a, **k: called.append(1) or original(*a, **k)):
         r = client.post("/dispatch", json={"prompt": "rm -rf /", "force": True})
     assert r.json()["status"] == "done"
     assert called == []
@@ -830,7 +830,7 @@ def _approval_client(tmp_path, monkeypatch):
     disp = RemoteDispatcher(task_store=store, registry=reg, http_call=fake_http,
                             now_fn=lambda: "t0")
     client = TestClient(create_brain_app(reg, store, cfg, dispatcher=disp))
-    with patch("brain_api.security_check", return_value=BLOCK_VERDICT):
+    with patch("brain_routers.security_check", return_value=BLOCK_VERDICT):
         r = client.post("/dispatch", json={"prompt": "rm -rf /",
                                            "context_memory": "前置上下文",
                                            "model": "sonnet"})
@@ -873,7 +873,7 @@ def test_approve_revised_prompt_recheck_pass(tmp_path, monkeypatch):
     client, store, bodies, task_id = _approval_client(tmp_path, monkeypatch)
     pass_verdict = {"verdict": "pass", "reason": "无规则命中", "matched_rules": [],
                     "suggestion": "", "llm_enhanced": False}
-    with patch("brain_api.security_check", return_value=pass_verdict):
+    with patch("brain_routers.security_check", return_value=pass_verdict):
         r = client.post(f"/tasks/{task_id}/approve", json={"prompt": "ls -l 安全指令"})
     assert r.status_code == 200
     body = r.json()
@@ -890,7 +890,7 @@ def test_approve_revised_prompt_recheck_block_keeps_pending(tmp_path, monkeypatc
     from unittest.mock import patch
     client, store, bodies, task_id = _approval_client(tmp_path, monkeypatch)
     new_block = dict(BLOCK_VERDICT, reason="仍然危险", matched_rules=["rule-2"])
-    with patch("brain_api.security_check", return_value=new_block):
+    with patch("brain_routers.security_check", return_value=new_block):
         r = client.post(f"/tasks/{task_id}/approve",
                         json={"prompt": "rm -rf / --no-preserve-root"})
     assert r.status_code == 200
@@ -1135,7 +1135,7 @@ def test_dispatch_async_security_check_does_not_block_loop(tmp_path, monkeypatch
         hb = asyncio.create_task(heartbeat())
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport, base_url="http://t") as ac:
-            with patch("brain_api.security_check", slow_check):
+            with patch("brain_routers.security_check", slow_check):
                 r = await ac.post("/dispatch/async",
                                   json={"prompt": "hello", "role": "executor"})
         hb.cancel()
@@ -1331,7 +1331,7 @@ def test_approval_restores_pinned_worker(tmp_path, monkeypatch):
     disp = RemoteDispatcher(task_store=store, registry=reg, http_call=fake_http,
                             now_fn=lambda: "t0")
     client = TestClient(create_brain_app(reg, store, cfg, dispatcher=disp))
-    with patch("brain_api.security_check",
+    with patch("brain_routers.security_check",
                return_value={"verdict": "block", "reason": "dangerous"}):
         r = client.post("/dispatch", json={"prompt": "rm -rf /", "role": "executor",
                                            "worker_id": "B"})

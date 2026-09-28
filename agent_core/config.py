@@ -131,7 +131,7 @@ class AgentConfig:
     tool_guard_cache_ttl: int = 300          # 工具结果缓存 TTL（秒）
     # ---- 计划验证（plan_validator.py）----
     plan_validation_enabled: bool = True     # 计划验证开关
-    plan_parallel_steps: bool = False        # 并行步骤执行（默认关）
+    plan_parallel_steps: bool = False        # [预留] 并行步骤执行（默认关）：无生产引用，仅测试引用，待并行步骤接入
     plan_replan_enabled: bool = True         # 动态重规划开关
     # ---- 安全增强 ----
     rate_limit_per_minute: int = 60          # 每分钟请求上限
@@ -341,7 +341,10 @@ def load_agent_config(**overrides) -> AgentConfig:
         experience_store_dir=_env(_default_experience_store_dir(),
                                   "AGENT_EXPERIENCE_STORE_DIR",
                                   "ORCH_EXPERIENCE_STORE_DIR"),
-        memory_backend=_env("local", "AGENT_MEMORY_BACKEND", "ORCH_MODE"),
+        # 专属兜底 ORCH_MEMORY_BACKEND 优先；ORCH_MODE（集群/编排模式 local|remote）
+        # 仅在旧命名约定下作最后回退——两者语义不同，但远程模式下记忆后端常随之 remote。
+        memory_backend=_env("local", "AGENT_MEMORY_BACKEND",
+                            "ORCH_MEMORY_BACKEND", "ORCH_MODE"),
         brain_url=_env("http://127.0.0.1:7000",
                        "AGENT_BRAIN_URL", "ORCH_BRAIN_URL"),
         api_key=_env("", "AGENT_API_KEY", "ORCH_API_KEY"),

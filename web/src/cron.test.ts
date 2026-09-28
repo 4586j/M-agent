@@ -69,6 +69,10 @@ describe('nextRuns', () => {
     expect(nextRuns('bad cron', 3, base)).toEqual([])
   })
 
+  it('当年无命中表达式快速返回（2 月 31 日：不触发逐分钟百万循环）', () => {
+    expect(nextRuns('0 0 31 2 *', 3, base)).toEqual([])
+  })
+
   it('区间与步长组合 a-b/n', () => {
     const runs = nextRuns('10-50/20 9 * * *', 3, base) // 分钟 10,30,50
     const mins = runs.map((ts) => new Date(ts * 1000).getMinutes())

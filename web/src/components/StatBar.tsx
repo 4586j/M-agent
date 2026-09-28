@@ -1,4 +1,5 @@
 import type { Stats } from '../types'
+import { fmtUsd } from '../utils'
 
 /** 统计条：四张 mint 白卡（顶部嫩绿渐变边条），对齐原型规格 */
 export default function StatBar({ stats, cacheHit }: {
@@ -34,7 +35,7 @@ export default function StatBar({ stats, cacheHit }: {
         label="累计消耗"
         badge="Cost"
         badgeCls="text-mint-600 bg-mint-50"
-        value={stats.cost?.total?.cost_usd != null ? `$${stats.cost.total.cost_usd.toFixed(4)}` : '—'}
+        value={stats.cost?.total?.cost_usd != null ? fmtUsd(stats.cost.total.cost_usd) : '—'}
         hint={stats.cost?.total?.tokens != null ? `${stats.cost.total.tokens.toLocaleString()} tokens` : '暂无 meta 数据'}
       />
       <Card

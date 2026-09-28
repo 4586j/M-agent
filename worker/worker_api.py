@@ -125,7 +125,7 @@ def create_worker_app(runner: AgentRunner, cfg: WorkerConfig) -> FastAPI:
     state_max = int(os.environ.get("ORCH_WORKER_STATE_MAX", "1000"))
 
     # CORS：开发期前端直连 worker 查任务/产物
-    origins = __import__("os").environ.get("ORCH_CORS_ORIGINS", "http://localhost:5173")
+    origins = os.environ.get("ORCH_CORS_ORIGINS", "http://localhost:5173")
     app.add_middleware(
         CORSMiddleware,
         allow_origins=[o.strip() for o in origins.split(",") if o.strip()],

@@ -6,6 +6,7 @@ build_env_block / load_mcp_servers）；真实 SDK 消费逻辑已下沉到
 agent_core.kernel.AgentKernel，SdkAgentRunner 退化为其薄 adapter。
 """
 import logging
+import sys
 import threading  # noqa: F401  保留：worker_api 等历史调用方可能引用本模块命名空间
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -14,9 +15,17 @@ from typing import Any
 
 log = logging.getLogger(__name__)
 
-# re-export：保持向后兼容（测试与 orch_cli / worker_api 从本模块 import 这些）
+# 项目根 + runtime 目录入 sys.path（worker_api 已注入，此处自足保证直接 import
+# 也成立）：agent_core 提供内核/工具，dispatch_common 提供 USAGE_KEYS 等共享常量。
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+_RUNTIME_DIR = _PROJECT_ROOT / "workspace" / "agent" / "orchestrator" / "runtime"
+for _p in (str(_PROJECT_ROOT), str(_RUNTIME_DIR)):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
 from agent_core.tools import scan_skills, load_mcp_servers  # noqa: F401
 from agent_core.context import build_env_block  # noqa: F401
+from dispatch_common import USAGE_KEYS  # noqa: E402
 
 
 @dataclass
@@ -224,10 +233,7 @@ class SdkAgentRunner(AgentRunner):
         # 映射 KernelResult -> TaskResult 的 meta（用量/成本/时长可观测）
         meta: dict = {"num_turns": result.turns}
         if result.usage:
-            meta["usage"] = {k: result.usage.get(k) for k in
-                             ("input_tokens", "output_tokens",
-                              "cache_read_input_tokens",
-                              "cache_creation_input_tokens")
+            meta["usage"] = {k: result.usage.get(k) for k in USAGE_KEYS
                              if k in result.usage}
         if result.cost_usd is not None:
             meta["cost_usd"] = result.cost_usd

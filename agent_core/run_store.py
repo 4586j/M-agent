@@ -474,9 +474,9 @@ class RunStore:
                     "UPDATE tasks SET status='interrupted', updated_at=? "
                     "WHERE task_id=? AND status='running'",
                     (ts, task_id))
+                # 只有「running 状态成功回退」的任务计入（rowcount=1）；
+                # 已是终态/取消的任务不视为受影响（清理死条件分支）
                 if cur.rowcount == 1 and task_id not in affected:
-                    affected.append(task_id)
-                elif task_id not in affected:
                     affected.append(task_id)
         return affected
 

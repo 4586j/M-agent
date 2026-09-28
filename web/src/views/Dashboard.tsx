@@ -1,7 +1,10 @@
 import { useMemo, useState } from 'react'
 import { usePolling } from '../hooks/usePolling'
+import { useSharedStats } from '../hooks/useSharedStats'
+import { POLL } from '../polling'
 import { api } from '../api/client'
 import type { ApprovalMeta, TaskRecord } from '../types'
+import { statusDot } from '../types'
 import StatBar from '../components/StatBar'
 import CostPanel from '../components/CostPanel'
 import WorkerCard from '../components/WorkerCard'
@@ -9,9 +12,10 @@ import TaskDetailDrawer from '../components/TaskDetailDrawer'
 
 /** 总览：10 秒内回答"系统健康吗？有什么需要我处理的？"（统计条 → 待办中心 → 分布/成本 → 节点） */
 export default function Dashboard() {
-  const stats = usePolling(() => api.stats(), 5000)
-  const workers = usePolling(() => api.workers(), 5000)
-  const tasks = usePolling<TaskRecord[]>(() => api.tasks(), 5000)
+  // /stats 复用 App 顶层单一轮询源（总览页 5s，离开降频 10s），不再双源重复拉
+  const stats = useSharedStats()
+  const workers = usePolling(() => api.workers(), POLL.workers)
+  const tasks = usePolling<TaskRecord[]>(() => api.tasks(), POLL.tasks)
   const [selected, setSelected] = useState<TaskRecord | null>(null)
   const [busyId, setBusyId] = useState<string | null>(null)
   const [msg, setMsg] = useState<string | null>(null)
@@ -199,16 +203,11 @@ export default function Dashboard() {
 
 function DistributionBars({ stats }: { stats?: Record<string, number> }) {
   const total = Object.values(stats || {}).reduce((s, v) => s + v, 0)
-  const order: [string, string][] = [
-    ['done', 'bg-mint-500'],
-    ['running', 'bg-sky-400'],
-    ['pending', 'bg-slate-300'],
-    ['awaiting_approval', 'bg-amber-400'],
-    ['failed', 'bg-rose-400'],
-    ['lost', 'bg-slate-400'],
-    ['cancelled', 'bg-zinc-400'],
+  // 状态 → 圆点色统一走 types.ts STATUS_RENDER（单点权威），此处只排展示次序
+  const order: string[] = [
+    'done', 'running', 'pending', 'awaiting_approval', 'failed', 'lost', 'cancelled',
   ]
-  const entries = order.filter(([k]) => (stats?.[k] ?? 0) > 0)
+  const entries = order.filter((k) => (stats?.[k] ?? 0) > 0)
   if (total === 0 || entries.length === 0) {
     return <div className="text-xs text-slate-400">暂无任务数据</div>
   }
@@ -218,7 +217,7 @@ function DistributionBars({ stats }: { stats?: Record<string, number> }) {
   }
   return (
     <div className="space-y-3">
-      {entries.map(([k, color]) => {
+      {entries.map((k) => {
         const v = stats?.[k] ?? 0
         const pct = Math.round((v / total) * 1000) / 10
         return (
@@ -228,7 +227,7 @@ function DistributionBars({ stats }: { stats?: Record<string, number> }) {
               <span className="text-slate-500 font-semibold">{pct}%</span>
             </div>
             <div className="w-full bg-slate-100 rounded-full h-2 overflow-hidden">
-              <div className={`${color} h-2 rounded-full transition-all duration-500`} style={{ width: `${pct}%` }} />
+              <div className={`${statusDot(k)} h-2 rounded-full transition-all duration-500`} style={{ width: `${pct}%` }} />
             </div>
           </div>
         )

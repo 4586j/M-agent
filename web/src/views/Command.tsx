@@ -1,9 +1,11 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { useLocation } from 'react-router-dom'
 import { api } from '../api/client'
 import type { ApprovalMeta, DispatchAsyncResponse, DispatchResult, ExperienceRecord, ProviderList, TaskRecord, RecommendResponse, TranslateResponse, WorkerInfo } from '../types'
+import { TERMINAL_STATUSES } from '../types'
 import { usePolling } from '../hooks/usePolling'
-import { formatTime, timeAgo } from '../utils'
+import { POLL } from '../polling'
+import { fmtUsd, formatTime, timeAgo } from '../utils'
 import StatusBadge from '../components/StatusBadge'
 
 export default function Command() {
@@ -18,7 +20,7 @@ export default function Command() {
   // 定点派发：从 NodeManage「派发到此节点」跳转带 workerId，或本页下拉选择
   const location = useLocation()
   const [workerId, setWorkerId] = useState<string>(() => (location.state as { workerId?: string } | null)?.workerId ?? '')
-  const { data: workers } = usePolling<WorkerInfo[]>(() => api.workers(), 5000)
+  const { data: workers } = usePolling<WorkerInfo[]>(() => api.workers(), POLL.workers)
 
   // 从 NodeManage 跳转带 workerId 时，工人列表异步返回后回填其真实 role（role 输入已随定点禁用）
   useEffect(() => {
@@ -27,7 +29,7 @@ export default function Command() {
   }, [workerId, workers])
 
   // 运行时 Provider 名列表（brain providers.json；省略=用当前默认）
-  const { data: providerList } = usePolling<ProviderList>(() => api.providers(), 15000)
+  const { data: providerList } = usePolling<ProviderList>(() => api.providers(), POLL.providers)
 
   // 二期：同步阻塞 / 异步+SSE 两种派发模式（异步适合 web-expert/back-expert 长流程）
   const [mode, setMode] = useState<'sync' | 'async'>('sync')
@@ -56,7 +58,7 @@ export default function Command() {
   const [approving, setApproving] = useState(false)
 
   // 历史命令从后端 /tasks 取（持久化，含发布时间/节点/结果）；5s 轮询
-  const { data: tasks, refresh } = usePolling<TaskRecord[]>(() => api.tasks(), 5000)
+  const { data: tasks, refresh } = usePolling<TaskRecord[]>(() => api.tasks(), POLL.tasks)
 
   const send = async (force = false) => {
     if (!prompt.trim()) return
@@ -189,15 +191,22 @@ export default function Command() {
     }
   }
 
-  const history = (tasks ?? [])
-    .slice()
-    .sort((a, b) => Number(b.created_at) - Number(a.created_at))
-    .slice(0, 20)
+  // 派生列表仅随 tasks 变化重算，不随每次渲染（prompt 输入等触发）重复排序
+  const history = useMemo(
+    () => (tasks ?? [])
+      .slice()
+      .sort((a, b) => Number(b.created_at) - Number(a.created_at))
+      .slice(0, 20),
+    [tasks],
+  )
 
   // 待审批任务：安全拦截挂起，等待人工裁决（新→旧）
-  const pendingApprovals = (tasks ?? [])
-    .filter((t) => t.status === 'awaiting_approval')
-    .sort((a, b) => Number(b.created_at) - Number(a.created_at))
+  const pendingApprovals = useMemo(
+    () => (tasks ?? [])
+      .filter((t) => t.status === 'awaiting_approval')
+      .sort((a, b) => Number(b.created_at) - Number(a.created_at)),
+    [tasks],
+  )
 
   return (
     <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
@@ -580,7 +589,7 @@ function AsyncTaskCard({ taskId, onFinished }: { taskId: string; onFinished?: ()
   const [task, setTask] = useState<TaskRecord | null>(null)
   const [error, setError] = useState<string | null>(null)
   const finishedRef = useRef(false)
-  const terminal = task ? ['done', 'failed', 'lost', 'cancelled', 'awaiting_approval'].includes(task.status) : false
+  const terminal = task ? [...TERMINAL_STATUSES, 'awaiting_approval'].includes(task.status) : false
 
   useEffect(() => {
     let alive = true
@@ -590,7 +599,7 @@ function AsyncTaskCard({ taskId, onFinished }: { taskId: string; onFinished?: ()
         const t = await api.task(taskId)
         if (!alive) return
         setTask(t)
-        if (['done', 'failed', 'lost', 'cancelled'].includes(t.status) && !finishedRef.current) {
+        if (TERMINAL_STATUSES.includes(t.status) && !finishedRef.current) {
           finishedRef.current = true
           onFinished?.()
         }
@@ -617,7 +626,7 @@ function AsyncTaskCard({ taskId, onFinished }: { taskId: string; onFinished?: ()
         {task ? <StatusBadge status={task.status} /> : <span className="text-xs text-slate-400">查询中…</span>}
         <span className="font-mono text-xs">{taskId}</span>
         {task?.meta?.cost_usd != null && (
-          <span className="text-xs text-mint-700">${task.meta.cost_usd.toFixed(4)}</span>
+          <span className="text-xs text-mint-700">{fmtUsd(task.meta.cost_usd)}</span>
         )}
       </div>
       {error && <div className="text-xs text-rose-600">{error}</div>}

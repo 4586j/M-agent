@@ -17,7 +17,7 @@ dependencies = [
 
 [project.optional-dependencies]
 service = ["fastapi>=0.100", "uvicorn>=0.20"]
-dev = ["pytest>=7.0"]
+dev = ["pytest>=7.0", "ruff>=0.9"]
 
 [project.scripts]
 agent = "agent_core.cli:main"

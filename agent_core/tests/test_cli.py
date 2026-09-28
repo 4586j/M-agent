@@ -13,7 +13,6 @@ from agent_core.cli import (
     CliState,
     _interactive_write_memory,
     _render_session_records,
-    _valid_memory_name,
     build_arg_parser,
     handle_command,
     load_last_session_id,
@@ -21,6 +20,7 @@ from agent_core.cli import (
     save_session_record,
 )
 from agent_core.config import load_agent_config
+from agent_core.tools import valid_memory_name
 from agent_core.kernel import AgentEvent, AgentKernel
 from agent_core.persona import Persona
 
@@ -426,20 +426,20 @@ def test_interactive_write_memory_cancelled_when_empty(tmp_path):
 
 
 def test_valid_memory_name():
-    assert _valid_memory_name("abc")
-    assert _valid_memory_name("中文记忆")
-    assert _valid_memory_name("a_b-c")
-    assert not _valid_memory_name("")
-    assert not _valid_memory_name("a/b")
-    assert not _valid_memory_name("a\\b")
-    assert not _valid_memory_name("..")
-    assert not _valid_memory_name("a b")
+    assert valid_memory_name("abc")
+    assert valid_memory_name("中文记忆")
+    assert valid_memory_name("a_b-c")
+    assert not valid_memory_name("")
+    assert not valid_memory_name("a/b")
+    assert not valid_memory_name("a\\b")
+    assert not valid_memory_name("..")
+    assert not valid_memory_name("a b")
     # Windows 保留设备名（大小写不敏感）
     for bad in ("NUL", "con", "AUX", "prn", "com1", "LPT9"):
-        assert not _valid_memory_name(bad), bad
+        assert not valid_memory_name(bad), bad
     # 含保留名子串的正常名字不受影响
-    assert _valid_memory_name("nul_backup")
-    assert _valid_memory_name("console")
+    assert valid_memory_name("nul_backup")
+    assert valid_memory_name("console")
 
 
 # ---- 参数解析 ----

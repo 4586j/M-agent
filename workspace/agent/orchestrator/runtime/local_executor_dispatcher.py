@@ -30,7 +30,8 @@ from agent_core.kernel import AgentKernel  # noqa: E402
 from agent_core.persona import Persona, load_persona_by_name  # noqa: E402
 from agent_core.run_store import RunStore, open_journal  # noqa: E402
 
-from dispatch_common import is_text_artifact, enrich_experience, write_result_note  # noqa: E402
+from dispatch_common import (USAGE_KEYS, is_text_artifact, enrich_experience,
+                             write_result_note, put_provider_name)  # noqa: E402
 from dispatcher import Dispatcher, DispatchResult  # noqa: E402
 from event_bus import TaskEventBus, publish_task_event  # noqa: E402
 from experience_store import ExperienceStore  # noqa: E402
@@ -38,10 +39,6 @@ from memory_store import MemoryStore  # noqa: E402
 from task_store import TaskRecord, TaskStore, new_trace_id  # noqa: E402
 
 log = logging.getLogger(__name__)
-
-_USAGE_KEYS = ("input_tokens", "output_tokens",
-               "cache_read_input_tokens", "cache_creation_input_tokens")
-
 
 def _kernel_meta(result: Any) -> dict:
     """KernelResult -> 可观测 meta（与 worker 侧 agent_runner 同一映射口径）。
@@ -51,7 +48,7 @@ def _kernel_meta(result: Any) -> dict:
     """
     meta: dict = {"num_turns": result.turns}
     if result.usage:
-        meta["usage"] = {k: result.usage.get(k) for k in _USAGE_KEYS
+        meta["usage"] = {k: result.usage.get(k) for k in USAGE_KEYS
                          if k in result.usage}
     if result.cost_usd is not None:
         meta["cost_usd"] = result.cost_usd
@@ -263,8 +260,8 @@ class LocalExecutorDispatcher(Dispatcher):
         meta: dict = {}
         if model:
             meta["model"] = model
-        if provider and provider.get("name"):
-            meta["provider"] = provider["name"]
+        meta["use_experience"] = bool(use_experience)  # 与 sync/async 统一口径
+        put_provider_name(meta, provider)
         self.task_store.write(TaskRecord(
             task_id=task_id, role=role, prompt=prompt, worker_id="local",
             status="pending", created_at=ts, updated_at=ts,
@@ -319,8 +316,12 @@ class LocalExecutorDispatcher(Dispatcher):
             verdict = self.product_check(
                 self._collect_product_text(cwd, output, artifacts))
 
-        # kernel 用量/成本并入 TaskRecord.meta（brain 侧 model 已在初始 meta）
-        meta = {**({"model": model} if model else {}), **_kernel_meta(result)}
+        # kernel 用量/成本并入 TaskRecord.meta；model/use_experience/provider 名与
+        # 初始 meta 同口径（此前 local 终态会丢 provider 名，与 sync/async 不一致）
+        meta = {"model": model} if model else {}
+        meta["use_experience"] = bool(use_experience)
+        put_provider_name(meta, provider)
+        meta.update(_kernel_meta(result))
         # 取消不可覆盖（P0）：仅当任务仍处运行态才写入终态；若 cancel 端点
         # 已置 cancelled（终态、不可变），迟到的收尾写入不得覆盖它。
         final = self.task_store.finalize_if(
@@ -366,11 +367,16 @@ class LocalExecutorDispatcher(Dispatcher):
                               trace_id=trace_id)
 
     def redispatch(self, task_id: str, model: str | None = None,
-                   worker_id: str | None = None) -> DispatchResult:
-        """按已存在任务的 role/prompt 重新本地执行，返回新 DispatchResult。"""
+                   worker_id: str | None = None,
+                   provider: dict | None = None) -> DispatchResult:
+        """按已存在任务的 role/prompt 重新本地执行，返回新 DispatchResult。
+
+        provider 签名与基类/远程派发器对齐（此前缺失：脑 /redispatch 带
+        provider 重派本地任务会 TypeError）。
+        """
         rec = self.task_store.get(task_id)
         if rec is None:
             raise KeyError(f"task not found: {task_id}")
         return self.dispatch(role=rec.role, prompt=rec.prompt,
                              context_memory=None, model=model,
-                             worker_id=worker_id)
+                             worker_id=worker_id, provider=provider)

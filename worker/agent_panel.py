@@ -90,18 +90,27 @@ class PanelExecutor:
 
 
 class KernelPanelExecutor(PanelExecutor):
-    """真实实现：每个面板 run 独立 new kernel（规划模式按请求覆盖），
-    与 /task 派发互不共享内核对像，无并发串扰。"""
+    """真实实现：按规划开关缓存两个内核（plain / planning_override），
+    面板 run 复用而非每次重建（同节点同配置；内核自身在 run 起始重置
+    _last_progress，_build_options 指纹缓存对复用是安全的）。"""
 
     def __init__(self, cfg):
         self.cfg = cfg
+        self._plain_kernel: Any | None = None
+        self._planning_kernel: Any | None = None
 
     def _kernel_for(self, planning: bool):
-        kernel = build_worker_kernel(self.cfg)
         if planning:
-            # 请求级规划开关：replace 出独立 config，避免污染共享内核
-            kernel.config = dataclasses.replace(kernel.config, planning_enabled=True)
-        return kernel
+            if self._planning_kernel is None:
+                kernel = build_worker_kernel(self.cfg)
+                # 请求级规划开关：replace 出独立 config 对象，绝不改写共享内核
+                kernel.config = dataclasses.replace(kernel.config,
+                                                    planning_enabled=True)
+                self._planning_kernel = kernel
+            return self._planning_kernel
+        if self._plain_kernel is None:
+            self._plain_kernel = build_worker_kernel(self.cfg)
+        return self._plain_kernel
 
     def stream_events(self, *, prompt, persona, cwd, run_id, sink):
         return self._kernel_for(planning=False).stream(

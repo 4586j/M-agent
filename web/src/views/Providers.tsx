@@ -2,12 +2,13 @@ import { useState } from 'react'
 import type { ProviderList } from '../types'
 import { api } from '../api/client'
 import { usePolling } from '../hooks/usePolling'
+import { POLL } from '../polling'
 
 /** 运行时 Provider 管理：模型/请求地址/密钥（网关级配置）。
  * 密钥只写 brain providers.json，此页回显已打码；${ENV} 引用在派发时由环境解析。
  * 热切：设默认只影响后续新任务，running/排队任务用已解析值。 */
 export default function Providers() {
-  const { data, error, refresh } = usePolling<ProviderList>(() => api.providers(), 8000)
+  const { data, error, refresh } = usePolling<ProviderList>(() => api.providers(), POLL.services)
   const [creating, setCreating] = useState(false)
   const [msg, setMsg] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)

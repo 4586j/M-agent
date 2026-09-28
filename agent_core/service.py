@@ -39,6 +39,7 @@ AGENT_ALLOW_UNAUTHENTICATED=1 可显式恢复全开放（仅限开发/受控环�
 """
 import argparse
 import asyncio
+import heapq
 import json
 import logging
 import os
@@ -52,7 +53,8 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any, AsyncIterator
 
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import (APIRouter, FastAPI, HTTPException, WebSocket,
+                     WebSocketDisconnect)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
@@ -91,6 +93,26 @@ _METRICS: dict = {
 _MAX_METRICS_DURATIONS = 100  # 保留最近 N 次延迟数据
 # Rate Limiting：{client_id: [timestamp, ...]}
 _RATE_LIMIT_STORE: dict[str, list[float]] = {}
+_RATE_LIMIT_CALLS = 0                      # 清扫节流计数
+_RATE_LIMIT_SWEEP_EVERY = 1000  # 每 N 次请求对限流表做一次全量过期清扫
+
+
+def _sweep_rate_limit_store(now: float) -> None:
+    """滑动窗口过期清扫：删除近双窗口（120s）内无请求的客户端 key。
+
+    限流表按客户端 IP/Key 累积，若只剪枝不摘 key，异构请求源会让字典无限
+    增长。按调用计数节流（每 _RATE_LIMIT_SWEEP_EVERY 次请求一次），摊销 O(1)。
+    """
+    global _RATE_LIMIT_CALLS
+    _RATE_LIMIT_CALLS += 1
+    if _RATE_LIMIT_CALLS < _RATE_LIMIT_SWEEP_EVERY:
+        return
+    _RATE_LIMIT_CALLS = 0
+    cutoff = now - 120.0  # 双窗口：留有余量，避免边界抖动误删
+    for client_id in list(_RATE_LIMIT_STORE):
+        ts = _RATE_LIMIT_STORE[client_id]
+        if not ts or max(ts) < cutoff:
+            del _RATE_LIMIT_STORE[client_id]
 # 运行历史存储（惰性初始化）
 _HISTORY_STORE: RunHistoryStore | None = None
 
@@ -525,9 +547,10 @@ class _RateLimitMiddleware:
         client = scope.get("client") or ("unknown", 0)
         client_id = api_key if api_key else client[0]
         now = time.time()
+        _sweep_rate_limit_store(now)
         window_start = now - 60.0
         timestamps = _RATE_LIMIT_STORE.get(client_id, [])
-        # 清理过期时间戳
+        # 清理过期时间戳；全过期即移除该 key（防 idle 客户端占位）
         timestamps = [t for t in timestamps if t > window_start]
         if len(timestamps) >= self.max_per_minute:
             from starlette.responses import JSONResponse
@@ -539,6 +562,9 @@ class _RateLimitMiddleware:
             )
             await resp(scope, receive, send)
             return
+        if not timestamps:
+            # 历史已全过期：先摘 key 再重建，避免再写回一个纯空表
+            _RATE_LIMIT_STORE.pop(client_id, None)
         timestamps.append(now)
         _RATE_LIMIT_STORE[client_id] = timestamps
         await self.app(scope, receive, send)
@@ -547,12 +573,21 @@ class _RateLimitMiddleware:
 # ---- 应用工厂 ----
 
 def create_app(default_persona: str = "executor") -> FastAPI:
-    """装配 FastAPI 应用。default_persona 为未显式指定人设时的默认值。"""
+    """装配 FastAPI 应用。default_persona 为未显式指定人设时的默认值。
+
+    路由端点按资源分组在模块级 router 工厂（create_runs_router /
+    create_sessions_router / create_memory_router 等），各 handler 经模块级
+    全局（get_config/get_kernel/_SESSIONS/...）在调用时解析，test_service 的
+    monkeypatch 语义不受拆分影响。
+    """
+
     global _DEFAULT_PERSONA
+
     _DEFAULT_PERSONA = default_persona
 
     app = FastAPI(title="agent_core service", version="1.0.0",
                   description="单机 Agent HTTP 服务（无 brain 注册/心跳）")
+
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
@@ -560,7 +595,9 @@ def create_app(default_persona: str = "executor") -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
     api_key = os.environ.get("AGENT_API_KEY", "")
+
     if api_key:
         app.add_middleware(_ApiKeyMiddleware, api_key=api_key)
     elif _allow_unauthenticated():
@@ -576,8 +613,8 @@ def create_app(default_persona: str = "executor") -> FastAPI:
             "如需恢复旧的全开放模式，请显式设置 AGENT_ALLOW_UNAUTHENTICATED=1。")
         app.add_middleware(_ApiKeyMiddleware, api_key="", loopback_only=True)
 
-    # Rate Limiting 中间件（按配置启用）
     _cfg = get_config()
+
     if getattr(_cfg, "rate_limit_per_minute", 0) > 0:
         app.add_middleware(_RateLimitMiddleware,
                            max_per_minute=_cfg.rate_limit_per_minute)
@@ -589,7 +626,85 @@ def create_app(default_persona: str = "executor") -> FastAPI:
                             content={"code": f"http_{exc.status_code}",
                                      "message": str(exc.detail), "detail": None})
 
-    @app.get("/health")
+    for make_router in (
+        create_runs_router,
+        create_terminal_router,
+        create_workspace_router,
+        create_artifact_router,
+        create_sessions_router,
+        create_memory_router,
+        create_system_router,
+        create_history_router,
+    ):
+        app.include_router(make_router())
+
+    return app
+
+def _event_payload(ev: Any) -> dict:
+    """把 AgentEvent 转为可 JSON 化的 SSE data payload。"""
+    if ev.type == "text_delta":
+        return {"text": ev.data if isinstance(ev.data, str) else str(ev.data)}
+    if ev.type == "tool_use":
+        d = ev.data if isinstance(ev.data, dict) else {"name": ev.data}
+        return {"name": d.get("name"), "input": d.get("input")}
+    if ev.type == "tool_result":
+        return {"content": ev.data}
+    if ev.type == "budget_warning":
+        return dict(ev.data) if isinstance(ev.data, dict) else {"detail": str(ev.data)}
+    if ev.type == "result":
+        return dict(ev.data) if isinstance(ev.data, dict) else {"detail": str(ev.data)}
+    if ev.type == "error":
+        return {"message": str(ev.data)}
+    return {"data": ev.data}
+
+def _sse_format(event_type: str, payload: Any, limit: int = 2000) -> str:
+    """单条 SSE 帧：event + data（JSON）。
+
+    序列化前先对 payload 内长字符串字段限幅（截断加 "...(truncated)"
+    标记），保证超长 data 仍是合法 JSON。"""
+    data = json.dumps(_clamp_sse_strings(payload, limit),
+                      ensure_ascii=False, default=str)
+    return f"event: {event_type}\ndata: {data}\n\n"
+
+async def _sse_stream(events: AsyncIterator[AgentEvent]):
+    """消费 AgentEvent 流并产出 SSE 帧（异常收敛为 error 帧）。"""
+    try:
+        async for ev in events:
+            yield _sse_format(ev.type, _event_payload(ev))
+    except Exception as e:  # noqa: BLE001 - 转发层异常也收敛为 error 帧
+        yield _sse_format("error", {"message": f"流式转发异常：{e}"})
+
+def _streaming_response(events) -> StreamingResponse:
+    return StreamingResponse(
+        _sse_stream(events), media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+def _ws_authorized(ws: WebSocket) -> bool:
+    """WebSocket 鉴权：与 HTTP 同口径（AGENT_API_KEY 或仅环回）。"""
+    key = os.environ.get("AGENT_API_KEY", "")
+    if not key:
+        host = (ws.client.host if ws.client else "") or ""
+        return host in ("127.0.0.1", "::1", "localhost")
+    supplied = (ws.query_params.get("api_key")
+                or ws.headers.get("x-api-key", ""))
+    return supplied == key
+
+class WorkspaceReq(BaseModel):
+    path: str = Field(..., description="工作区绝对路径（须已存在的目录）")
+
+def _memory_backend() -> dict:
+    """按 config.memory_backend 构造记忆后端（local/remote 函数集）。"""
+    from agent_core.tools import _make_local_backend, _make_remote_backend
+    config = get_config()
+    if config.memory_backend == "remote":
+        return _make_remote_backend(config)
+    return _make_local_backend(config)
+
+def create_system_router() -> APIRouter:
+    """(由 create_app 拆出的路由组；handler 语义未变)"""
+    router = APIRouter()
+
+    @router.get("/health")
     def health() -> dict:
         """健康检查（含 doctor 自检 checks 汇总；自检失败不影响存活判定）。"""
         global _HEALTH_CHECKS
@@ -604,50 +719,66 @@ def create_app(default_persona: str = "executor") -> FastAPI:
             summary = {"total": 0, "ok": 0, "warn": 0, "fail": 0, "items": []}
         return {"status": "ok", "service": "agent_core", "checks": summary}
 
-    # ---- SSE 流式辅助 ----
+    @router.get("/agent/status")
+    def agent_status() -> dict:
+        """内核状态：会话用量与 oneshot 用量分开返回。"""
+        config = get_config()
+        total_cost = 0.0
+        total_turns = 0
+        for entry in _SESSIONS.values():
+            s = entry["session"]
+            total_cost += getattr(s, "total_cost", 0.0) or 0.0
+            total_turns += getattr(s, "total_turns", 0) or 0
+        return {
+            "active_sessions": len(_SESSIONS),
+            # 兼容旧字段（会话口径）
+            "total_cost_usd": round(total_cost, 6),
+            "total_turns": total_turns,
+            "session_usage": {
+                "sessions": len(_SESSIONS),
+                "total_cost_usd": round(total_cost, 6),
+                "total_turns": total_turns,
+            },
+            "oneshot_usage": {
+                "runs": _ONESHOT_TOTALS["runs"],
+                "errors": _ONESHOT_TOTALS["errors"],
+                "total_cost_usd": round(_ONESHOT_TOTALS["total_cost_usd"], 6),
+                "total_turns": _ONESHOT_TOTALS["total_turns"],
+            },
+            "default_persona": _DEFAULT_PERSONA,
+            "model": config.model,
+            "memory_backend": config.memory_backend,
+        }
 
-    def _event_payload(ev: Any) -> dict:
-        """把 AgentEvent 转为可 JSON 化的 SSE data payload。"""
-        if ev.type == "text_delta":
-            return {"text": ev.data if isinstance(ev.data, str) else str(ev.data)}
-        if ev.type == "tool_use":
-            d = ev.data if isinstance(ev.data, dict) else {"name": ev.data}
-            return {"name": d.get("name"), "input": d.get("input")}
-        if ev.type == "tool_result":
-            return {"content": ev.data}
-        if ev.type == "budget_warning":
-            return dict(ev.data) if isinstance(ev.data, dict) else {"detail": str(ev.data)}
-        if ev.type == "result":
-            return dict(ev.data) if isinstance(ev.data, dict) else {"detail": str(ev.data)}
-        if ev.type == "error":
-            return {"message": str(ev.data)}
-        return {"data": ev.data}
+    @router.get("/agent/metrics")
+    def agent_metrics() -> dict:
+        """可观测性指标：延迟分布、错误分类、纠错统计。
 
-    def _sse_format(event_type: str, payload: Any, limit: int = 2000) -> str:
-        """单条 SSE 帧：event + data（JSON）。
+        返回 JSON 格式（便于前端展示）；同时支持 Prometheus text 格式
+        （Accept: text/plain 时）。
+        """
+        durations = sorted(_METRICS["durations_ms"])
+        n = len(durations)
+        p50 = durations[n // 2] if n > 0 else 0
+        p95 = durations[int(n * 0.95)] if n > 0 else 0
+        p99 = durations[int(n * 0.99)] if n > 0 else 0
+        return {
+            "runs_total": _ONESHOT_TOTALS["runs"],
+            "errors_total": _ONESHOT_TOTALS["errors"],
+            "cost_usd_total": round(_ONESHOT_TOTALS["total_cost_usd"], 6),
+            "duration_ms": {"p50": p50, "p95": p95, "p99": p99, "count": n},
+            "error_types": dict(_METRICS["error_types"]),
+            "corrections_total": _METRICS["total_corrections"],
+            "active_sessions": len(_SESSIONS),
+        }
 
-        序列化前先对 payload 内长字符串字段限幅（截断加 "...(truncated)"
-        标记），保证超长 data 仍是合法 JSON。"""
-        data = json.dumps(_clamp_sse_strings(payload, limit),
-                          ensure_ascii=False, default=str)
-        return f"event: {event_type}\ndata: {data}\n\n"
+    return router
 
-    async def _sse_stream(events: AsyncIterator[AgentEvent]):
-        """消费 AgentEvent 流并产出 SSE 帧（异常收敛为 error 帧）。"""
-        try:
-            async for ev in events:
-                yield _sse_format(ev.type, _event_payload(ev))
-        except Exception as e:  # noqa: BLE001 - 转发层异常也收敛为 error 帧
-            yield _sse_format("error", {"message": f"流式转发异常：{e}"})
+def create_runs_router() -> APIRouter:
+    """(由 create_app 拆出的路由组；handler 语义未变)"""
+    router = APIRouter()
 
-    def _streaming_response(events) -> StreamingResponse:
-        return StreamingResponse(
-            _sse_stream(events), media_type="text/event-stream",
-            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
-
-    # ---- 单发：同步 / 流式 / 异步 ----
-
-    @app.post("/agent/run")
+    @router.post("/agent/run")
     async def agent_run(req: RunReq) -> dict:
         """单发执行：临时工作目录跑一轮，返回 KernelResult JSON。"""
         persona = resolve_persona(req.persona or _DEFAULT_PERSONA)
@@ -662,7 +793,7 @@ def create_app(default_persona: str = "executor") -> FastAPI:
         d["usage_summary"] = _format_usage_summary(d)
         return d
 
-    @app.post("/agent/run/stream")
+    @router.post("/agent/run/stream")
     async def agent_run_stream(req: RunReq):
         """单发流式执行（SSE）。事件名：thinking/thinking_delta/text_delta/
         tool_use/tool_result/plan_update/budget_warning/result/error；
@@ -713,7 +844,7 @@ def create_app(default_persona: str = "executor") -> FastAPI:
 
         return _streaming_response(_events_with_bookkeeping())
 
-    @app.post("/agent/run/async", status_code=202)
+    @router.post("/agent/run/async", status_code=202)
     async def agent_run_async(req: RunReq):
         """异步单发：立即返回 202 + {run_id}，后台任务执行 run_oneshot。
 
@@ -767,7 +898,7 @@ def create_app(default_persona: str = "executor") -> FastAPI:
         return JSONResponse(status_code=202,
                             content={"run_id": run_id, "status": "running"})
 
-    @app.get("/agent/run/{run_id}")
+    @router.get("/agent/run/{run_id}")
     async def agent_run_get(run_id: str):
         """查询异步运行：status ∈ running/completed/failed/cancelled。"""
         entry = _ASYNC_RUNS.get(run_id)
@@ -784,7 +915,7 @@ def create_app(default_persona: str = "executor") -> FastAPI:
             resp["error"] = entry["error"]
         return resp
 
-    @app.delete("/agent/run/{run_id}")
+    @router.delete("/agent/run/{run_id}")
     async def agent_run_cancel(run_id: str):
         """请求取消异步运行：置位 cancel_event，在下一个消息边界停下。"""
         entry = _ASYNC_RUNS.get(run_id)
@@ -794,19 +925,13 @@ def create_app(default_persona: str = "executor") -> FastAPI:
         return {"run_id": run_id, "status": entry["status"],
                 "cancel_requested": True}
 
-    # ---- 内嵌终端（WebSocket：持久 cwd 会话，用户直接操作终端） ----
+    return router
 
-    def _ws_authorized(ws: WebSocket) -> bool:
-        """WebSocket 鉴权：与 HTTP 同口径（AGENT_API_KEY 或仅环回）。"""
-        key = os.environ.get("AGENT_API_KEY", "")
-        if not key:
-            host = (ws.client.host if ws.client else "") or ""
-            return host in ("127.0.0.1", "::1", "localhost")
-        supplied = (ws.query_params.get("api_key")
-                    or ws.headers.get("x-api-key", ""))
-        return supplied == key
+def create_terminal_router() -> APIRouter:
+    """(由 create_app 拆出的路由组；handler 语义未变)"""
+    router = APIRouter()
 
-    @app.websocket("/agent/terminal")
+    @router.websocket("/agent/terminal")
     async def agent_terminal(ws: WebSocket):
         """内嵌终端：WebSocket 双向通道。
 
@@ -961,19 +1086,20 @@ def create_app(default_persona: str = "executor") -> FastAPI:
                 except Exception:  # noqa: BLE001
                     pass
 
-    # ---- 工作区（agent 默认操作边界） ----
+    return router
 
-    class WorkspaceReq(BaseModel):
-        path: str = Field(..., description="工作区绝对路径（须已存在的目录）")
+def create_workspace_router() -> APIRouter:
+    """(由 create_app 拆出的路由组；handler 语义未变)"""
+    router = APIRouter()
 
-    @app.get("/agent/workspace")
+    @router.get("/agent/workspace")
     def get_workspace() -> dict:
         """当前工作区：agent 的任务目录与终端默认 cwd 都限定在此范围内。"""
         ws = _workspace_path()
         return {"path": str(ws), "name": ws.name or str(ws),
                 "exists": ws.is_dir()}
 
-    @app.put("/agent/workspace")
+    @router.put("/agent/workspace")
     def set_workspace(req: WorkspaceReq) -> dict:
         """切换工作区（须为已存在目录）。"""
         p = Path(req.path).expanduser()
@@ -983,14 +1109,24 @@ def create_app(default_persona: str = "executor") -> FastAPI:
         logger.info("工作区已切换为 %s", _WORKSPACE["path"])
         return {"path": str(_WORKSPACE["path"]), "name": _WORKSPACE["path"].name}
 
-    # ---- 运行事件回放 / 产物只读 / 面板（Agent 面板数据源） ----
+    return router
 
-    @app.get("/agent/runs")
+def create_artifact_router() -> APIRouter:
+    """(由 create_app 拆出的路由组；handler 语义未变)"""
+    router = APIRouter()
+
+    @router.get("/agent/runs")
     def list_runs(limit: int = 50) -> dict:
-        """列出运行（runs/<id>.meta.json，按 started_at 新→旧）。"""
+        """列出运行（runs/<id>.meta.json，按 mtime 新→旧）。"""
+        # nlargest 只保留最新 limit 个元数据路径，避免全量排序 + 全读
+        try:
+            latest = heapq.nlargest(
+                max(0, limit), _runs_dir().glob("*.meta.json"),
+                key=lambda p: p.stat().st_mtime)
+        except OSError:
+            latest = []
         items = []
-        for meta_path in sorted(_runs_dir().glob("*.meta.json"),
-                                key=lambda p: p.stat().st_mtime, reverse=True)[:max(0, limit)]:
+        for meta_path in latest:
             try:
                 meta = json.loads(meta_path.read_text(encoding="utf-8"))
                 items.append(meta)
@@ -998,13 +1134,16 @@ def create_app(default_persona: str = "executor") -> FastAPI:
                 continue
         return {"runs": items}
 
-    @app.get("/agent/run/{run_id}/events")
+    @router.get("/agent/run/{run_id}/events")
     def replay_run_events(run_id: str, limit: int = 5000) -> list:
-        """回放一次 run 的全量事件（按 seq 升序，供面板回放模式）。"""
+        """回放一次 run 的最近事件（按 seq 升序，max_replay 条；供面板回放模式）。"""
         events_path = _runs_dir() / f"{run_id}.jsonl"
         if not events_path.exists():
             raise HTTPException(status_code=404,
                                 detail=f"run 事件不存在: {run_id}")
+        max_replay = max(0, limit)
+        if max_replay == 0:
+            return []                       # 与旧 [:0] 语义一致
         out = []
         with open(events_path, encoding="utf-8") as f:
             for line in f:
@@ -1015,9 +1154,11 @@ def create_app(default_persona: str = "executor") -> FastAPI:
                     out.append(json.loads(line))
                 except ValueError:
                     continue
-        return out[:max(0, limit)]
+                if len(out) >= max_replay:   # 达到上限即停，不整读超长文件
+                    break
+        return out
 
-    @app.get("/agent/artifact/{run_id}")
+    @router.get("/agent/artifact/{run_id}")
     def read_run_artifact(run_id: str, path: str):
         """只读回传该 run 工作目录下的产物文件（防路径穿越；二进制 base64）。"""
         meta_path = _run_meta_path(run_id)
@@ -1048,7 +1189,7 @@ def create_app(default_persona: str = "executor") -> FastAPI:
             return {"path": path, "content": base64.b64encode(data).decode("ascii"),
                     "encoding": "base64", "size": size}
 
-    @app.get("/panel")
+    @router.get("/panel")
     def serve_panel():
         """Agent 面板（单文件深色 UI，由本服务直接托管）。"""
         from fastapi.responses import FileResponse
@@ -1057,15 +1198,19 @@ def create_app(default_persona: str = "executor") -> FastAPI:
             raise HTTPException(status_code=404, detail="panel 未安装")
         return FileResponse(panel, media_type="text/html")
 
-    @app.get("/")
+    @router.get("/")
     def root_redirect():
         """根路径重定向到面板。"""
         from fastapi.responses import RedirectResponse
         return RedirectResponse(url="/panel")
 
-    # ---- 多轮会话 ----
+    return router
 
-    @app.post("/agent/session")
+def create_sessions_router() -> APIRouter:
+    """(由 create_app 拆出的路由组；handler 语义未变)"""
+    router = APIRouter()
+
+    @router.post("/agent/session")
     async def agent_session_create(req: SessionCreateReq) -> dict:
         """创建多轮会话并连接底层客户端，返回本地 session_id。"""
         persona_name = req.persona or _DEFAULT_PERSONA
@@ -1081,7 +1226,7 @@ def create_app(default_persona: str = "executor") -> FastAPI:
         _SESSIONS[sid] = {"session": session, "cwd": cwd, "persona": persona_name}
         return {"session_id": sid, "persona": persona_name, "cwd": cwd}
 
-    @app.post("/agent/session/{session_id}/message")
+    @router.post("/agent/session/{session_id}/message")
     async def agent_session_message(session_id: str, req: SessionMessageReq) -> dict:
         """向已存在会话发一轮消息，聚合完整响应后返回。"""
         entry = _SESSIONS.get(session_id)
@@ -1089,7 +1234,7 @@ def create_app(default_persona: str = "executor") -> FastAPI:
             raise HTTPException(status_code=404, detail="session not found")
         return await _run_session_turn(entry["session"], req.prompt, req.timeout)
 
-    @app.post("/agent/session/{session_id}/message/stream")
+    @router.post("/agent/session/{session_id}/message/stream")
     async def agent_session_message_stream(session_id: str, req: SessionMessageReq):
         """向已存在会话发一轮消息（SSE 流式转发 AgentSession 事件）。"""
         entry = _SESSIONS.get(session_id)
@@ -1102,7 +1247,7 @@ def create_app(default_persona: str = "executor") -> FastAPI:
             events = session.send(req.prompt)
         return _streaming_response(events)
 
-    @app.post("/agent/session/{session_id}/interrupt")
+    @router.post("/agent/session/{session_id}/interrupt")
     async def agent_session_interrupt(session_id: str):
         """中断会话当前轮（协作式，在 turn 边界停下）。"""
         entry = _SESSIONS.get(session_id)
@@ -1114,7 +1259,7 @@ def create_app(default_persona: str = "executor") -> FastAPI:
             return _error(500, "interrupt_failed", f"中断失败：{e}")
         return {"status": "interrupt_requested", "session_id": session_id}
 
-    @app.get("/agent/sessions")
+    @router.get("/agent/sessions")
     def agent_sessions_list() -> dict:
         """列出活跃会话元数据（本地 id / 人设 / 工作目录 / 累计用量）。"""
         out = []
@@ -1130,7 +1275,7 @@ def create_app(default_persona: str = "executor") -> FastAPI:
             })
         return {"sessions": out, "count": len(out)}
 
-    @app.delete("/agent/session/{session_id}")
+    @router.delete("/agent/session/{session_id}")
     async def agent_session_close(session_id: str) -> dict:
         """关闭会话并释放底层连接。"""
         entry = _SESSIONS.pop(session_id, None)
@@ -1142,7 +1287,13 @@ def create_app(default_persona: str = "executor") -> FastAPI:
             pass
         return {"status": "closed", "session_id": session_id}
 
-    @app.get("/agent/tools")
+    return router
+
+def create_memory_router() -> APIRouter:
+    """(由 create_app 拆出的路由组；handler 语义未变)"""
+    router = APIRouter()
+
+    @router.get("/agent/tools")
     def agent_tools(persona: str | None = None) -> dict:
         """列出指定（或默认）人设的可用工具、技能、MCP 服务与记忆工具。"""
         p = resolve_persona(persona or _DEFAULT_PERSONA)
@@ -1158,17 +1309,7 @@ def create_app(default_persona: str = "executor") -> FastAPI:
                              "write_core_memory", "write_task_context"],
         }
 
-    # ---- 核心记忆 HTTP 端点（复用 tools.py 记忆后端读写） ----
-
-    def _memory_backend() -> dict:
-        """按 config.memory_backend 构造记忆后端（local/remote 函数集）。"""
-        from agent_core.tools import _make_local_backend, _make_remote_backend
-        config = get_config()
-        if config.memory_backend == "remote":
-            return _make_remote_backend(config)
-        return _make_local_backend(config)
-
-    @app.get("/agent/memory/core")
+    @router.get("/agent/memory/core")
     def memory_core_list() -> dict:
         """列出核心记忆（name/size/updated_at；remote 后端仅列本地目录）。"""
         config = get_config()
@@ -1189,7 +1330,7 @@ def create_app(default_persona: str = "executor") -> FastAPI:
         return {"memories": items, "count": len(items),
                 "backend": config.memory_backend, "dir": str(d)}
 
-    @app.get("/agent/memory/core/{name}")
+    @router.get("/agent/memory/core/{name}")
     async def memory_core_get(name: str):
         """读取一条核心记忆；不存在返回 404（统一错误形状）。"""
         if not _valid_memory_name(name):
@@ -1204,7 +1345,7 @@ def create_app(default_persona: str = "executor") -> FastAPI:
             return _error(404, "not_found", f"记忆 '{name}' 不存在或为空")
         return {"name": name, "content": content}
 
-    @app.put("/agent/memory/core/{name}")
+    @router.put("/agent/memory/core/{name}")
     async def memory_core_put(name: str, req: MemoryWriteReq):
         """写入一条核心记忆（覆盖写）。local 后端回显落盘路径。"""
         if not _valid_memory_name(name):
@@ -1226,62 +1367,13 @@ def create_app(default_persona: str = "executor") -> FastAPI:
             path = str(Path(get_config().memory_core_dir) / f"{name}.md")
         return {"status": "written", "name": name, "path": path}
 
-    @app.get("/agent/status")
-    def agent_status() -> dict:
-        """内核状态：会话用量与 oneshot 用量分开返回。"""
-        config = get_config()
-        total_cost = 0.0
-        total_turns = 0
-        for entry in _SESSIONS.values():
-            s = entry["session"]
-            total_cost += getattr(s, "total_cost", 0.0) or 0.0
-            total_turns += getattr(s, "total_turns", 0) or 0
-        return {
-            "active_sessions": len(_SESSIONS),
-            # 兼容旧字段（会话口径）
-            "total_cost_usd": round(total_cost, 6),
-            "total_turns": total_turns,
-            "session_usage": {
-                "sessions": len(_SESSIONS),
-                "total_cost_usd": round(total_cost, 6),
-                "total_turns": total_turns,
-            },
-            "oneshot_usage": {
-                "runs": _ONESHOT_TOTALS["runs"],
-                "errors": _ONESHOT_TOTALS["errors"],
-                "total_cost_usd": round(_ONESHOT_TOTALS["total_cost_usd"], 6),
-                "total_turns": _ONESHOT_TOTALS["total_turns"],
-            },
-            "default_persona": _DEFAULT_PERSONA,
-            "model": config.model,
-            "memory_backend": config.memory_backend,
-        }
+    return router
 
-    @app.get("/agent/metrics")
-    def agent_metrics() -> dict:
-        """可观测性指标：延迟分布、错误分类、纠错统计。
+def create_history_router() -> APIRouter:
+    """(由 create_app 拆出的路由组；handler 语义未变)"""
+    router = APIRouter()
 
-        返回 JSON 格式（便于前端展示）；同时支持 Prometheus text 格式
-        （Accept: text/plain 时）。
-        """
-        durations = sorted(_METRICS["durations_ms"])
-        n = len(durations)
-        p50 = durations[n // 2] if n > 0 else 0
-        p95 = durations[int(n * 0.95)] if n > 0 else 0
-        p99 = durations[int(n * 0.99)] if n > 0 else 0
-        return {
-            "runs_total": _ONESHOT_TOTALS["runs"],
-            "errors_total": _ONESHOT_TOTALS["errors"],
-            "cost_usd_total": round(_ONESHOT_TOTALS["total_cost_usd"], 6),
-            "duration_ms": {"p50": p50, "p95": p95, "p99": p99, "count": n},
-            "error_types": dict(_METRICS["error_types"]),
-            "corrections_total": _METRICS["total_corrections"],
-            "active_sessions": len(_SESSIONS),
-        }
-
-    # ---- 运行历史 / 用量统计 / Trace 查询 ----
-
-    @app.get("/agent/history")
+    @router.get("/agent/history")
     def agent_history(limit: int = 50, offset: int = 0,
                       status: str = "all") -> dict:
         """查询运行历史：分页 + 状态过滤。"""
@@ -1300,7 +1392,7 @@ def create_app(default_persona: str = "executor") -> FastAPI:
             "offset": offset,
         }
 
-    @app.get("/agent/stats")
+    @router.get("/agent/stats")
     def agent_stats(period: str = "daily", days: int = 7) -> dict:
         """用量趋势统计：按天/小时聚合。"""
         from datetime import datetime, timedelta, timezone
@@ -1366,7 +1458,7 @@ def create_app(default_persona: str = "executor") -> FastAPI:
             },
         }
 
-    @app.get("/agent/trace/{run_id}")
+    @router.get("/agent/trace/{run_id}")
     def agent_trace(run_id: str) -> dict:
         """查询单次执行的 trace 详情。
 
@@ -1400,7 +1492,8 @@ def create_app(default_persona: str = "executor") -> FastAPI:
             return {"trace": None, "message": "该次执行未记录 trace"}
         return {"run_id": run_id, "trace": trace}
 
-    return app
+    return router
+
 
 
 # 模块级 app：供 `uvicorn agent_core.service:app` 直接引用

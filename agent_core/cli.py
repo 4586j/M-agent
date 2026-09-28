@@ -32,18 +32,12 @@ import os
 import sys
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 from agent_core.config import AgentConfig, load_agent_config
 from agent_core.context import load_core_memories_block
 from agent_core.kernel import AgentKernel
-from agent_core.persona import (
-    Persona,
-    list_persona_names,
-    load_persona_by_name,
-    parse_subagents,
-    strip_frontmatter,
-)
+from agent_core.persona import Persona, resolve_persona
 from agent_core.planning import (
     PlanningManager,
     build_planning_prompt,
@@ -237,50 +231,7 @@ def load_session(path: str | Path | None = None) -> str | None:
         return None
 
 
-# ---- 人设解析 ----
-
-def _build_orchestrator_persona(config: AgentConfig) -> Persona:
-    """构造 orchestrator（大脑）人设：orchestrator SKILL.md 正文 + 子 agent 注册。
-
-    等价于 orch_cli 的大脑姿态：加载编排工作流作为系统提示，并把
-    .claude/agents/ 下的 executor / security-guard 作为子 agent 供 Agent 工具派发。
-    """
-    skill_md = (Path(config.project_root) / "workspace" / "agent" / "skills"
-                / "orchestrator" / "SKILL.md")
-    body = "你是 orchestrator，多 agent 编排框架的大脑。"
-    if skill_md.is_file():
-        body += "\n\n" + strip_frontmatter(skill_md.read_text(encoding="utf-8"))
-    return Persona(
-        name="orchestrator",
-        description="编排大脑：拆解目标、派发子 agent、汇总裁决",
-        model=None,
-        tools=None,
-        system_prompt=body,
-        sub_agents=parse_subagents(config.persona_dir),
-    )
-
-
-def resolve_persona(name: str, config: AgentConfig) -> Persona:
-    """按名称解析人设。
-
-    - 优先在 persona_dir 下找 <name>.md（executor / security-guard 等）；
-    - name == orchestrator 且无定义文件时，回退构造大脑人设（等同 orch_cli）；
-    - 其余未知名给最小人设兜底，避免直接崩溃，并打印警告列出可用人设名。
-    """
-    try:
-        return load_persona_by_name(name, config.persona_dir)
-    except FileNotFoundError:
-        if name == "orchestrator":
-            return _build_orchestrator_persona(config)
-        available = list_persona_names(config.persona_dir)
-        print(dim(f"[persona] 未找到人设定义 '{name}'（目录：{config.persona_dir}）；"
-                  f"可用人设：{', '.join(available) or '无'}；已回退最小人设。"),
-              file=sys.stderr)
-        return Persona(
-            name=name,
-            description=f"{name}（未找到定义文件，使用最小人设）",
-            system_prompt=f"你是 {name}。请按用户指令完成任务。",
-        )
+# ---- 人设解析（resolve_persona 统一实现见 agent_core.persona） ----
 
 
 # ---- slash 命令清单（补全与 /help 共用） ----
@@ -1125,10 +1076,6 @@ def _usage_file_path(state: CliState) -> Path | None:
     return root / ".agent_usage" / f"{sid}.jsonl"
 
 
-def _valid_memory_name(name: str) -> bool:
-    """记忆名校验：委托 tools.valid_memory_name（与 service 共用同一实现，
-    含 Windows 保留设备名黑名单）。"""
-    return valid_memory_name(name)
 
 
 async def _interactive_write_memory(cfg: AgentConfig, name: str,
@@ -1158,174 +1105,206 @@ async def _interactive_write_memory(cfg: AgentConfig, name: str,
 
 
 async def handle_command(state: CliState, text: str, ui: Any) -> None:
-    """处理 slash 命令。/exit /quit 置 stop；/new 重连会话。"""
+    """处理 slash 命令：按命令名查分发表，分发到各自 handler。
+
+    /exit /quit 置 stop；/new 重连会话。未命中命令提示未知命令不发送。
+    """
     cmd = text.split()[0]
-    cfg = state.config
-
-    if cmd in ("/exit", "/quit"):
-        state.stop = True
+    handler = _COMMAND_HANDLERS.get(cmd)
+    if handler is None:
+        ui.info(f"· 未知命令 {cmd}（未发送；/help 查看命令）")
         return
+    await handler(state, text, ui)
 
-    if cmd == "/help":
-        ui.help()
-        return
 
-    if cmd == "/new":
+def _memory_name_error_msg() -> str:
+    """记忆名校验失败提示（/memory set 与 /memory 读共用，保持提示一致）。"""
+    return ("· 记忆名只能含字母/数字/下划线/连字符，不含路径分隔符，"
+            "且不得为 Windows 保留设备名（con/nul 等）")
+
+
+async def _close_current_session(state: CliState) -> None:
+    """关闭当前会话（/new 与 /switch 换会话前共用；关闭失败不阻断）。"""
+    if state.session is not None:
         try:
-            if state.session is not None:
-                await state.session.close()
+            await state.session.close()
         except Exception:  # noqa: BLE001 - 关闭失败不阻断新会话
             pass
-        await _open_session(state, ui=ui)
-        ui.info("· 已开新会话（核心记忆保留，上下文清空）")
-        return
 
-    if cmd == "/sessions":
-        records = load_session_records(
-            sessions_dir=_sessions_dir(cfg.project_root))
-        ui.info(_render_session_records(records))
-        return
 
-    if cmd == "/switch":
-        parts = text.split()
-        records = load_session_records(
-            sessions_dir=_sessions_dir(cfg.project_root))
-        if len(parts) < 2 or not parts[1].isdigit():
-            ui.info("· 用法：/switch <序号>（先 /sessions 查看列表）")
-            return
-        idx = int(parts[1])
-        if not (1 <= idx <= len(records)):
-            ui.info(f"· 序号超出范围（1-{len(records)}）")
-            return
-        target = records[idx - 1]
-        try:
-            if state.session is not None:
-                await state.session.close()
-        except Exception:  # noqa: BLE001
-            pass
-        await _open_session(state, resume_id=target.get("session_id"), ui=ui)
-        # 元数据继承自目标记录；resume 失败降级时 _open_session 已重置
-        if state.session is not None and \
-                state.session.session_id == target.get("session_id"):
-            state.session_meta = {
-                "persona": target.get("persona") or state.persona.name,
-                "first_message": target.get("first_message") or "",
-                "created_at": target.get("created_at")
-                or time.strftime("%Y-%m-%d %H:%M:%S"),
-            }
-        ui.info(f"· 已切换到会话 {target.get('session_id')}"
-                f"（人设：{target.get('persona') or '(未知)'}）")
-        return
+async def _cmd_exit(state: CliState, text: str, ui: Any) -> None:
+    state.stop = True
 
-    if cmd == "/session":
-        s = state.session
-        sid = s.session_id if s else None
-        meta = state.session_meta
-        lines = ["当前会话：",
-                 f"  session_id：{sid or '（尚未产生）'}",
-                 f"  人设：{meta.get('persona') or state.persona.name}",
-                 f"  工作目录：{state.cwd}",
-                 f"  创建时间：{meta.get('created_at') or '—'}",
-                 f"  首条消息：{meta.get('first_message') or '—'}",
-                 f"  累计 turns：{getattr(s, 'total_turns', 0) if s else 0}",
-                 f"  累计 cost：${getattr(s, 'total_cost', 0.0) or 0.0:.4f}"]
-        if sid:
-            lines.append(f"  记录文件：.agent_sessions/{sid}.json")
-        ui.info("\n".join(lines))
-        return
 
-    if cmd == "/usage":
-        p = _usage_file_path(state)
-        if p is None:
-            ui.info("· 尚未产生 session_id（先发一条消息）")
-            return
-        pending = state.turn_records[state.usage_flushed:]
-        try:
-            p.parent.mkdir(parents=True, exist_ok=True)
-            with p.open("a", encoding="utf-8") as f:
-                for rec in pending:
-                    f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-            state.usage_flushed = len(state.turn_records)
-            ui.info(f"· 已追加写入 {len(pending)} 条用量记录 → {p}")
-        except Exception as e:  # noqa: BLE001 - 写盘失败只提示不崩溃
-            ui.info(f"· 写入失败：{e}")
-        return
+async def _cmd_help(state: CliState, text: str, ui: Any) -> None:
+    ui.help()
 
-    if cmd == "/cost":
-        s = state.session
-        ui.cost(s.total_turns if s else 0, s.total_cost if s else 0.0)
-        return
 
-    if cmd == "/tools":
-        ui.tools(state)
-        return
+async def _cmd_new(state: CliState, text: str, ui: Any) -> None:
+    await _close_current_session(state)
+    await _open_session(state, ui=ui)
+    ui.info("· 已开新会话（核心记忆保留，上下文清空）")
 
-    if cmd == "/plan":
-        if state.planning_mgr is None:
-            ui.info("· 未启用规划模式（启动加 --planning）")
+
+async def _cmd_sessions(state: CliState, text: str, ui: Any) -> None:
+    records = load_session_records(
+        sessions_dir=_sessions_dir(state.config.project_root))
+    ui.info(_render_session_records(records))
+
+
+async def _cmd_switch(state: CliState, text: str, ui: Any) -> None:
+    cfg = state.config
+    parts = text.split()
+    records = load_session_records(sessions_dir=_sessions_dir(cfg.project_root))
+    if len(parts) < 2 or not parts[1].isdigit():
+        ui.info("· 用法：/switch <序号>（先 /sessions 查看列表）")
+        return
+    idx = int(parts[1])
+    if not (1 <= idx <= len(records)):
+        ui.info(f"· 序号超出范围（1-{len(records)}）")
+        return
+    target = records[idx - 1]
+    await _close_current_session(state)
+    await _open_session(state, resume_id=target.get("session_id"), ui=ui)
+    # 元数据继承自目标记录；resume 失败降级时 _open_session 已重置
+    if state.session is not None and \
+            state.session.session_id == target.get("session_id"):
+        state.session_meta = {
+            "persona": target.get("persona") or state.persona.name,
+            "first_message": target.get("first_message") or "",
+            "created_at": target.get("created_at")
+            or time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+    ui.info(f"· 已切换到会话 {target.get('session_id')}"
+            f"（人设：{target.get('persona') or '(未知)'}）")
+
+
+async def _cmd_session(state: CliState, text: str, ui: Any) -> None:
+    s = state.session
+    sid = s.session_id if s else None
+    meta = state.session_meta
+    lines = ["当前会话：",
+             f"  session_id：{sid or '（尚未产生）'}",
+             f"  人设：{meta.get('persona') or state.persona.name}",
+             f"  工作目录：{state.cwd}",
+             f"  创建时间：{meta.get('created_at') or '—'}",
+             f"  首条消息：{meta.get('first_message') or '—'}",
+             f"  累计 turns：{getattr(s, 'total_turns', 0) if s else 0}",
+             f"  累计 cost：${getattr(s, 'total_cost', 0.0) or 0.0:.4f}"]
+    if sid:
+        lines.append(f"  记录文件：.agent_sessions/{sid}.json")
+    ui.info("\n".join(lines))
+
+
+async def _cmd_usage(state: CliState, text: str, ui: Any) -> None:
+    p = _usage_file_path(state)
+    if p is None:
+        ui.info("· 尚未产生 session_id（先发一条消息）")
+        return
+    pending = state.turn_records[state.usage_flushed:]
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with p.open("a", encoding="utf-8") as f:
+            for rec in pending:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        state.usage_flushed = len(state.turn_records)
+        ui.info(f"· 已追加写入 {len(pending)} 条用量记录 → {p}")
+    except Exception as e:  # noqa: BLE001 - 写盘失败只提示不崩溃
+        ui.info(f"· 写入失败：{e}")
+
+
+async def _cmd_cost(state: CliState, text: str, ui: Any) -> None:
+    s = state.session
+    ui.cost(s.total_turns if s else 0, s.total_cost if s else 0.0)
+
+
+async def _cmd_tools(state: CliState, text: str, ui: Any) -> None:
+    ui.tools(state)
+
+
+async def _cmd_plan(state: CliState, text: str, ui: Any) -> None:
+    if state.planning_mgr is None:
+        ui.info("· 未启用规划模式（启动加 --planning）")
+    else:
+        plan = state.planning_mgr.load_plan(state.session_key)
+        if plan is None:
+            ui.info("· （无进行中的计划；先发一条任务让 Agent 产出计划）")
         else:
-            plan = state.planning_mgr.load_plan(state.session_key)
-            if plan is None:
-                ui.info("· （无进行中的计划；先发一条任务让 Agent 产出计划）")
-            else:
-                ui.plan(plan)
-        return
+            ui.plan(plan)
 
-    if cmd == "/memory":
-        parts = text.split()
-        if len(parts) == 1:
-            ui.memory(load_core_memories_block(cfg.memory_core_dir))
+
+async def _cmd_memory(state: CliState, text: str, ui: Any) -> None:
+    cfg = state.config
+    parts = text.split()
+    if len(parts) == 1:
+        ui.memory(load_core_memories_block(cfg.memory_core_dir))
+        return
+    if parts[1] == "set":
+        if len(parts) < 3:
+            ui.info("· 用法：/memory set <名称>（随后逐行输入内容，空行结束）")
             return
-        if parts[1] == "set":
-            if len(parts) < 3:
-                ui.info("· 用法：/memory set <名称>（随后逐行输入内容，空行结束）")
-                return
-            name = parts[2]
-            if not _valid_memory_name(name):
-                ui.info("· 记忆名只能含字母/数字/下划线/连字符，不含路径分隔符，且不得为 Windows 保留设备名（con/nul 等）")
-                return
-            path = await _interactive_write_memory(cfg, name)
-            if path:
-                ui.info(f"· 已写入核心记忆 '{name}' → {path}")
-            else:
-                ui.info("· 未输入任何内容，取消写入")
+        name = parts[2]
+        if not valid_memory_name(name):
+            ui.info(_memory_name_error_msg())
             return
-        name = parts[1]
-        if not _valid_memory_name(name):
-            ui.info("· 记忆名只能含字母/数字/下划线/连字符，不含路径分隔符，且不得为 Windows 保留设备名（con/nul 等）")
-            return
-        p = Path(cfg.memory_core_dir) / f"{name}.md"
-        if p.is_file():
-            try:
-                ui.memory(p.read_text(encoding="utf-8"))
-            except Exception as e:  # noqa: BLE001
-                ui.info(f"· 读取失败：{e}")
+        path = await _interactive_write_memory(cfg, name)
+        if path:
+            ui.info(f"· 已写入核心记忆 '{name}' → {path}")
         else:
-            available = sorted(
-                q.stem for q in Path(cfg.memory_core_dir).glob("*.md")
-            ) if Path(cfg.memory_core_dir).is_dir() else []
-            ui.info(f"· 无此记忆 '{name}'（{p}）；"
-                    f"可用：{', '.join(available) or '无'}")
+            ui.info("· 未输入任何内容，取消写入")
         return
-
-    if cmd == "/retry":
-        if not state.last_prompt:
-            ui.info("· 没有可重发的消息（/retry 用于重发上一条失败消息）")
-            return
-        ui.info(f"· 重发上一条消息：{state.last_prompt[:50]}")
-        await _send_user_message(state, state.last_prompt, ui)
+    name = parts[1]
+    if not valid_memory_name(name):
+        ui.info(_memory_name_error_msg())
         return
-
-    if cmd == "/interrupt":
+    p = Path(cfg.memory_core_dir) / f"{name}.md"
+    if p.is_file():
         try:
-            if state.session is not None:
-                await state.session.interrupt()
-            ui.info("· 已请求中断当前轮（在 turn 边界停下）")
+            ui.memory(p.read_text(encoding="utf-8"))
         except Exception as e:  # noqa: BLE001
-            ui.info(f"· 中断失败：{e}")
-        return
+            ui.info(f"· 读取失败：{e}")
+    else:
+        available = sorted(
+            q.stem for q in Path(cfg.memory_core_dir).glob("*.md")
+        ) if Path(cfg.memory_core_dir).is_dir() else []
+        ui.info(f"· 无此记忆 '{name}'（{p}）；"
+                f"可用：{', '.join(available) or '无'}")
 
-    ui.info(f"· 未知命令 {cmd}（未发送；/help 查看命令）")
+
+async def _cmd_retry(state: CliState, text: str, ui: Any) -> None:
+    if not state.last_prompt:
+        ui.info("· 没有可重发的消息（/retry 用于重发上一条失败消息）")
+        return
+    ui.info(f"· 重发上一条消息：{state.last_prompt[:50]}")
+    await _send_user_message(state, state.last_prompt, ui)
+
+
+async def _cmd_interrupt(state: CliState, text: str, ui: Any) -> None:
+    try:
+        if state.session is not None:
+            await state.session.interrupt()
+        ui.info("· 已请求中断当前轮（在 turn 边界停下）")
+    except Exception as e:  # noqa: BLE001
+        ui.info(f"· 中断失败：{e}")
+
+
+# slash 命令分发表；命令清单（help/补全展示用）见上方 _COMMANDS
+_COMMAND_HANDLERS: dict[str, Callable[[CliState, str, Any], Awaitable[None]]] = {
+    "/exit": _cmd_exit,
+    "/quit": _cmd_exit,
+    "/help": _cmd_help,
+    "/new": _cmd_new,
+    "/sessions": _cmd_sessions,
+    "/switch": _cmd_switch,
+    "/session": _cmd_session,
+    "/usage": _cmd_usage,
+    "/cost": _cmd_cost,
+    "/tools": _cmd_tools,
+    "/plan": _cmd_plan,
+    "/memory": _cmd_memory,
+    "/retry": _cmd_retry,
+    "/interrupt": _cmd_interrupt,
+}
 
 
 # ---- REPL 主循环 ----
@@ -1481,7 +1460,9 @@ def main(argv: list[str] | None = None) -> int:
         project_root=project_root,
         mcp_config_path=mcp_path,
     )
-    persona = resolve_persona(args.persona, config)
+    persona = resolve_persona(
+        args.persona, config,
+        warn=lambda msg: print(dim(msg), file=sys.stderr))
     kernel = AgentKernel(config)
     cwd = config.project_root or project_root
     state = CliState(kernel, persona, config, cwd, planning=args.planning)

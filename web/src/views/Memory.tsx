@@ -4,6 +4,7 @@ import type {
 } from '../types'
 import { api } from '../api/client'
 import { usePolling } from '../hooks/usePolling'
+import { POLL } from '../polling'
 import { timeAgo } from '../utils'
 import StatusBadge from '../components/StatusBadge'
 
@@ -48,7 +49,7 @@ export default function Memory() {
 /* ---------------- Tab 1 核心记忆 ---------------- */
 
 function CoreMemTab() {
-  const { data, refresh, error } = usePolling(() => api.memoryCore(), 8000)
+  const { data, refresh, error } = usePolling(() => api.memoryCore(), POLL.services)
   const [selected, setSelected] = useState<string | null>(null)
   const [editing, setEditing] = useState<string | null>(null)
   const [draft, setDraft] = useState('')
@@ -172,7 +173,7 @@ function CoreMemTab() {
 /* ---------------- Tab 2 任务上下文 ---------------- */
 
 function ContextTab() {
-  const { data: tasks } = usePolling<TaskRecord[]>(() => api.tasks(), 10000)
+  const { data: tasks } = usePolling<TaskRecord[]>(() => api.tasks(), POLL.tasksSlow)
   const [taskId, setTaskId] = useState('')
   const [notes, setNotes] = useState<Record<string, string | null> | null>(null)
   const [editingKey, setEditingKey] = useState<string | null>(null)
@@ -180,8 +181,12 @@ function ContextTab() {
   const [newKey, setNewKey] = useState('')
   const [msg, setMsg] = useState<string | null>(null)
 
-  const recent = (tasks ?? [])
-    .slice().sort((a, b) => Number(b.created_at) - Number(a.created_at)).slice(0, 30)
+  // 派生列表仅随 tasks 变化重算，不随每次渲染（编辑态/加载态触发）重复排序
+  const recent = useMemo(
+    () => (tasks ?? [])
+      .slice().sort((a, b) => Number(b.created_at) - Number(a.created_at)).slice(0, 30),
+    [tasks],
+  )
 
   const load = async (id: string) => {
     setTaskId(id)
@@ -397,8 +402,8 @@ function ExperienceTab() {
 /* ---------------- Tab 4 演化提案 ---------------- */
 
 function ProposalTab() {
-  const reflection = usePolling(() => api.reflection(50), 15000)
-  const proposals = usePolling(() => api.proposals(), 8000)
+  const reflection = usePolling(() => api.reflection(50), POLL.reflection)
+  const proposals = usePolling(() => api.proposals(), POLL.services)
   const [expanded, setExpanded] = useState<string | null>(null)
   const [voter, setVoter] = useState<Record<string, string>>({})
   const [msg, setMsg] = useState<string | null>(null)

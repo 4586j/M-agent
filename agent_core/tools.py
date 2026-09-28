@@ -128,6 +128,19 @@ def _runtime_dir(config) -> Path:
             / "orchestrator" / "runtime")
 
 
+def ensure_runtime_on_path(config) -> Path:
+    """把大脑 runtime 目录加入 sys.path（幂等），返回其路径。
+
+    供 agent_core 内延迟导入 runtime 模块（memory_store / experience_store /
+    worker_api 等）前调用，收敛各处「拼路径 + sys.path.insert」的样板，避免
+    内核重复写同一段依赖路径逻辑。
+    """
+    rt = _runtime_dir(config)
+    if str(rt) not in sys.path:
+        sys.path.insert(0, str(rt))
+    return rt
+
+
 def _load_embedding_model(config):
     """按 config 解析 ExperienceStore 的 embedding 模型（阶段四记忆修复）。
 
@@ -164,9 +177,7 @@ def _make_local_backend(config):
     返回一组异步函数（search/read_core/write_core/write_context），内部同步调用
     FileMemoryStore / ExperienceStore。runtime 不可用时抛出异常，由工具层转 is_error。
     """
-    rt = _runtime_dir(config)
-    if str(rt) not in sys.path:
-        sys.path.insert(0, str(rt))
+    rt = ensure_runtime_on_path(config)
     from memory_store import FileMemoryStore  # noqa: E402  延迟导入避免循环依赖
     from experience_store import ExperienceStore  # noqa: E402
 

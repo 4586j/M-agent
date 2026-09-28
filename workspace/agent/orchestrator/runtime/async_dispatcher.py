@@ -10,7 +10,8 @@ from task_store import TaskStore, TaskRecord, new_trace_id
 from worker_registry import WorkerRegistry
 from experience_store import ExperienceStore
 from memory_store import MemoryStore
-from dispatch_common import is_text_artifact, enrich_experience, write_result_note
+from dispatch_common import (is_text_artifact, enrich_experience,
+                             write_result_note, put_provider_name, provider_body)
 from audit_log import record_verdict_event
 from event_bus import TaskEventBus, TERMINAL_STATUSES, publish_task_event
 
@@ -100,8 +101,7 @@ class AsyncRemoteDispatcher:
         if pinned:
             meta["pinned"] = True
         # 只记 provider 名进 meta（密钥绝不落盘）；三元组走瞬时 body
-        if provider and provider.get("name"):
-            meta["provider"] = provider["name"]
+        put_provider_name(meta, provider)
         self.task_store.write(TaskRecord(
             task_id=task_id, role=role, prompt=prompt,
             worker_id=worker.worker_id, status="pending",
@@ -126,12 +126,7 @@ class AsyncRemoteDispatcher:
         if model:
             body["model"] = model
         # provider 三元组瞬时转发 worker（内存仅本次任务；不落任何持久化）
-        if provider:
-            body["provider"] = provider.get("name")
-            if provider.get("base_url"):
-                body["provider_base_url"] = provider["base_url"]
-            if provider.get("auth_token"):
-                body["provider_auth_token"] = provider["auth_token"]
+        body.update(provider_body(provider))
         resp = await self.async_http("POST", f"{base}/task", json=body)
         if resp.get("status_code") != 200:
             log.warning("[trace=%s] task=%s post failed: %s", trace_id, task_id, resp)

@@ -1,9 +1,11 @@
 import { useEffect, useMemo, useState } from 'react'
 import type { TaskRecord, TaskStatus } from '../types'
 import { usePolling } from '../hooks/usePolling'
+import { POLL } from '../polling'
 import { useActiveConnectionId } from '../api/connections'
 import { api } from '../api/client'
-import { timeAgo } from '../utils'
+import { fmtUsd, timeAgo } from '../utils'
+import { statusDot } from '../types'
 import StatusBadge from '../components/StatusBadge'
 import TaskDetailDrawer from '../components/TaskDetailDrawer'
 
@@ -11,19 +13,9 @@ const STATUSES: (TaskStatus | 'all')[] = [
   'all', 'running', 'awaiting_approval', 'pending', 'done', 'failed', 'lost', 'cancelled',
 ]
 
-const DOT: Record<string, string> = {
-  pending: 'bg-slate-300',
-  running: 'bg-sky-400',
-  done: 'bg-mint-500',
-  failed: 'bg-rose-500',
-  lost: 'bg-slate-400',
-  cancelled: 'bg-zinc-400',
-  awaiting_approval: 'bg-amber-400',
-}
-
 /** 任务全集：多维筛选 + 实时详情抽屉（SSE） */
 export default function Tasks() {
-  const { data: tasks, error, refresh } = usePolling<TaskRecord[]>(() => api.tasks(), 5000)
+  const { data: tasks, error, refresh } = usePolling<TaskRecord[]>(() => api.tasks(), POLL.tasks)
   const [status, setStatus] = useState<TaskStatus | 'all'>('all')
   const [role, setRole] = useState('all')
   const [worker, setWorker] = useState('all')
@@ -129,7 +121,7 @@ export default function Tasks() {
               onClick={() => setSelected(t)}
               className="w-full text-left px-3 py-2.5 rounded-xl hover:bg-mint-50/60 flex items-center gap-2.5 transition"
             >
-              <span className={`w-2 h-2 rounded-full shrink-0 ${DOT[t.status] || 'bg-slate-300'}`} />
+              <span className={`w-2 h-2 rounded-full shrink-0 ${statusDot(t.status)}`} />
               <StatusBadge status={t.status} />
               {t.verdict?.verdict === 'block' && (
                 <span className="text-amber-600 text-xs" title={t.verdict.reason}>⚠</span>
@@ -138,7 +130,7 @@ export default function Tasks() {
               <span className="text-xs text-slate-400 shrink-0 hidden md:inline">{t.role}</span>
               <span className="text-sm text-slate-700 truncate flex-1">{t.prompt}</span>
               {t.meta?.cost_usd != null && (
-                <span className="text-xs text-mint-700 shrink-0">${t.meta.cost_usd.toFixed(4)}</span>
+                <span className="text-xs text-mint-700 shrink-0">{fmtUsd(t.meta.cost_usd)}</span>
               )}
               <span className="text-xs text-slate-400 shrink-0">{timeAgo(t.updated_at)}</span>
             </button>

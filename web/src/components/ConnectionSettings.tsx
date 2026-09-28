@@ -39,13 +39,11 @@ export default function ConnectionSettings() {
   const saveDraft = () => {
     if (!draft) return
     if (!draft.name.trim() && !draft.baseUrl.trim()) return
-    const prevActive = activeId
     persistConnection(draft)
     if (isNew) activate(draft.id) // 新增的连接直接激活
     setDraft(null)
     setIsNew(false)
     setTestMsg(null)
-    void prevActive
   }
 
   const runTest = async () => {

@@ -1,0 +1,17 @@
+# 全仓库 Python 增量质量门（ruff）：基础集 E9（正确性）/F（pyflakes 未用与
+# 缺失）/B（bugbear 常见反模式）/I（导入排序），长行 100。
+# 存量文件不强求全绿；约定：新增/改动处零告警（提交前 `ruff check <改动文件>`）。
+# 用法：ruff check <文件或目录>；agent_core[dev] 已含 ruff 依赖。
+line-length = 100
+
+[lint]
+select = ["E9", "F", "B", "I"]
+# 第三方无关噪声/smoke 不入 gate
+exclude = [
+    "agent_core/tests/data/**",
+    "worker/tests/data/**",
+    "eval/results/**",
+]
+
+[lint.isort]
+known-first-party = ["agent_core", "dispatch_common", "task_store"]

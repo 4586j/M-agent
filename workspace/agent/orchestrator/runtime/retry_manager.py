@@ -4,10 +4,11 @@ import threading
 import time
 from typing import Callable
 
-from task_store import TaskStore, TaskRecord
-from worker_registry import WorkerRegistry
 from dispatcher import Dispatcher
 from event_bus import TaskEventBus, publish_task_event
+from worker_registry import WorkerRegistry
+
+from task_store import TaskRecord, TaskStore
 
 log = logging.getLogger(__name__)
 
@@ -84,22 +85,27 @@ class RetryManager:
 
     def _mark_lost_from_dead_workers(self) -> int:
         dead = self.registry.dead_workers()
+        if not dead:
+            return 0
+        dead_ids = {dw.worker_id for dw in dead}
         count = 0
-        for dw in dead:
-            for rec in self.task_store.list_by_worker(dw.worker_id):
-                if rec.status == "running":
-                    self.task_store.update(
-                        rec.task_id, status="lost",
-                        error=f"worker {dw.worker_id} heartbeat timeout",
-                        updated_at=self._ts(),
-                    )
-                    log.info("[trace=%s] task=%s marked lost (worker=%s heartbeat timeout)",
-                             rec.trace_id, rec.task_id, dw.worker_id)
-                    # lost 属终态：发布 done 事件让 SSE 订阅流关闭
-                    publish_task_event(self.event_bus, rec.task_id, event="done",
-                                       state="lost", trace_id=rec.trace_id,
-                                       summary=f"worker {dw.worker_id} heartbeat timeout")
-                    count += 1
+        # 一次取全表扫描，命中任一 dead worker 的 running 任务即标 lost：
+        # 避免对每个 dead worker 各扫一遍全表（旧实现 O(dead×N) → O(N)）。
+        for rec in self.task_store.list_all():
+            if rec.status != "running" or rec.worker_id not in dead_ids:
+                continue
+            self.task_store.update(
+                rec.task_id, status="lost",
+                error=f"worker {rec.worker_id} heartbeat timeout",
+                updated_at=self._ts(),
+            )
+            log.info("[trace=%s] task=%s marked lost (worker=%s heartbeat timeout)",
+                     rec.trace_id, rec.task_id, rec.worker_id)
+            # lost 属终态：发布 done 事件让 SSE 订阅流关闭
+            publish_task_event(self.event_bus, rec.task_id, event="done",
+                               state="lost", trace_id=rec.trace_id,
+                               summary=f"worker {rec.worker_id} heartbeat timeout")
+            count += 1
         return count
 
     @staticmethod

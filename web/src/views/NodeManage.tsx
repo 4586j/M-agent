@@ -2,6 +2,7 @@ import { useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { api } from '../api/client'
 import { usePolling } from '../hooks/usePolling'
+import { POLL } from '../polling'
 import TaskList from '../components/TaskList'
 import type { NodeStatus, WorkerInfo } from '../types'
 
@@ -14,8 +15,8 @@ export function panelUrl(w: WorkerInfo): string {
 
 export default function NodeManage() {
   const navigate = useNavigate()
-  const workers = usePolling(() => api.workers(), 5000)
-  const tasks = usePolling(() => api.tasks(), 5000)
+  const workers = usePolling(() => api.workers(), POLL.workers)
+  const tasks = usePolling(() => api.tasks(), POLL.tasks)
   const [form, setForm] = useState({
     worker_id: '',
     role: 'executor',

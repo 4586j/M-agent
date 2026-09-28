@@ -1,7 +1,6 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { Routes, Route, NavLink, useLocation, Link } from 'react-router-dom'
-import { usePolling } from './hooks/usePolling'
-import { api } from './api/client'
+import { StatsProvider, useSharedStats } from './hooks/useSharedStats'
 import { useActiveConnection } from './api/connections'
 import Dashboard from './views/Dashboard'
 import Tasks from './views/Tasks'
@@ -27,10 +26,11 @@ const NAV = [
 /** 生机绿白顶栏：玻璃拟态 + 7 视图滑动 glass pill + SSE 呼吸状态点 */
 export default function App() {
   return (
-    <div className="min-h-screen bg-gradient-to-b from-mint-50 to-[#F8FCFA] text-slate-800">
-      <TopBar />
-      <main className="p-6 max-w-7xl mx-auto">
-        <Routes>
+    <StatsProvider>
+      <div className="min-h-screen bg-gradient-to-b from-mint-50 to-[#F8FCFA] text-slate-800">
+        <TopBar />
+        <main className="p-6 max-w-7xl mx-auto">
+          <Routes>
           <Route path="/" element={<Dashboard />} />
           <Route path="/tasks" element={<Tasks />} />
           <Route path="/nodes" element={<NodeManage />} />
@@ -39,9 +39,10 @@ export default function App() {
           <Route path="/schedules" element={<Schedules />} />
           <Route path="/providers" element={<Providers />} />
           <Route path="/audit" element={<Audit />} />
-        </Routes>
-      </main>
-    </div>
+            </Routes>
+          </main>
+        </div>
+    </StatsProvider>
   )
 }
 
@@ -49,7 +50,7 @@ function TopBar() {
   const location = useLocation()
   const navRef = useRef<HTMLDivElement>(null)
   const [pill, setPill] = useState({ left: 0, width: 0 })
-  const stats = usePolling(() => api.stats(), 10000)
+  const stats = useSharedStats()
 
   // 滑动玻璃指示块：随激活项移动（含 resize 重校准）
   useLayoutEffect(() => {

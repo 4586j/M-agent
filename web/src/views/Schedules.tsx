@@ -2,6 +2,7 @@ import { useMemo, useState } from 'react'
 import type { ScheduleRecord } from '../types'
 import { api } from '../api/client'
 import { usePolling } from '../hooks/usePolling'
+import { POLL } from '../polling'
 import { formatTime, timeAgo } from '../utils'
 import { isValidCron, nextRuns } from '../cron'
 
@@ -15,7 +16,7 @@ const CRON_TEMPLATES: { label: string; expr: string }[] = [
 
 /** 调度视图：cron 定时任务管理（列表 + 创建预览 + 启停/触发/删除） */
 export default function Schedules() {
-  const { data: schedules, error, refresh } = usePolling(() => api.schedules(), 8000)
+  const { data: schedules, error, refresh } = usePolling(() => api.schedules(), POLL.services)
   const [creating, setCreating] = useState(false)
   const [msg, setMsg] = useState<string | null>(null)
   const [busyId, setBusyId] = useState<string | null>(null)

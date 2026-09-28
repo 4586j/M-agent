@@ -4,6 +4,7 @@
 - worker/agent_runner.py 的 _parse_executor_def（解析单个 .md frontmatter）
 - runtime/orch_cli.py 的 parse_subagents（批量解析 .claude/agents/*.md）
 - runtime/orch_cli.py 的 strip_frontmatter
+- service.py / cli.py 各一份的 _build_orchestrator_persona 与 resolve_persona
 
 约定：人设是带 YAML frontmatter 的 Markdown 文件。frontmatter 用 --- 分隔，
 声明 name/description/model/tools 等元数据，正文即该 agent 的系统提示。
@@ -12,6 +13,10 @@ tools 在 frontmatter 中为逗号分隔字符串，加载时统一转为列表�
 """
 from dataclasses import dataclass, field, fields as _dataclass_fields
 from pathlib import Path
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from agent_core.config import AgentConfig
 
 
 @dataclass
@@ -205,3 +210,50 @@ def parse_subagents(agents_dir: str | Path) -> dict:
         except Exception:
             continue  # 单个定义损坏不拖垮启动
     return agents
+
+
+def build_orchestrator_persona(config: "AgentConfig") -> Persona:
+    """orchestrator（大脑）人设兜底：编排 SKILL.md 正文 + 子 agent 注册。
+
+    service 与 cli 两份逐字副本收敛于此：加载 orchestrator 工作流作为系统提示，
+    并把 .claude/agents/ 下的 executor / security-guard 解析为子 agent 供
+    Agent 工具派发。SKILL.md 不存在时退化为内置一句话人设。
+    """
+    skill_md = (Path(config.project_root) / "workspace" / "agent" / "skills"
+                / "orchestrator" / "SKILL.md")
+    body = "你是 orchestrator，多 agent 编排框架的大脑。"
+    if skill_md.is_file():
+        body += "\n\n" + strip_frontmatter(skill_md.read_text(encoding="utf-8"))
+    return Persona(
+        name="orchestrator",
+        description="编排大脑：拆解目标、派发子 agent、汇总裁决",
+        system_prompt=body,
+        sub_agents=parse_subagents(config.persona_dir),
+    )
+
+
+def resolve_persona(name: str, config: "AgentConfig",
+                    warn: Any | None = None) -> Persona:
+    """按名称解析人设（service / cli 共用的纯函数，不带缓存）。
+
+    - 优先在 persona_dir 下找 <name>.md（executor / security-guard 等）；
+    - name == orchestrator 且无定义文件时，回退构造大脑人设；
+    - 其余未知名给最小人设兜底，避免直接崩溃。
+
+    warn（可调用，可选）：形如 ``fn(str) -> None``，存在时用于输出未知名
+    警告（service 传 logger.warning、cli 传打印函数）；缺省静默不告警。
+    """
+    try:
+        return load_persona_by_name(name, config.persona_dir)
+    except FileNotFoundError:
+        if name == "orchestrator":
+            return build_orchestrator_persona(config)
+        available = list_persona_names(config.persona_dir)
+        if warn is not None:
+            warn(f"[persona] 未找到人设定义 '{name}'（目录：{config.persona_dir}）；"
+                 f"可用人设：{', '.join(available) or '无'}；已回退最小人设。")
+        return Persona(
+            name=name,
+            description=f"{name}（未找到定义文件，使用最小人设）",
+            system_prompt=f"你是 {name}。请按用户指令完成任务。",
+        )

@@ -1,4 +1,5 @@
 import type { TaskMeta } from '../types'
+import { fmtUsd } from '../utils'
 
 /** 用量四格卡：tokens / turns / 成本 / 缓存命中率（数据缺失显示 —） */
 export default function UsageCard({ meta }: { meta?: TaskMeta }) {
@@ -12,7 +13,7 @@ export default function UsageCard({ meta }: { meta?: TaskMeta }) {
       <div className="grid grid-cols-4 gap-2 text-center text-xs">
         <Cell label="Tokens" value={tokens != null ? tokens.toLocaleString() : '—'} />
         <Cell label="Turns" value={meta?.num_turns != null ? `${meta.num_turns} 轮` : '—'} />
-        <Cell label="成本" value={meta?.cost_usd != null ? `$${meta.cost_usd.toFixed(4)}` : '—'} accent />
+        <Cell label="成本" value={meta?.cost_usd != null ? fmtUsd(meta.cost_usd) : '—'} accent />
         <Cell
           label="缓存命中"
           value={cacheHit != null ? `${Math.round(cacheHit * 100)}%` : '—'}
