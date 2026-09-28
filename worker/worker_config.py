@@ -23,9 +23,13 @@ def _default_work_dir() -> str:
     return str(_HERE / ".worker_work")
 
 
-def _default_executor_def() -> str:
-    """定位到项目根 .claude/agents/executor.md，避免相对路径随 cwd 漂移。"""
-    return str(_HERE.parent / ".claude" / "agents" / "executor.md")
+def _default_persona_def(role: str) -> str:
+    """人设定义文件：按 role 定位 .claude/agents/{role}.md。
+
+    与「role 即人设名」的约定一致（executor / security-guard / data-expert 等），
+    worker 进程跑哪个 role 就加载哪个人设；避免相对路径随 cwd 漂移。
+    """
+    return str(_HERE.parent / ".claude" / "agents" / f"{role}.md")
 
 
 def _default_project_root() -> str:
@@ -52,7 +56,7 @@ class WorkerConfig:
     role: str = "executor"
     listen_host: str = "127.0.0.1"
     listen_port: int = 8000
-    executor_def_path: str = _default_executor_def()
+    persona_def_path: str = _default_persona_def("executor")
     work_dir: str = _default_work_dir()
     project_root: str = _default_project_root()
     task_timeout: int = 900
@@ -67,6 +71,8 @@ class WorkerConfig:
     heartbeat_interval: int = 15
     # 默认 default（SDK 权限门控生效）；bypassPermissions 须显式设置（仅限开发/受控环境）
     permission_mode: str = "default"
+    # Agent 面板（/agent/* + /panel）：默认开启；0 关闭（不挂面板路由）
+    worker_panel: bool = True
     auto_register: bool = True
     api_key: str = ""
     artifact_max_bytes: int = 20 * 1024 * 1024
@@ -78,13 +84,17 @@ class WorkerConfig:
 
 
 def load_worker_config() -> WorkerConfig:
+    role = os.environ.get("ORCH_WORKER_ROLE", "executor")
     return WorkerConfig(
         brain_url=os.environ.get("ORCH_BRAIN_URL", "http://127.0.0.1:7000"),
         worker_id=os.environ.get("ORCH_WORKER_ID", "worker-local"),
-        role="executor",
+        role=role,
         listen_host=os.environ.get("ORCH_WORKER_HOST", "127.0.0.1"),
         listen_port=int(os.environ.get("ORCH_WORKER_PORT", "8000")),
-        executor_def_path=os.environ.get("ORCH_EXECUTOR_DEF", _default_executor_def()),
+        # 人设路径跟随 role（.claude/agents/{role}.md）；显式覆盖优先
+        # ORCH_WORKER_PERSONA_DEF，旧名 ORCH_EXECUTOR_DEF 保留作兼容回退
+        persona_def_path=_env(_default_persona_def(role),
+                              "ORCH_WORKER_PERSONA_DEF", "ORCH_EXECUTOR_DEF"),
         work_dir=os.environ.get("ORCH_WORK_DIR", _default_work_dir()),
         project_root=os.environ.get("ORCH_PROJECT_ROOT", _default_project_root()),
         task_timeout=int(os.environ.get("ORCH_TASK_TIMEOUT", "900")),
@@ -97,6 +107,7 @@ def load_worker_config() -> WorkerConfig:
         heartbeat_interval=int(os.environ.get("ORCH_HEARTBEAT_INTERVAL", "15")),
         # 默认收敛为 default：权限门控生效；bypassPermissions 须显式环境变量指定
         permission_mode=os.environ.get("ORCH_PERMISSION_MODE", "default"),
+        worker_panel=os.environ.get("ORCH_WORKER_PANEL", "1") not in ("0", "false", "False"),
         auto_register=os.environ.get("ORCH_AUTO_REGISTER", "1") not in ("0", "false", "False"),
         api_key=os.environ.get("ORCH_API_KEY", ""),
         artifact_max_bytes=int(os.environ.get("ORCH_ARTIFACT_MAX_BYTES",

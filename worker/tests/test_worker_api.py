@@ -298,3 +298,36 @@ def test_trace_id_flows_to_runner_and_callback(tmp_path, monkeypatch):
     assert payload.get("trace_id") == "trc-abc123"
     assert "meta" in payload
 
+
+def test_build_app_fails_fast_on_missing_persona(monkeypatch):
+    """ORCH_RUNNER=sdk 且人设文件缺失：启动即抛错并列出可用人设（fail-fast）。"""
+    import worker_api
+    from worker_config import load_worker_config
+
+    monkeypatch.setenv("ORCH_RUNNER", "sdk")
+    monkeypatch.setenv("ORCH_WORKER_ROLE", "ghost-persona")
+    monkeypatch.delenv("ORCH_WORKER_PERSONA_DEF", raising=False)
+    monkeypatch.delenv("ORCH_EXECUTOR_DEF", raising=False)
+    monkeypatch.delenv("ORCH_AUTO_REGISTER", raising=False)
+    cfg = load_worker_config()
+    assert not Path(cfg.persona_def_path).is_file()  # 前置：人设不存在
+    try:
+        worker_api._build_app()
+    except RuntimeError as e:
+        msg = str(e)
+        assert "人设文件不存在" in msg
+        assert "executor.md" in msg  # 错误信息带可用人设清单
+    else:
+        raise AssertionError("缺失人设时 _build_app 应抛 RuntimeError")
+
+
+def test_build_app_fake_runner_ignores_missing_persona(monkeypatch):
+    """ORCH_RUNNER=fake 不读人设，缺失也不应拦截（fail-fast 仅在 sdk 分支）。"""
+    import worker_api
+
+    monkeypatch.setenv("ORCH_RUNNER", "fake")
+    monkeypatch.setenv("ORCH_WORKER_ROLE", "ghost-persona")
+    monkeypatch.setenv("ORCH_AUTO_REGISTER", "0")
+    app = worker_api._build_app()  # 不应抛错
+    assert app is not None
+

@@ -48,6 +48,38 @@ def test_load_worker_config_output_guard_agent_prefix(monkeypatch):
     assert cfg.fallback_model == "fb"
 
 
+# ---- role 人设（单机多 agent：ORCH_WORKER_ROLE 决定人设与派发身份）----
+
+def test_default_role_is_executor(monkeypatch):
+    monkeypatch.delenv("ORCH_WORKER_ROLE", raising=False)
+    monkeypatch.delenv("ORCH_WORKER_PERSONA_DEF", raising=False)
+    monkeypatch.delenv("ORCH_EXECUTOR_DEF", raising=False)
+    cfg = load_worker_config()
+    assert cfg.role == "executor"
+    assert cfg.persona_def_path.endswith(f"executor.md")
+
+
+def test_role_env_overrides_and_persona_follows(monkeypatch):
+    """ORCH_WORKER_ROLE 覆盖角色，人设路径默认跟随 role（role 即人设名）。"""
+    monkeypatch.delenv("ORCH_WORKER_PERSONA_DEF", raising=False)
+    monkeypatch.delenv("ORCH_EXECUTOR_DEF", raising=False)
+    monkeypatch.setenv("ORCH_WORKER_ROLE", "security-guard")
+    cfg = load_worker_config()
+    assert cfg.role == "security-guard"
+    assert cfg.persona_def_path.endswith("security-guard.md")
+
+
+def test_persona_def_override_preferred_then_compat(monkeypatch):
+    """ORCH_WORKER_PERSONA_DEF 优先；旧名 ORCH_EXECUTOR_DEF 兼容回退。"""
+    monkeypatch.delenv("ORCH_EXECUTOR_DEF", raising=False)
+    monkeypatch.setenv("ORCH_WORKER_ROLE", "data-expert")
+    monkeypatch.setenv("ORCH_WORKER_PERSONA_DEF", "/custom/persona.md")
+    assert load_worker_config().persona_def_path == "/custom/persona.md"
+    monkeypatch.delenv("ORCH_WORKER_PERSONA_DEF")
+    monkeypatch.setenv("ORCH_EXECUTOR_DEF", "/legacy/executor.md")
+    assert load_worker_config().persona_def_path == "/legacy/executor.md"
+
+
 def test_load_worker_config_output_guard_orch_fallback(monkeypatch):
     """AGENT_ 未设置时回退 ORCH_ 前缀（与集群既有 ORCH_ 配置并存）。"""
     for key in ("AGENT_OUTPUT_GUARD_ENABLED", "AGENT_OUTPUT_GUARD_MAX_RETRIES",

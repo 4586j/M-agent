@@ -182,7 +182,7 @@ SDK 模式必需两块文件，且**必须保持相对目录结构**（因为 `e
         └── executor.md       # executor 角色定义（model=sonnet，全工具）
 ```
 
-> 若无法保持该结构，改用 `ORCH_EXECUTOR_DEF` 指定 executor.md 绝对路径（见 4.6）。
+> 若无法保持该结构，改用 `ORCH_WORKER_PERSONA_DEF`（旧名 `ORCH_EXECUTOR_DEF` 等价）指定人设文件绝对路径（见 4.6）。换人设只需改 `ORCH_WORKER_ROLE`（如 `security-guard` 则加载 `security-guard.md`），文件放 `.claude/agents/` 即可。
 
 拷贝方式（示例，从大脑主机传到 worker 主机）：
 ```bash
@@ -216,11 +216,13 @@ export ANTHROPIC_MODEL=ark-code-latest
 
 > 建议把这三个变量写入 worker 主机的 `~/.bashrc`（或 Windows 系统环境变量），避免每次启动 worker 都要重设。
 
-### 4.4 确认 executor.md 就位
-默认路径自动定位到 `<部署根>/.claude/agents/executor.md`。若目录结构不是 4.1 所示，显式指定：
+### 4.4 确认人设文件就位
+默认路径按 `ORCH_WORKER_ROLE`（默认 `executor`）自动定位到 `<部署根>/.claude/agents/{role}.md`。若目录结构不是 4.1 所示，显式指定：
 ```bash
-export ORCH_EXECUTOR_DEF=/abs/path/to/executor.md
+export ORCH_WORKER_PERSONA_DEF=/abs/path/to/executor.md   # 新配置名
+# export ORCH_EXECUTOR_DEF=/abs/path/to/executor.md        # 旧兼容名（等价，仅文档仍引用旧名时用）
 ```
+> worker 人设文件缺失时 sdk 分支**启动即报错**（列出 `.claude/agents/*.md` 可用清单），便于快速定位，不静默回退。
 
 ### 4.5 选择权限模式
 `ORCH_PERMISSION_MODE` 控制 sdk 执行时遇到需确认操作（写文件、执行命令等）的行为：
@@ -244,7 +246,7 @@ export ORCH_WORKER_HOST=<worker本机真实IP>      # 关键！大脑靠它回�
 export ORCH_WORKER_PORT=8001                   # 监听端口
 export ORCH_RUNNER=sdk                         # ★ 切到真实 SDK 执行
 export ORCH_PERMISSION_MODE=bypassPermissions  # 无人值守权限
-# export ORCH_EXECUTOR_DEF=/abs/path/executor.md  # 仅目录结构不符时设
+# export ORCH_WORKER_PERSONA_DEF=/abs/path/executor.md  # 仅目录结构不符时设（旧名 ORCH_EXECUTOR_DEF 等价可用）
 # export ANTHROPIC_AUTH_TOKEN=...                # 见 4.3，SDK 认证三件套（网关接入）
 # export ANTHROPIC_BASE_URL=...
 # export ANTHROPIC_MODEL=...
@@ -337,8 +339,10 @@ curl "http://127.0.0.1:7000/proxy/artifact?worker_id=worker-B&task_id=task-xxxxx
 | `ORCH_WORKER_HOST` | 127.0.0.1 | 监听+上报地址（跨主机必填真实 IP） |
 | `ORCH_WORKER_PORT` | 8000 | 监听端口 |
 | `ORCH_RUNNER` | fake | **sdk 模式必设 `sdk`** |
-| `ORCH_EXECUTOR_DEF` | 自动定位 | executor.md 路径（目录结构不符时显式指定） |
+| `ORCH_WORKER_ROLE` | executor | 人设名，决定加载 `.claude/agents/{role}.md`（同名 worker 各设不同 role 即可让同一台/同一批机器跑不同人设） |
+| `ORCH_WORKER_PERSONA_DEF` | 自动定位 | 人设文件路径（目录结构不符时显式指定；旧兼容名 `ORCH_EXECUTOR_DEF` 等价） |
 | `ORCH_WORK_DIR` | worker/.worker_work | worker 本地工作区（产物落盘处） |
+| `ORCH_WORKER_PANEL` | 1 | 节点 Agent 面板（`http://host:port/` 可打开该节点控制台，含内嵌终端）。**跨主机暴露 = 该节点任意命令执行能力，见 §5 安全核对第 1 条**；无面板需求的节点设 `0` 关闭 |
 | `ORCH_PERMISSION_MODE` | bypassPermissions | sdk 权限模式 |
 | `ORCH_AUTO_REGISTER` | 1 | 启动自动注册到大脑 |
 | `ANTHROPIC_AUTH_TOKEN` | - | SDK 认证 Bearer token（网关接入必设） |
@@ -361,7 +365,7 @@ curl "http://127.0.0.1:7000/proxy/artifact?worker_id=worker-B&task_id=task-xxxxx
 | worker 启动后大脑 `/workers` 看不到它 | ① `ORCH_BRAIN_URL` 是否指向大脑真实 IP（非 127.0.0.1）；② 大脑是否 `ORCH_BRAIN_HOST=0.0.0.0` 且防火墙放行 7000；③ worker 日志有无注册失败重试 |
 | worker 上线后很快消失 | 心跳超时。确认 worker 进程活着、`ORCH_WORKER_HOST` 正确、大脑能连到 worker 8001（防火墙） |
 | 任务 `failed`，error 含 `sdk error: ...` | 多为认证问题。运行 2.3 验证脚本；确认 `ANTHROPIC_AUTH_TOKEN`/`ANTHROPIC_BASE_URL` 已设有效（或官方直连的 `ANTHROPIC_API_KEY`） |
-| 任务 `failed`，error 含 `executor.md` 或路径 | `ORCH_EXECUTOR_DEF` 路径错或文件不存在。检查 4.1 目录结构 / 4.4 路径配置 |
+| 任务 `failed`，error 含 `executor.md` 或路径 | `ORCH_WORKER_PERSONA_DEF`（旧名 `ORCH_EXECUTOR_DEF`）路径错或文件不存在。检查 4.1 目录结构 / 4.4 路径配置 |
 | 任务一直 `running` 不返回 | sdk 执行中或卡住。`GET /task/{id}` 轮询；复杂任务耗时长，可调大耐心；卡死可标 lost 后重派 |
 | 产物拉取 404 / 502 | `ORCH_WORKER_HOST` 填了 127.0.0.1（大脑连不回），或 worker 8001 防火墙未放行，或 path 越界（防路径穿越校验拦截） |
 | 派发返回 `无可用 worker` | worker 未注册或已超时。`GET /workers` 确认；启动 worker 并等其注册 |
@@ -381,7 +385,7 @@ curl "http://127.0.0.1:7000/proxy/artifact?worker_id=worker-B&task_id=task-xxxxx
 
 ## 8. 生产化与安全建议
 
-1. **TLS 与鉴权**：新版已内置 API Key 鉴权（`X-API-Key` 头 / `?api_key=` 查询参数）：跨主机部署须双侧配置同一 `ORCH_API_KEY`（未配 key 时仅放行环回，非环回 403）；上生产再补 TLS（反向代理终结，注意代理后环回豁免失效），防止 worker 被冒充注册、指令被窃听。
+1. **TLS 与鉴权**：新版已内置 API Key 鉴权（`X-API-Key` 头 / `?api_key=` 查询参数）：跨主机部署须双侧配置同一 `ORCH_API_KEY`（未配 key 时仅放行环回，非环回 403）；上生产再补 TLS（反向代理终结，注意代理后环回豁免失效），防止 worker 被冒充注册、指令被窃听。**节点 Agent 面板含内嵌终端（WebSocket 任意命令执行）**：面板须配 `ORCH_API_KEY`（或受控内网访问），`ORCH_WORKER_PANEL=0` 可完全关闭不需要的面板。终端 WS 与 `/agent/*` 均受既有 auth 中间件保护，未配 key 时非环回请求拿不到面板交互。
 2. **权限模式取舍**：`bypassPermissions` 无人值守但 executor 全工具不停顿，务必依赖 security-guard 双关卡（指令+产物）兜底；高敏感场景考虑 `acceptEdits` 并接受需人工介入的代价。
 3. **API 成本控制**：sdk 模式按 token 计费。简单任务用 `ORCH_MODEL=haiku` 降档；复杂任务才升 sonnet/opus。关注 Anthropic 用量面板。
 4. **工作目录隔离**：每个 task 在 `work_dir/{task_id}/` 独立目录执行，互不污染；定期清理历史产物。

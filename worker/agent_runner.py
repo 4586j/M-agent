@@ -61,17 +61,56 @@ class FakeAgentRunner(AgentRunner):
         return TaskResult(req.task_id, "done", output=out, artifacts=[], error=None)
 
 
+def build_worker_kernel(cfg, mcp_servers: dict | None = None) -> Any:
+    """从 WorkerConfig 装配统一 AgentKernel（worker 面板与任务执行共用同一配方）。
+
+    与 SdkAgentRunner._get_kernel 原是同一段 WorkerConfig → AgentConfig 装配，提成
+    模块级函数后，worker 面板（agent_panel.KernelPanelExecutor）与 brain 派发的
+    任务执行不再各写一份配置映射，保证「同一节点、同一模型/权限/预算/经验库」。
+
+    mcp_servers：预加载的 MCP 服务器 dict（优先于 mcp_config_path，与 worker_api
+    现有预加载 - 传递约定一致）；None 时尝试按 mcp_config_path 加载。
+    """
+    from agent_core.config import AgentConfig
+    from agent_core.kernel import AgentKernel
+    from worker_config import _default_experience_store_dir
+
+    # 0/None 一律视为「不限制」，与原有成本控制语义一致
+    config = AgentConfig(
+        max_turns=cfg.max_turns,
+        max_thinking_tokens=cfg.max_thinking_tokens if cfg.max_thinking_tokens else None,
+        task_budget_usd=cfg.task_budget_usd if cfg.task_budget_usd else None,
+        task_timeout=cfg.task_timeout,
+        permission_mode=cfg.permission_mode,
+        project_root=cfg.project_root,
+        mcp_servers=mcp_servers or load_mcp_servers(cfg.mcp_config_path),
+        mcp_config_path="",  # 预加载 dict 优先，配置路径清空避免二重加载
+        # 经验库目录兜底：缺省时退回 worker 约定默认（与大脑共享的
+        # runtime/.experiences，基于 __file__ 锚定，与进程 CWD 无关），
+        # 避免 AgentConfig 默认空串导致 ExperienceStore(Path("")) 落到 CWD、
+        # 在进程工作目录散落 exp-local-<ts>.json（历史缺陷）
+        experience_store_dir=cfg.experience_store_dir or _default_experience_store_dir(),
+        # 输出质量守卫三配置透传（此前缺失导致集群下 guard 无法关闭、
+        # fallback_model 不生效）
+        output_guard_enabled=cfg.output_guard_enabled,
+        output_guard_max_retries=cfg.output_guard_max_retries,
+        fallback_model=cfg.fallback_model,
+    )
+    return AgentKernel(config)
+
+
 class SdkAgentRunner(AgentRunner):
     """真实执行：委托 agent_core.kernel.AgentKernel 统一内核。
 
     保持原有构造函数签名与行为契约，内部用 kernel 替代直接的 SDK 调用：
-    - executor.md 的 frontmatter/body 解析交给 persona.load_persona；
+    - persona 定义文件（默认 .claude/agents/{role}.md，role 即人设名）的
+      frontmatter/body 解析交给 persona.load_persona；
     - system prompt / 运行环境块 / 用户消息前缀由 context 模块拼装；
     - SDK query() 消费、超时、取消、usage/cost 收集全部由 kernel 负责；
     - 本类只做 TaskRequest -> kernel 入参、KernelResult -> TaskResult 的映射。
     """
 
-    def __init__(self, work_dir: str, executor_def_path: str,
+    def __init__(self, work_dir: str, persona_def_path: str,
                  permission_mode: str = "default",  # 默认收敛：bypassPermissions 须显式传入
                  project_root: str | None = None,
                  task_timeout: int = 900,
@@ -86,7 +125,7 @@ class SdkAgentRunner(AgentRunner):
                  kernel: Any = None):
         self.work_dir = Path(work_dir)
         self.work_dir.mkdir(parents=True, exist_ok=True)
-        self.executor_def_path = executor_def_path
+        self.persona_def_path = persona_def_path
         self.permission_mode = permission_mode
         self.project_root = project_root or str(self.work_dir.parent)
         self.task_timeout = task_timeout
@@ -107,40 +146,29 @@ class SdkAgentRunner(AgentRunner):
         """延迟构建 AgentKernel，避免 __init__ 阶段就触发 SDK/内核导入。"""
         if self._kernel is not None:
             return self._kernel
-        from agent_core.config import AgentConfig
-        from agent_core.kernel import AgentKernel
-        # 经验库目录兜底：缺省时退回 worker 约定默认（与大脑共享的
-        # runtime/.experiences，基于 __file__ 锚定，与进程 CWD 无关），
-        # 避免 AgentConfig 默认空串导致 ExperienceStore(Path("")) 落到 CWD、
-        # 在进程工作目录散落 exp-local-<ts>.json（历史缺陷）
-        from worker_config import _default_experience_store_dir
-        config = AgentConfig(
+        from worker_config import WorkerConfig
+        cfg = WorkerConfig(
             max_turns=self.max_turns,
-            # 0/None 一律视为「不限制」，与原有成本控制语义一致
-            max_thinking_tokens=self.max_thinking_tokens if self.max_thinking_tokens else None,
-            task_budget_usd=self.task_budget_usd if self.task_budget_usd else None,
+            max_thinking_tokens=self.max_thinking_tokens,
+            task_budget_usd=self.task_budget_usd,
             task_timeout=self.task_timeout,
             permission_mode=self.permission_mode,
             project_root=self.project_root,
-            mcp_servers=self.mcp_servers,  # 预加载的 dict，优先于 mcp_config_path
-            mcp_config_path="",
-            experience_store_dir=self.experience_store_dir or _default_experience_store_dir(),
-            # 输出质量守卫三配置透传（此前缺失导致集群下 guard 无法关闭、
-            # fallback_model 不生效）
+            experience_store_dir=self.experience_store_dir,
             output_guard_enabled=self.output_guard_enabled,
             output_guard_max_retries=self.output_guard_max_retries,
             fallback_model=self.fallback_model,
         )
-        self._kernel = AgentKernel(config)
+        self._kernel = build_worker_kernel(cfg, mcp_servers=self.mcp_servers)
         return self._kernel
 
     def run(self, req: TaskRequest) -> TaskResult:
         from agent_core.persona import load_persona, Persona
         from agent_core.kernel import KernelResult
 
-        # 加载 executor persona（等价于原 _parse_executor_def）
-        persona = load_persona(self.executor_def_path)
-        # 请求级 model 覆盖：req.model 优先，其次 executor.md frontmatter
+        # 加载 persona（默认 .claude/agents/{role}.md；等价于原 _parse_executor_def）
+        persona = load_persona(self.persona_def_path)
+        # 请求级 model 覆盖：req.model 优先，其次 persona 定义文件 frontmatter
         if req.model:
             persona = Persona(
                 name=persona.name, description=persona.description,

@@ -477,6 +477,16 @@
 const $ = id => document.getElementById(id);
 let currentRunId = null, live = false, lastSeq = 0, abortCtl = null, planSteps = null;
 
+/* 统一 API URL：面板在带 key 的部署（worker 网关 / 跨主机）下，fetch 也要带
+   凭据。key 取自 localStorage['orch_api_key']（编排面板连接管理器镜像写入，
+   与下方终端 WS ?api_key= 同一来源）；未配 key 时原样返回，行为零变化。 */
+function apiUrl(p){
+  let key = '';
+  try{ key = localStorage.getItem('orch_api_key') || ''; }catch(e){}
+  if(!key) return p;
+  return p + (p.indexOf('?') >= 0 ? '&' : '?') + 'api_key=' + encodeURIComponent(key);
+}
+
 function setConn(state, text){
   const d = $('conn-dot');
   d.className = 'dot' + (state === 'ok' ? '' : state === 'busy' ? ' busy' : ' off');
@@ -525,7 +535,7 @@ function dispatch(){
 }
 
 function dispatchAsync(body){
-  fetch('/agent/run/async', {
+  fetch(apiUrl('/agent/run/async'), {
     method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)
   }).then(r => r.json()).then(d => {
     currentRunId = d.run_id;
@@ -533,7 +543,7 @@ function dispatchAsync(body){
     renderRight({ num_turns: 0 });
     const poll = () => {
       if(!live || currentRunId !== d.run_id) return;
-      fetch(`/agent/run/${d.run_id}/events`).then(r => r.json()).then(events => {
+      fetch(apiUrl(`/agent/run/${d.run_id}/events`)).then(r => r.json()).then(events => {
         for(const e of events){
           if(e.seq <= lastSeq) continue;
           lastSeq = e.seq;
@@ -551,7 +561,7 @@ function dispatchAsync(body){
 
 function dispatchStream(body){
   abortCtl = new AbortController();
-  fetch('/agent/run/stream', {
+  fetch(apiUrl('/agent/run/stream'), {
     method:'POST', headers:{'Content-Type':'application/json'},
     body: JSON.stringify(body), signal: abortCtl.signal
   }).then(resp => {
@@ -584,7 +594,7 @@ function dispatchStream(body){
 function abortRun(silent){
   if(abortCtl){ try{ abortCtl.abort(); }catch(e){} abortCtl = null; }
   if(currentRunId){
-    fetch(`/agent/run/${encodeURIComponent(currentRunId)}`, { method:'DELETE' }).catch(() => {});
+    fetch(apiUrl(`/agent/run/${encodeURIComponent(currentRunId)}`), { method:'DELETE' }).catch(() => {});
   }
   if(!silent){ appendError('已请求中断'); }
   finishRun();
@@ -754,7 +764,7 @@ function renderRight(result, replay){
   }
   html += `<div class="sec"><h3>Trace</h3><div class="tracebox" id="trace-box">加载中…</div></div>`;
   rb.innerHTML = html;
-  if(currentRunId) fetch(`/agent/trace/${encodeURIComponent(currentRunId)}`)
+  if(currentRunId) fetch(apiUrl(`/agent/trace/${encodeURIComponent(currentRunId)}`))
     .then(r => r.json())
     .then(tr => {
       const box = $('trace-box'); if(!box) return;
@@ -767,12 +777,12 @@ function previewArtifact(path){
   if(!currentRunId) return;
   const f = $('preview'); if(!f) return;
   f.style.display = 'block';
-  f.src = `/agent/artifact/${encodeURIComponent(currentRunId)}?path=${encodeURIComponent(path)}`;
+  f.src = apiUrl(`/agent/artifact/${encodeURIComponent(currentRunId)}?path=${encodeURIComponent(path)}`);
 }
 
 /* ================= 运行历史 ================= */
 function loadRuns(){
-  fetch('/agent/runs').then(r => r.json()).then(d => {
+  fetch(apiUrl('/agent/runs')).then(r => r.json()).then(d => {
     const list = $('runlist'), runs = d.runs || [];
     $('sidebar-foot').textContent = runs.length ? `共 ${runs.length} 条运行记录` : '—';
     list.innerHTML = '';
@@ -801,7 +811,7 @@ function replayRun(runId){
   showRunbar(runId, '回放模式');
   streamEl().innerHTML = '<div class="replay-badge">⏮ 回放模式 · 按事件序列重放</div>';
   renderRight({ num_turns: 0 });
-  fetch(`/agent/run/${encodeURIComponent(runId)}/events`).then(r => r.json()).then(events => {
+  fetch(apiUrl(`/agent/run/${encodeURIComponent(runId)}/events`)).then(r => r.json()).then(events => {
     for(const e of events){
       if(e.type === 'plan_update'){ renderPlan(e.data); continue; }
       if(e.type === 'result'){ renderResult(e.data, true); continue; }
@@ -919,12 +929,12 @@ function setWsChip(path){
   $('ws-chip').title = '工作区: ' + path + '（点击切换）';
 }
 function loadWorkspace(){
-  fetch('/agent/workspace').then(r => r.json())
+  fetch(apiUrl('/agent/workspace')).then(r => r.json())
     .then(d => { if(d.path) setWsChip(d.path); })
     .catch(() => {});
 }
 function editWorkspace(){
-  fetch('/agent/workspace').then(r => r.json()).then(d => {
+  fetch(apiUrl('/agent/workspace')).then(r => r.json()).then(d => {
     showModal({
       title: '📁 工作区',
       bodyHTML:
@@ -939,7 +949,7 @@ function editWorkspace(){
             const inp = $('ws-input');
             const p = inp ? inp.value.trim() : '';
             if(!p) return;
-            fetch('/agent/workspace', {
+            fetch(apiUrl('/agent/workspace'), {
               method: 'PUT', headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({ path: p })
             }).then(r => r.json()).then(res => {
@@ -1088,7 +1098,7 @@ $('prompt').addEventListener('keydown', e => {
 });
 loadRuns();
 loadWorkspace();
-fetch('/health').then(r => r.json())
+fetch(apiUrl('/health')).then(r => r.json())
   .then(() => setConn('ok', '就绪'))
   .catch(() => setConn('off', '服务离线'));
 </script>

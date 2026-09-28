@@ -5,6 +5,15 @@ import sys
 import threading
 import time
 from pathlib import Path
+
+# 项目根入 sys.path（必须在 `from agent_runner import ...` 之前：其模块级
+# re-export 已引用 agent_core.tools/context）。否则 `python -m worker_api`
+# 从 worker/ 启动时，进程里 PYTHONPATH / editable install 的其他 agent_core
+# 会抢占，导致面板与 SDK 执行拿到陈旧内核代码（如 run_oneshot 无 run_id）。
+# 与 worker_config 基于 __file__ 锚定仓库默认路径的约定一致，保证本仓库内核
+# 永远优先，与进程 CWD 无关。
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -117,7 +126,13 @@ def create_worker_app(runner: AgentRunner, cfg: WorkerConfig) -> FastAPI:
         allow_headers=["*"],
     )
 
-    add_auth_middleware(app, cfg.api_key)
+    # 面板静态页（/panel、/）无需鉴权即公开（页面本身只是入口，/agent/* 仍受控）
+    add_auth_middleware(app, cfg.api_key, public_paths={"/", "/panel"})
+
+    # 节点 Agent 面板：把单 agent 控制台挂到本节点（ORCH_WORKER_PANEL=0 关闭）
+    if cfg.worker_panel:
+        from agent_panel import build_agent_panel_router
+        app.include_router(build_agent_panel_router(cfg))
 
     # 参数校验（validate_id 等）抛的 ValueError 统一转 400
     from fastapi.responses import JSONResponse
@@ -248,8 +263,20 @@ def _build_app():
     cfg = load_worker_config()
     runner_kind = os.environ.get("ORCH_RUNNER", "fake").lower()
     if runner_kind == "sdk":
+        # 人设文件缺失 = 配置错误，启动即失败并列出可用人设（fail-fast）。
+        # 只在这里检查而非 load_worker_config：FakeAgentRunner 不读人设，
+        # WorkerConfig() 直接构造也不应被文件存在性绑架。
+        _persona = Path(cfg.persona_def_path)
+        if not _persona.is_file():
+            _agents_dir = Path(cfg.project_root) / ".claude" / "agents"
+            _available = sorted(
+                p.name for p in _agents_dir.glob("*.md")) if _agents_dir.is_dir() else []
+            raise RuntimeError(
+                f"人设文件不存在: {cfg.persona_def_path}（role={cfg.role}）。"
+                f"当前 .claude/agents/ 可用: {_available or '无'}。"
+                "设置 ORCH_WORKER_ROLE 指定人设名，或用 ORCH_WORKER_PERSONA_DEF 指定文件路径。")
         from agent_runner import load_mcp_servers
-        runner = SdkAgentRunner(work_dir=cfg.work_dir, executor_def_path=cfg.executor_def_path,
+        runner = SdkAgentRunner(work_dir=cfg.work_dir, persona_def_path=cfg.persona_def_path,
                                 permission_mode=cfg.permission_mode,
                                 project_root=cfg.project_root,
                                 task_timeout=cfg.task_timeout,

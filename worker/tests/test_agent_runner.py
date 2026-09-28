@@ -93,7 +93,7 @@ def test_sdk_runner_injects_env_block_into_system_prompt(tmp_path, monkeypatch):
     captured = _install_fake_sdk(
         monkeypatch, [{"result": "ok", "is_error": False, "num_turns": 3}])
     runner = SdkAgentRunner(work_dir=str(tmp_path),
-                            executor_def_path=str(Path(PROJECT_ROOT) / ".claude" / "agents" / "executor.md"),
+                            persona_def_path=str(Path(PROJECT_ROOT) / ".claude" / "agents" / "executor.md"),
                             project_root=PROJECT_ROOT)
     res = runner.run(TaskRequest(task_id="task-env", prompt="做个页面",
                                  context_memory="先读 tokens", model=None))
@@ -112,7 +112,7 @@ def test_sdk_runner_is_error_maps_to_failed(tmp_path, monkeypatch):
     _install_fake_sdk(monkeypatch,
                       [{"result": "炸了", "is_error": True, "num_turns": 5}])
     runner = SdkAgentRunner(work_dir=str(tmp_path),
-                            executor_def_path=str(Path(PROJECT_ROOT) / ".claude" / "agents" / "executor.md"),
+                            persona_def_path=str(Path(PROJECT_ROOT) / ".claude" / "agents" / "executor.md"),
                             project_root=PROJECT_ROOT)
     res = runner.run(TaskRequest(task_id="task-err", prompt="p", context_memory="", model=None))
     assert res.status == "failed"
@@ -124,7 +124,7 @@ def test_sdk_runner_cancelled_mid_session(tmp_path, monkeypatch):
     _install_fake_sdk(monkeypatch,
                       [{"result": "partial", "is_error": False, "num_turns": 1}])
     runner = SdkAgentRunner(work_dir=str(tmp_path),
-                            executor_def_path=str(Path(PROJECT_ROOT) / ".claude" / "agents" / "executor.md"),
+                            persona_def_path=str(Path(PROJECT_ROOT) / ".claude" / "agents" / "executor.md"),
                             project_root=PROJECT_ROOT)
     ev = threading.Event()
     ev.set()  # 预先置位：第一条消息后即应退出
@@ -139,7 +139,7 @@ def test_sdk_runner_timeout(tmp_path, monkeypatch):
                       [{"result": "late", "is_error": False, "num_turns": 1}],
                       delay=2.0)
     runner = SdkAgentRunner(work_dir=str(tmp_path),
-                            executor_def_path=str(Path(PROJECT_ROOT) / ".claude" / "agents" / "executor.md"),
+                            persona_def_path=str(Path(PROJECT_ROOT) / ".claude" / "agents" / "executor.md"),
                             project_root=PROJECT_ROOT, task_timeout=1)
     res = runner.run(TaskRequest(task_id="task-slow", prompt="p", context_memory="", model=None))
     assert res.status == "failed"
@@ -155,7 +155,7 @@ def test_sdk_runner_cost_controls_and_usage(tmp_path, monkeypatch):
         "total_cost_usd": 0.012, "duration_ms": 4321,
     }])
     runner = SdkAgentRunner(work_dir=str(tmp_path),
-                            executor_def_path=str(Path(PROJECT_ROOT) / ".claude" / "agents" / "executor.md"),
+                            persona_def_path=str(Path(PROJECT_ROOT) / ".claude" / "agents" / "executor.md"),
                             project_root=PROJECT_ROOT,
                             max_turns=7, max_thinking_tokens=4096, task_budget_usd=0.5)
     res = runner.run(TaskRequest(task_id="task-cost", prompt="p",
@@ -176,7 +176,7 @@ def test_sdk_runner_cost_controls_disabled(tmp_path, monkeypatch):
     captured = _install_fake_sdk(monkeypatch,
                                  [{"result": "ok", "is_error": False, "num_turns": 1}])
     runner = SdkAgentRunner(work_dir=str(tmp_path),
-                            executor_def_path=str(Path(PROJECT_ROOT) / ".claude" / "agents" / "executor.md"),
+                            persona_def_path=str(Path(PROJECT_ROOT) / ".claude" / "agents" / "executor.md"),
                             project_root=PROJECT_ROOT,
                             max_thinking_tokens=0, task_budget_usd=0)
     runner.run(TaskRequest(task_id="task-nocost", prompt="p", context_memory="", model=None))
@@ -204,7 +204,7 @@ def test_sdk_runner_passes_mcp_servers(tmp_path, monkeypatch):
                                  [{"result": "ok", "is_error": False, "num_turns": 1}])
     mcp_servers = {"fs": {"command": "npx", "args": ["-y", "x"]}}
     runner = SdkAgentRunner(work_dir=str(tmp_path),
-                            executor_def_path=str(Path(PROJECT_ROOT) / ".claude" / "agents" / "executor.md"),
+                            persona_def_path=str(Path(PROJECT_ROOT) / ".claude" / "agents" / "executor.md"),
                             project_root=PROJECT_ROOT, mcp_servers=mcp_servers)
     runner.run(TaskRequest(task_id="task-mcp", prompt="p", context_memory="", model=None))
     assert captured["mcp_servers"] == mcp_servers  # MCP 工具挂载进 SDK 会话
@@ -217,7 +217,7 @@ def test_get_kernel_passthrough_output_guard_config(tmp_path):
     """
     runner = SdkAgentRunner(
         work_dir=str(tmp_path),
-        executor_def_path=str(Path(PROJECT_ROOT) / ".claude" / "agents" / "executor.md"),
+        persona_def_path=str(Path(PROJECT_ROOT) / ".claude" / "agents" / "executor.md"),
         project_root=PROJECT_ROOT,
         output_guard_enabled=False, output_guard_max_retries=3,
         fallback_model="fb-model")
@@ -242,7 +242,7 @@ def test_sdk_runner_merges_kernel_meta_into_task_result(tmp_path):
 
     runner = SdkAgentRunner(
         work_dir=str(tmp_path),
-        executor_def_path=str(Path(PROJECT_ROOT) / ".claude" / "agents" / "executor.md"),
+        persona_def_path=str(Path(PROJECT_ROOT) / ".claude" / "agents" / "executor.md"),
         project_root=PROJECT_ROOT, kernel=FakeGuardKernel())
     res = runner.run(TaskRequest(task_id="task-degen", prompt="p",
                                  context_memory="", model=None))
