@@ -1,0 +1,67 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "multi-agent-orchestrator 架构总览",
+    "locale": "zh-CN",
+    "output": "architecture-overview.html",
+    "quality_profile": "showcase"
+  },
+  "components": [
+    { "id": "obs", "type": "messagebus", "label": "事件总线与审计", "sublabel": "SSE / 审计 / trace", "pos": [270, 170], "size": [140, 76] },
+
+    { "id": "panel", "type": "frontend", "label": "Web 控制面板", "sublabel": "React + Vite", "pos": [40, 360], "size": [140, 84] },
+
+    { "id": "brain", "type": "backend", "label": "大脑 brain_api", "sublabel": "FastAPI 编排 :8000", "pos": [270, 360], "size": [140, 84] },
+
+    { "id": "guard", "type": "security", "label": "security-guard", "sublabel": "规则引擎 + LLM 增强", "tag": "block 挂起审批", "pos": [490, 360], "size": [140, 84] },
+
+    { "id": "dispatcher", "type": "backend", "label": "派发器", "sublabel": "Local / Remote / Async", "pos": [710, 360], "size": [140, 84] },
+
+    { "id": "worker", "type": "backend", "label": "worker 执行节点", "sublabel": "FastAPI :8100", "tag": "注册 + 心跳", "pos": [930, 360], "size": [140, 84] },
+
+    { "id": "kernel", "type": "backend", "label": "AgentKernel", "sublabel": "统一执行内核", "pos": [1150, 360], "size": [140, 84] },
+
+    { "id": "cli", "type": "frontend", "label": "agent CLI", "sublabel": "单机 REPL / headless", "pos": [40, 555], "size": [140, 76] },
+
+    { "id": "memory", "type": "database", "label": "记忆三库", "sublabel": "核心 / 经验 / 程序记忆", "pos": [270, 555], "size": [140, 76] },
+
+    { "id": "registry", "type": "backend", "label": "worker 注册表", "sublabel": "心跳保活 + 轮询选节点", "pos": [710, 555], "size": [140, 76] },
+
+    { "id": "sdk", "type": "external", "label": "claude-agent-sdk", "sublabel": "火山 Ark 网关", "pos": [1145, 555], "size": [150, 76] }
+  ],
+  "boundaries": [
+    { "kind": "region", "label": "大脑进程 brain_api :8000", "wraps": ["brain", "guard", "dispatcher", "registry", "memory", "obs"] },
+    { "kind": "region", "label": "worker 执行节点 :8100", "wraps": ["worker", "kernel", "sdk"] }
+  ],
+  "connections": [
+    { "id": "panel-dispatch", "from": "panel", "to": "brain", "label": "HTTP /dispatch", "variant": "emphasis" },
+    { "id": "cli-direct", "from": "cli", "to": "brain", "label": "单机直连", "variant": "dashed", "fromSide": "right", "toSide": "bottom" },
+    { "id": "guard-check", "from": "brain", "to": "guard", "label": "指令检验" },
+    { "id": "guard-pass", "from": "guard", "to": "dispatcher", "label": "pass 放行" },
+    { "id": "post-task", "from": "dispatcher", "to": "worker", "label": "POST /task" },
+    { "id": "runner-adapter", "from": "worker", "to": "kernel", "label": "AgentRunner" },
+    { "id": "sdk-session", "from": "kernel", "to": "sdk", "label": "SDK 会话", "labelDy": 40 },
+    { "id": "memory-io", "from": "brain", "to": "memory", "label": "记忆 / 经验读写", "labelDy": 60 },
+    { "id": "select-worker", "from": "dispatcher", "to": "registry", "label": "选节点", "labelDy": 40 },
+    { "id": "publish-event", "from": "brain", "to": "obs", "label": "发布任务事件" },
+    { "id": "sse-stream", "from": "obs", "to": "panel", "label": "SSE 实时流", "variant": "dashed", "fromSide": "left", "toSide": "top" }
+  ],
+  "cards": [
+    { "dot": "cyan", "title": "编排主干", "items": [
+      "panel 与 CLI 统一走 /dispatch，先过 security-guard 前置关卡",
+      "block 指令挂起为审批态，人工 approve / reject 后才继续",
+      "集群按角色轮询选 worker；单机 ORCH_LOCAL_EXEC=1 进程内直跑内核"
+    ] },
+    { "dot": "emerald", "title": "统一内核", "items": [
+      "AgentKernel 被单机 CLI、本地服务与集群 worker 共用",
+      "三种入口：run_oneshot 单发 / open_session 多轮 / stream 流式",
+      "守卫链：prompt_guard → tool_policy → output_guard → result_validator"
+    ] },
+    { "dot": "violet", "title": "记忆闭环", "items": [
+      "核心记忆 / 任务上下文 / 经验库，RAG 注入限幅 3000 字符",
+      "程序记忆演化：提案 → security+brain+executor 三票 → 自动应用",
+      "按 role 加载人设与技能（data-expert / back-expert / web-expert）"
+    ] }
+  ]
+}
