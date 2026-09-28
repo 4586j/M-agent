@@ -47,3 +47,6 @@ workspace/agent/orchestrator/runtime/.proc-run/
 .zcode/
 workspace/agent/skills/orchestrator/memory/context/task-*/
 result/.last_run_id
+
+# agent 运行任务临时目录（run-<hash>）
+.agent_work/
