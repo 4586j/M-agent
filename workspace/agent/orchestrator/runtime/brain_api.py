@@ -28,6 +28,7 @@ from experience_store import ExperienceStore
 from memory_store import FileMemoryStore, MemoryStore
 from procedural_store import ProceduralStore
 from retry_manager import RetryManager
+from providers import ProviderStore
 from embedding_model import create_embedding_model
 from schedule_store import ScheduleStore, ScheduleRecord, compute_next_run
 from task_scheduler import TaskScheduler
@@ -51,6 +52,12 @@ class HeartbeatReq(BaseModel):
     load: int = 0
 
 
+class NodeWorkspaceProxyReq(BaseModel):
+    """PUT /proxy/node/workspace：代理设置节点对话工作区。"""
+    worker_id: str
+    path: str
+
+
 class DispatchReq(BaseModel):
     prompt: str
     role: str = "executor"
@@ -67,6 +74,9 @@ class DispatchReq(BaseModel):
     # 定点派发：非空时按 worker_id 指定节点（定向指挥单机多 agent 的某个实例）。
     # 节点不存在/心跳超时直接 failed 返回，不静默换节点；格式非法归 400。
     worker_id: str | None = None
+    # 运行时 Provider：只传 provider 名（密钥不入请求体/审计/审批缓存）。
+    # 未指定 → 用 brain 当前默认 provider；都没有 → worker 走自身配置/进程 env。
+    provider: str | None = None
 
 
 class AdvisorReq(BaseModel):
@@ -105,6 +115,8 @@ class RedispatchReq(BaseModel):
     model: str | None = None
     # 定点重派：非空时强制指到该节点；缺省后端按原任务 meta.pinned 继承。
     worker_id: str | None = None
+    # provider 覆盖：非空用指名 provider；缺省继承原任务 meta.provider（同名重新解析）。
+    provider: str | None = None
 
 
 class ApproveReq(BaseModel):
@@ -130,6 +142,7 @@ class ScheduleReq(BaseModel):
     prompt: str
     context_memory: str | None = None
     model: str | None = None
+    provider: str | None = None  # 定时任务使用的 provider 名（触发时按当前环境再解析）
 
 
 def _default_web_dist() -> str:
@@ -143,6 +156,27 @@ def _default_web_dist() -> str:
             break
         p = p.parent
     return "web/dist"
+
+
+def _make_provider_resolver(provider_store: ProviderStore,
+                            default_provider: str):
+    """构造 provider 名解析器：显式名或默认名 → 解析后的三元组。
+
+    显式名/默认名不可用（不存在或 ${ENV} 不可解析）→ 抛 ValueError（→400）；
+    两者都空 → None（worker 走自身配置/进程 env）。
+    """
+    def resolve_name(name: str | None) -> dict | None:
+        target = (name or "").strip() or default_provider
+        if not target:
+            return None
+        resolved = provider_store.resolve(target)
+        if resolved is None:
+            avail = ", ".join(provider_store.names()) or "无"
+            raise ValueError(
+                f"provider '{target}' 不可用（池中: {avail}）——检查 "
+                "providers.json 条目与其引用的环境变量")
+        return resolved
+    return resolve_name
 
 
 def _request_operator(request: Request) -> str | None:
@@ -262,7 +296,8 @@ def create_brain_app(registry: WorkerRegistry, task_store: TaskStore, cfg: Confi
                      event_bus: TaskEventBus | None = None,
                      http_call=None,
                      advisor=None,
-                     translator=None) -> FastAPI:
+                     translator=None,
+                     provider_store: ProviderStore | None = None) -> FastAPI:
     """dispatcher 可选：remote 模式传入 RemoteDispatcher，使派发与注册状态同进程。
 
     event_bus 可选：SSE 实时流的事件总线；未传入时自建（派发器未接总线时
@@ -312,6 +347,21 @@ def create_brain_app(registry: WorkerRegistry, task_store: TaskStore, cfg: Confi
             return cfg.cheap_model
         return None
 
+    provider_store = provider_store if provider_store is not None else ProviderStore(
+        cfg.providers_file)
+    resolve_provider_name = _make_provider_resolver(provider_store, cfg.default_provider)
+
+    def _resolve_provider(model: str | None,
+                          provider_name: str | None) -> tuple[str | None, dict | None]:
+        """把 provider 名解析为三元组 + 返回最终 model。
+
+        优先级：显式 provider 名 > brain 默认 provider（热切）> 无（worker 自身配置）。
+        名不存在/环境变量不可解析 → ValueError（全局 handler → 400）。
+        model 优先 req.model / 启发式路由，其次 provider.model（网关默认模型）。
+        """
+        resolved = resolve_provider_name(provider_name)
+        return (model or (resolved or {}).get("model"), resolved)
+
     @app.post("/register")
     def register(req: RegisterReq):
         validate_id(req.worker_id, "worker_id")
@@ -341,6 +391,54 @@ def create_brain_app(registry: WorkerRegistry, task_store: TaskStore, cfg: Confi
         if not registry.unregister(worker_id):
             raise HTTPException(status_code=404, detail="worker not found")
         return {"status": "unregistered", "worker_id": worker_id}
+
+    # ---- 运行时 Provider 池管理（密钥只写 providers.json，gitignore；GET 回显遮蔽）----
+
+    class ProviderPutReq(BaseModel):
+        name: str
+        model: str | None = None
+        base_url: str | None = None
+        auth_token: str | None = None
+
+    class DefaultProviderReq(BaseModel):
+        name: str = ""  # 空=清空默认
+
+    @app.get("/providers")
+    def list_providers():
+        """遮蔽密钥后的池视图 + 当前默认名（真实密钥绝不回显）。"""
+        return provider_store.list_all()
+
+    @app.put("/providers")
+    def put_provider(req: ProviderPutReq):
+        name = req.name.strip()
+        validate_id(name, "provider name")
+        provider_store.upsert(name, model=req.model or "",
+                              base_url=req.base_url or "",
+                              auth_token=req.auth_token or "")
+        return {"status": "saved", "name": name}
+
+    @app.delete("/providers/{name}")
+    def delete_provider(name: str):
+        if not provider_store.delete(name):
+            raise HTTPException(status_code=404, detail="provider not found")
+        return {"status": "deleted", "name": name}
+
+    @app.get("/providers/default")
+    def get_default_provider():
+        return {"default": provider_store.default()}
+
+    @app.put("/providers/default")
+    def set_default_provider(req: DefaultProviderReq):
+        """热切默认：只影响后续新任务；running/排队任务用已解析值。"""
+        name = req.name.strip()
+        if name:
+            validate_id(name, "provider name")
+        try:
+            provider_store.set_default(name)
+        except KeyError:
+            raise HTTPException(status_code=404,
+                                detail=f"provider '{name}' 不存在")
+        return {"status": "default_set", "default": provider_store.default()}
 
     @app.get("/tasks")
     def list_tasks(worker_id: str | None = None, status: str | None = None):
@@ -430,9 +528,14 @@ def create_brain_app(registry: WorkerRegistry, task_store: TaskStore, cfg: Confi
             if (rec_meta.get("approval") or {}).get("status") == "rejected":
                 raise HTTPException(status_code=400,
                                     detail="被人工拒绝的指令不可重派，请修订后重新派发")
+        # Provider 继承：显式 req.provider 优先；缺省沿用原任务 meta.provider（同名
+        # 重新从环境解析，密钥不落盘）。模型同理：显式 req.model 优先，缺省沿用原 model。
+        provider_name = (req.provider or "").strip() or (
+            (rec0.meta if isinstance(rec0.meta, dict) else {}).get("provider") or None)
+        model, provider = _resolve_provider(req.model, provider_name)
         try:
-            res = dispatcher.redispatch(task_id, model=req.model,
-                                        worker_id=req.worker_id)
+            res = dispatcher.redispatch(task_id, model=model,
+                                        worker_id=req.worker_id, provider=provider)
         except KeyError as e:
             raise HTTPException(status_code=404, detail=str(e))
         except RuntimeError as e:
@@ -441,6 +544,7 @@ def create_brain_app(registry: WorkerRegistry, task_store: TaskStore, cfg: Confi
             "task_id": res.task_id, "status": res.status,
             "output": res.output, "artifacts": res.artifacts, "error": res.error,
             "product_verdict": res.verdict,
+            "provider": provider["name"] if provider else None,
         }
 
     def _approval_meta(rec: TaskRecord) -> dict:
@@ -473,6 +577,7 @@ def create_brain_app(registry: WorkerRegistry, task_store: TaskStore, cfg: Confi
                 "context_task_ids": req.context_task_ids,
                 "model": model,
                 "worker_id": req.worker_id,  # 定点续传：approve 时恢复对同一节点派发
+                "provider": req.provider,   # 只缓存 provider 名，不缓存三元组/<密钥>
                 "requested_by": _request_operator(request),
             }},
         ))
@@ -543,13 +648,16 @@ def create_brain_app(registry: WorkerRegistry, task_store: TaskStore, cfg: Confi
             context = assemble_context(memory_store, context, ctx_task_ids)
         context = clamp_context(context, cfg.context_memory_max_chars)
         model = approval.get("model")
+        # Provider：approve 时按缓存名重新解析（不缓存三元组/密钥于 approval meta）；
+        # 老任务该键缺失 → 走当前默认 provider（与「新任务」语义一致）
+        model, provider = _resolve_provider(model, approval.get("provider"))
         # 定点续传：被拦截时缓存了 worker_id，approve 时恢复对同一节点派发；
         # 老任务该键缺失 → None → 自动选节点（向后兼容）
         worker_id = approval.get("worker_id")
         try:
             res = dispatcher.dispatch(role=rec.role, prompt=prompt,
                                       context_memory=context or None, model=model,
-                                      worker_id=worker_id)
+                                      worker_id=worker_id, provider=provider)
         except Exception as e:  # noqa: BLE001 - 派发失败回滚占位，任务回到待审批
             task_store.transition(task_id, "dispatching", "awaiting_approval")
             publish_task_event(bus, task_id, event="status", state="awaiting_approval",
@@ -646,18 +754,22 @@ def create_brain_app(registry: WorkerRegistry, task_store: TaskStore, cfg: Confi
             context = assemble_context(memory_store, context, req.context_task_ids)
         context = clamp_context(context, cfg.context_memory_max_chars)
         model = _route_model(req)
+        # 运行时 Provider：名 → 三元组（密钥不落盘）；显式名/默认名不可用 → 400
+        model, provider = _resolve_provider(model, req.provider)
         try:
             res = dispatcher.dispatch(role=req.role, prompt=req.prompt,
                                       context_memory=context or None, model=model,
                                       use_experience=req.use_experience,
                                       enable_subagents=req.enable_subagents,
-                                      worker_id=req.worker_id)
+                                      worker_id=req.worker_id,
+                                      provider=provider)
         except RuntimeError as e:
             return {"status": "failed", "error": str(e)}
         return {
             "task_id": res.task_id, "status": res.status,
             "output": res.output, "artifacts": res.artifacts, "error": res.error,
             "product_verdict": res.verdict, "model": model,
+            "provider": provider["name"] if provider else None,
         }
 
     @app.post("/dispatch/async")
@@ -695,6 +807,8 @@ def create_brain_app(registry: WorkerRegistry, task_store: TaskStore, cfg: Confi
             context = assemble_context(memory_store, context, req.context_task_ids)
         context = clamp_context(context, cfg.context_memory_max_chars)
         model = _route_model(req)
+        # 运行时 Provider：名 → 三元组（密钥不落盘）；显式名/默认名不可用 → 400
+        model, provider = _resolve_provider(model, req.provider)
         try:
             task_id = await async_dispatcher.dispatch_async(
                 role=req.role, prompt=req.prompt,
@@ -702,10 +816,12 @@ def create_brain_app(registry: WorkerRegistry, task_store: TaskStore, cfg: Confi
                 use_experience=req.use_experience,
                 enable_subagents=req.enable_subagents,
                 worker_id=req.worker_id,
+                provider=provider,
             )
         except RuntimeError as e:
             return {"status": "failed", "error": str(e)}
-        return {"status": "accepted", "task_id": task_id, "model": model}
+        return {"status": "accepted", "task_id": task_id, "model": model,
+                "provider": provider["name"] if provider else None}
 
     @app.post("/recommend")
     async def recommend(req: AdvisorReq, request: Request):
@@ -1047,6 +1163,7 @@ def create_brain_app(registry: WorkerRegistry, task_store: TaskStore, cfg: Confi
             schedule_id=sid, name=req.name, cron_expr=req.cron_expr,
             role=req.role, prompt=req.prompt,
             context_memory=req.context_memory, model=req.model,
+            provider=req.provider,
             created_at=str(int(time.time())), next_run=next_run,
         )
         schedule_store.write(rec)
@@ -1098,6 +1215,38 @@ def create_brain_app(registry: WorkerRegistry, task_store: TaskStore, cfg: Confi
         if resp.get("status_code") != 200:
             raise HTTPException(status_code=502, detail=f"worker 返回: {resp}")
         return resp.get("json", {})
+
+    def _proxy_worker(worker_id: str):
+        """代理端 worker 解析：复用 /proxy/artifact 的注册表查找，未注册 404。"""
+        w = next((x for x in registry.all_workers() if x.worker_id == worker_id), None)
+        if w is None:
+            raise HTTPException(status_code=404, detail=f"worker not found: {worker_id}")
+        return f"http://{w.host}:{w.port}"
+
+    @app.get("/proxy/node/status")
+    def proxy_node_status(worker_id: str):
+        """节点详情（技能/MCP/工作区/run 计数）：经同 key 通道转调 worker /agent/status。
+        worker 未开面板时该端点 404 → 502，语义即「此节点无面板/状态不可达」。"""
+        base = _proxy_worker(worker_id)
+        resp = http_call("GET", f"{base}/agent/status")
+        if resp.get("status_code") != 200:
+            raise HTTPException(status_code=502, detail=f"worker 返回: {resp}")
+        return resp.get("json", {})
+
+    @app.put("/proxy/node/workspace")
+    def proxy_node_workspace(req: NodeWorkspaceProxyReq):
+        """规定节点对话工作区：转调 worker PUT /agent/workspace。
+        worker 端 400（目录不存在/越界）原样透传，其余失败 502。"""
+        base = _proxy_worker(req.worker_id)
+        resp = http_call("PUT", f"{base}/agent/workspace", json={"path": req.path})
+        sc = resp.get("status_code")
+        if sc == 200:
+            return resp.get("json", {})
+        body = resp.get("json", {})
+        if sc == 400:
+            raise HTTPException(status_code=400,
+                                detail=body.get("detail", body) or f"worker 返回: {resp}")
+        raise HTTPException(status_code=502, detail=f"worker 返回: {resp}")
 
     # 静态托管前端构建产物（生产同源）；目录不存在则跳过，仅提供 API
     web_dist = os.environ.get("ORCH_WEB_DIST") or _default_web_dist()
@@ -1193,6 +1342,9 @@ def _build_app() -> FastAPI:
     cfg = load_config()
     registry = WorkerRegistry(heartbeat_timeout=cfg.heartbeat_timeout)
     store = TaskStore(cfg.task_store_dir)
+    # Provider 池（providers.json，gitignore）：重试/定时/派发共用同一 resolver
+    provider_store = ProviderStore(cfg.providers_file)
+    provider_resolver = _make_provider_resolver(provider_store, cfg.default_provider)
     emb_model = create_embedding_model()
     exp_store = ExperienceStore(cfg.experience_store_dir, embedding_model=emb_model,
                                 max_count=cfg.experience_max_count,
@@ -1246,9 +1398,11 @@ def _build_app() -> FastAPI:
             sweeper_interval=cfg.sweeper_interval,
             retry_base_delay=cfg.retry_base_delay,
             event_bus=bus,
+            provider_resolver=provider_resolver,
         )
         retry_mgr.start()
-        scheduler = TaskScheduler(schedule_store=sched_store, dispatcher=dispatcher)
+        scheduler = TaskScheduler(schedule_store=sched_store, dispatcher=dispatcher,
+                                  provider_resolver=provider_resolver)
         scheduler.start()
     elif cfg.mode == "local" and os.environ.get("ORCH_LOCAL_EXEC", "0") in ("1", "true", "True"):
         # 单机本地执行：brain 进程内直接运行 AgentKernel（默认不启用，行为不变）
@@ -1288,7 +1442,8 @@ def _build_app() -> FastAPI:
                             retry_manager=retry_mgr,
                             schedule_store=sched_store, task_scheduler=scheduler,
                             async_dispatcher=async_disp, event_bus=bus,
-                            advisor=advisor, translator=translator)
+                            advisor=advisor, translator=translator,
+                            provider_store=provider_store)
 
 
 if __name__ == "__main__":

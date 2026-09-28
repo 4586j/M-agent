@@ -299,6 +299,35 @@ def test_trace_id_flows_to_runner_and_callback(tmp_path, monkeypatch):
     assert "meta" in payload
 
 
+def test_provider_fields_flow_to_runner(tmp_path):
+    """brain 下发的 provider 四字段（名 + 三元组 + 故障切换池）透传到 runner 的 TaskRequest。"""
+    captured = {}
+
+    class ProviderRunner(FakeAgentRunner):
+        def run(self, req):
+            captured["provider"] = req.provider
+            captured["base_url"] = req.provider_base_url
+            captured["auth_token"] = req.provider_auth_token
+            captured["pool"] = req.provider_pool
+            return super().run(req)
+
+    client = TestClient(create_worker_app(ProviderRunner(work_dir=str(tmp_path)),
+                                          WorkerConfig(work_dir=str(tmp_path))))
+    r = client.post("/task", json={
+        "task_id": "task-p1", "prompt": "p", "context_memory": "", "model": "m",
+        "provider": "gw-main",
+        "provider_base_url": "https://gw.example.com/v1",
+        "provider_auth_token": "secre t-key",
+        "provider_pool": [{"model": "haiku", "base_url": "https://alt"}],
+    })
+    assert r.status_code == 200
+    _wait_terminal(client, "task-p1")
+    assert captured["provider"] == "gw-main"
+    assert captured["base_url"] == "https://gw.example.com/v1"
+    assert captured["auth_token"] == "secre t-key"
+    assert captured["pool"] == [{"model": "haiku", "base_url": "https://alt"}]
+
+
 def test_build_app_fails_fast_on_missing_persona(monkeypatch):
     """ORCH_RUNNER=sdk 且人设文件缺失：启动即抛错并列出可用人设（fail-fast）。"""
     import worker_api

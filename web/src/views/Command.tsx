@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { useLocation } from 'react-router-dom'
 import { api } from '../api/client'
-import type { ApprovalMeta, DispatchAsyncResponse, DispatchResult, ExperienceRecord, TaskRecord, RecommendResponse, TranslateResponse, WorkerInfo } from '../types'
+import type { ApprovalMeta, DispatchAsyncResponse, DispatchResult, ExperienceRecord, ProviderList, TaskRecord, RecommendResponse, TranslateResponse, WorkerInfo } from '../types'
 import { usePolling } from '../hooks/usePolling'
 import { formatTime, timeAgo } from '../utils'
 import StatusBadge from '../components/StatusBadge'
@@ -10,6 +10,7 @@ export default function Command() {
   const [prompt, setPrompt] = useState('')
   const [role, setRole] = useState('executor')
   const [model, setModel] = useState('')
+  const [provider, setProvider] = useState('')
   const [ctx, setCtx] = useState('')
   const [result, setResult] = useState<DispatchResult | null>(null)
   const [busy, setBusy] = useState(false)
@@ -24,6 +25,9 @@ export default function Command() {
     const w = workerId ? (workers ?? []).find((x) => x.worker_id === workerId) : undefined
     if (w) setRole(w.role)
   }, [workerId, workers])
+
+  // 运行时 Provider 名列表（brain providers.json；省略=用当前默认）
+  const { data: providerList } = usePolling<ProviderList>(() => api.providers(), 15000)
 
   // 二期：同步阻塞 / 异步+SSE 两种派发模式（异步适合 web-expert/back-expert 长流程）
   const [mode, setMode] = useState<'sync' | 'async'>('sync')
@@ -65,6 +69,7 @@ export default function Command() {
         prompt, role,
         context_memory: ctx || null,
         model: model || null,
+        provider: provider || null,
         force,
         enable_subagents: enableSubagents,
         context_task_ids: ctxTaskIds.length > 0 ? ctxTaskIds : undefined,
@@ -206,7 +211,7 @@ export default function Command() {
           className="mt-1 w-full px-2 py-1 text-sm border border-slate-300 rounded font-mono"
           placeholder="例如：分析 workspace/test.csv 并报告行数"
         />
-        <div className="grid grid-cols-3 gap-2 mt-2">
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-2 mt-2">
           <label className="text-xs text-slate-500">
             role
             <input value={role} disabled={!!workerId} onChange={(e) => setRole(e.target.value)}
@@ -218,6 +223,17 @@ export default function Command() {
             <input value={model} onChange={(e) => setModel(e.target.value)}
               className="mt-1 w-full px-2 py-1 text-sm border border-slate-300 rounded"
               placeholder="sonnet" />
+          </label>
+          <label className="text-xs text-slate-500">
+            provider（可选）
+            <select value={provider} onChange={(e) => setProvider(e.target.value)}
+              className="mt-1 w-full px-2 py-1 text-sm border border-slate-300 rounded bg-white"
+              title={`空 = 用 brain 当前默认${providerList?.default ? `（${providerList.default}）` : ''}；只传 provider 名，密钥在 brain 侧解析`}>
+              <option value="">默认{providerList?.default ? `（${providerList.default}）` : ''}</option>
+              {Object.keys(providerList?.providers ?? {}).map((p) => (
+                <option key={p} value={p}>{p}</option>
+              ))}
+            </select>
           </label>
           <label className="text-xs text-slate-500">
             目标节点

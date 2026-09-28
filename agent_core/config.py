@@ -5,9 +5,13 @@
 runtime/config.py（记忆目录）。全部从环境变量加载，前缀优先 AGENT_，
 向后兼容 ORCH_；缺省值基于本文件位置定位项目根，避免相对路径随 cwd 漂移。
 """
+import json
+import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
+
+log = logging.getLogger(__name__)
 
 # agent_core/ 的上一级即项目根（本包放在 <project_root>/agent_core/ 下）
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -104,6 +108,15 @@ class AgentConfig:
     output_guard_max_retries: int = 1
     # 第 2 次重试使用的备用模型；空=不换模型（仍注入提示重试）
     fallback_model: str = ""
+    # ---- 运行时 Provider（模型/端点/密钥切换；persona / 任务级覆盖优先）----
+    # provider_base_url / provider_auth_token：全局默认三元组（第三层兜底）。
+    # 非空时 kernel._build_options 注入 SDK options.env（ANTHROPIC_BASE_URL /
+    # ANTHROPIC_AUTH_TOKEN）覆盖子进程 env；空则回落进程 env（第四层）。
+    provider_base_url: str = ""
+    provider_auth_token: str = ""
+    # provider_pool：自动故障切换候选 [{model, base_url, auth_token}, ...]。
+    # 「有池才切」：sdk_error/429/超时/空结果时依序切下一候选重试，最多 len(pool) 次。
+    provider_pool: list[dict] | None = None
     # ---- 自纠错闭环（result_validator.py）----
     correction_enabled: bool = True       # 自纠错闭环开关
     correction_max_retries: int = 2       # 修正重试上限
@@ -180,6 +193,35 @@ def _to_bool(raw: str, default: bool) -> bool:
     if raw == "":
         return default
     return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _to_provider_pool(raw: str) -> list[dict] | None:
+    """解析 provider_pool 环境变量（JSON 数组 [{model, base_url, auth_token}]）。
+
+    空串/非法 JSON → 返回 None（视为未配置，“有池才切”下不启用故障切换）；
+    损坏条目（非对象）跳过。密钥只来自环境变量装配，不进日志。
+    """
+    raw = (raw or "").strip()
+    if not raw:
+        return None
+    try:
+        parsed = json.loads(raw)
+    except Exception as e:
+        log.warning("AGENT_PROVIDER_POOL 解析失败，视为未配置：%s", e)
+        return None
+    if not isinstance(parsed, list):
+        log.warning("AGENT_PROVIDER_POOL 应为 JSON 数组，视为未配置")
+        return None
+    pool = []
+    for item in parsed:
+        if not isinstance(item, dict):
+            continue
+        pool.append({
+            "model": str(item["model"]) if item.get("model") else None,
+            "base_url": str(item["base_url"]) if item.get("base_url") else None,
+            "auth_token": str(item["auth_token"]) if item.get("auth_token") else None,
+        })
+    return pool or None
 
 
 def _to_optional_int(raw: str) -> int | None:
@@ -323,6 +365,13 @@ def load_agent_config(**overrides) -> AgentConfig:
             "1", "AGENT_OUTPUT_GUARD_MAX_RETRIES",
             "ORCH_OUTPUT_GUARD_MAX_RETRIES")),
         fallback_model=_env("", "AGENT_FALLBACK_MODEL", "ORCH_FALLBACK_MODEL"),
+        # 运行时 Provider（全局默认三元组 + 故障切换池）
+        provider_base_url=_env("", "AGENT_PROVIDER_BASE_URL",
+                               "ORCH_PROVIDER_BASE_URL"),
+        provider_auth_token=_env("", "AGENT_PROVIDER_AUTH_TOKEN",
+                                 "ORCH_PROVIDER_AUTH_TOKEN"),
+        provider_pool=_to_provider_pool(_env(
+            "", "AGENT_PROVIDER_POOL", "ORCH_PROVIDER_POOL")),
         # 自纠错闭环
         correction_enabled=_to_bool(_env("1", "AGENT_CORRECTION_ENABLED"), True),
         correction_max_retries=int(_env("2", "AGENT_CORRECTION_MAX_RETRIES")),

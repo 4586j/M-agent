@@ -80,6 +80,50 @@ def test_persona_def_override_preferred_then_compat(monkeypatch):
     assert load_worker_config().persona_def_path == "/legacy/executor.md"
 
 
+# ---- 运行时 Provider（ORCH_PROVIDER_* 全局默认 + 池）----
+
+def test_provider_defaults_empty():
+    cfg = WorkerConfig()
+    assert cfg.provider_base_url == "" and cfg.provider_auth_token == ""
+    assert cfg.provider_pool is None
+
+
+def test_provider_env_base_url_and_pool(monkeypatch):
+    monkeypatch.setenv("AGENT_PROVIDER_BASE_URL", "https://gw.example.com/v1")
+    monkeypatch.setenv("ORCH_PROVIDER_AUTH_TOKEN", "tok")
+    monkeypatch.setenv("AGENT_PROVIDER_POOL",
+                       '[{"model": "haiku", "base_url": "https://alt"}]')
+    cfg = load_worker_config()
+    assert cfg.provider_base_url == "https://gw.example.com/v1"
+    assert cfg.provider_auth_token == "tok"
+    assert cfg.provider_pool == [{"model": "haiku", "base_url": "https://alt",
+                                  "auth_token": None}]
+
+
+def test_provider_pool_invalid_json_returns_none(monkeypatch):
+    monkeypatch.setenv("AGENT_PROVIDER_POOL", "not-json")
+    assert load_worker_config().provider_pool is None
+
+
+# ---- skillhub 自动同步（ORCH_SKILLHUB_AUTO 三态）----
+
+def test_skillhub_auto_three_states(monkeypatch):
+    """缺省关闭；1/true 开启；0/false 关闭（与 worker_panel 同布尔约定）。"""
+    monkeypatch.delenv("ORCH_SKILLHUB_AUTO", raising=False)
+    assert WorkerConfig().skillhub_auto is False
+    assert load_worker_config().skillhub_auto is False
+
+    monkeypatch.setenv("ORCH_SKILLHUB_AUTO", "1")
+    assert load_worker_config().skillhub_auto is True
+    monkeypatch.setenv("ORCH_SKILLHUB_AUTO", "true")
+    assert load_worker_config().skillhub_auto is True
+
+    monkeypatch.setenv("ORCH_SKILLHUB_AUTO", "0")
+    assert load_worker_config().skillhub_auto is False
+    monkeypatch.setenv("ORCH_SKILLHUB_AUTO", "false")
+    assert load_worker_config().skillhub_auto is False
+
+
 def test_load_worker_config_output_guard_orch_fallback(monkeypatch):
     """AGENT_ 未设置时回退 ORCH_ 前缀（与集群既有 ORCH_ 配置并存）。"""
     for key in ("AGENT_OUTPUT_GUARD_ENABLED", "AGENT_OUTPUT_GUARD_MAX_RETRIES",

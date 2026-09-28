@@ -10,6 +10,7 @@ import Command from './views/Command'
 import Memory from './views/Memory'
 import Schedules from './views/Schedules'
 import Audit from './views/Audit'
+import Providers from './views/Providers'
 import ConnectionSettings from './components/ConnectionSettings'
 
 const NAV = [
@@ -19,6 +20,7 @@ const NAV = [
   { to: '/command', label: '命令台' },
   { to: '/memory', label: '记忆' },
   { to: '/schedules', label: '调度' },
+  { to: '/providers', label: 'Provider' },
   { to: '/audit', label: '审计' },
 ]
 
@@ -35,6 +37,7 @@ export default function App() {
           <Route path="/command" element={<Command />} />
           <Route path="/memory" element={<Memory />} />
           <Route path="/schedules" element={<Schedules />} />
+          <Route path="/providers" element={<Providers />} />
           <Route path="/audit" element={<Audit />} />
         </Routes>
       </main>

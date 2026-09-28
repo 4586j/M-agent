@@ -34,6 +34,13 @@ def _classify(text: str, tname: str) -> str:
     if "not_found_error" in low:
         return "model_not_found"
 
+    # 限流（429 / rate limit / too many requests）——判定提前到 budget 类之前：
+    # 限流是**可换 provider 重试**的信号（内核自动故障切换「有池才切」），
+    # 与预算熔断（不可换、只能调额度）语义不同，必须分开归类。
+    if ("429" in low or "rate limit" in low or "too many requests" in low
+            or "ratelimit" in low or "request_limit_exceeded" in low):
+        return "rate_limit"
+
     # 鉴权失败（401/403 / unauthorized / forbidden / invalid api key）——
     # 判定提前到预算类之前：避免 "insufficient permission"(403) 等
     # 鉴权表述被余额关键词抢先误判为 budget
@@ -72,6 +79,10 @@ _TEMPLATES: dict[str, tuple[str, str]] = {
     "sdk_missing": (
         "未安装 claude-agent-sdk，内核无法驱动底层 Claude Code CLI。",
         "在当前 Python 环境执行 pip install claude-agent-sdk 后重试。",
+    ),
+    "rate_limit": (
+        "触发限流（429，请求频率超额度，或账户并发/每分钟配额用尽）。",
+        "稍后重试，或配置 provider_pool 让内核自动切到备用 provider（有池才切）。",
     ),
     "auth": (
         "鉴权失败（API Key 缺失、无效或已过期，服务端返回 401）。",

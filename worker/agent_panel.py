@@ -35,7 +35,7 @@ from pydantic import BaseModel, Field
 from agent_core.errors import humanize_sdk_error
 from agent_core.kernel import AgentEvent
 from agent_core.persona import Persona, load_persona
-from agent_runner import build_worker_kernel
+from agent_runner import build_worker_kernel, scan_skills, load_mcp_servers
 
 log = logging.getLogger(__name__)
 
@@ -204,12 +204,10 @@ def build_agent_panel_router(cfg, executor: PanelExecutor | None = None) -> APIR
 
     def _resolve_persona(model: str | None) -> Persona:
         """加载节点人设（.claude/agents/{role}.md），请求级 model 覆盖。"""
+        from agent_core.persona import replace_persona
         persona = load_persona(cfg.persona_def_path)
         if model:
-            persona = Persona(name=persona.name, description=persona.description,
-                              model=model, tools=persona.tools,
-                              system_prompt=persona.system_prompt,
-                              sub_agents=persona.sub_agents)
+            persona = replace_persona(persona, model=model)
         return persona
 
     # ---- SSE 帧格式化（与 agent_core.service 对齐） ----
@@ -410,6 +408,33 @@ def build_agent_panel_router(cfg, executor: PanelExecutor | None = None) -> APIR
         state["workspace"] = p
         log.info("[%s] 工作区已切换为 %s", cfg.worker_id, p)
         return {"path": str(p), "name": p.name or str(p)}
+
+    @router.get("/agent/status")
+    def agent_status() -> dict:
+        """节点详情：技能 / MCP 挂载 / 当前工作区 / 面板 run 计数。
+
+        供编排面板的 brain 代理（/proxy/node/status）拉取；不依赖 executor
+        （Fake runner 下同样可读），skills 与 mcp 取与 kernel 注入同源的扫描结果。
+        """
+        skills = scan_skills(cfg.project_root)
+        mcp = load_mcp_servers(cfg.mcp_config_path) or {}
+        ws = state["workspace"]
+        return {
+            "worker_id": cfg.worker_id,
+            "role": cfg.role,
+            "panel_enabled": cfg.worker_panel,
+            "workspace": {"path": str(ws), "name": ws.name or str(ws),
+                          "exists": ws.is_dir()},
+            "skills": [{"name": s["name"], "description": s["description"],
+                        "triggers": s.get("triggers", [])} for s in skills],
+            "mcp_servers": [{"name": k, "command": v.get("command"), "url": v.get("url")}
+                            for k, v in mcp.items()],
+            "runs": {
+                "running": sum(1 for e in state["runs"].values()
+                               if e["status"] == "running"),
+                "total": len(state["runs"]),
+            },
+        }
 
     # ---- 内嵌终端（与 agent_core.service 同协议；工作区边界 = 节点工作区） ----
 

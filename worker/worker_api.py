@@ -35,6 +35,14 @@ class TaskBody(BaseModel):
     model: str | None = None
     callback_url: str | None = None
     trace_id: str | None = None  # brain 派发时生成的链路追踪 ID，日志与 callback 透传
+    # 运行时 Provider 四字段（brain 解析后透传；密钥只走本请求体/内存，不落盘）：
+    # provider = provider 名（进 meta 对账）；provider_base_url/auth_token = 解析后的
+    # 端点/密钥（仅本次任务生效，SdkAgentRunner.run 并入 persona）；provider_pool =
+    # 自动故障切换候选（有池才切）。
+    provider: str | None = None
+    provider_base_url: str | None = None
+    provider_auth_token: str | None = None
+    provider_pool: list[dict] | None = None
 
 
 def register_to_brain(cfg: WorkerConfig, http_post=None) -> bool:
@@ -157,7 +165,11 @@ def create_worker_app(runner: AgentRunner, cfg: WorkerConfig) -> FastAPI:
         with lock:
             cancel_events[body.task_id] = event
         req = TaskRequest(body.task_id, body.prompt, body.context_memory,
-                          body.model, cancel_event=event, trace_id=body.trace_id)
+                          body.model, cancel_event=event, trace_id=body.trace_id,
+                          provider=body.provider,
+                          provider_base_url=body.provider_base_url,
+                          provider_auth_token=body.provider_auth_token,
+                          provider_pool=body.provider_pool)
         log.info("[trace=%s] task=%s execute start (model=%s)",
                  body.trace_id, body.task_id, body.model)
         res = runner.run(req)
@@ -261,6 +273,24 @@ def _build_app():
     from agent_runner import FakeAgentRunner, SdkAgentRunner
 
     cfg = load_worker_config()
+    if cfg.skillhub_auto:
+        # skillhub 自动同步：把本项目 catalog 里 verified 技能对账到自己。
+        # 只修技能不碰 MCP；任何失败仅告警，不阻断启动。
+        try:
+            from agent_core.skillhub import auto_sync
+        except Exception as e:  # 模块缺失/导入失败也降级为告警
+            log.warning("skillhub 自动同步不可用（%s）", e)
+        else:
+            rep = auto_sync(cfg.project_root)
+            if rep.get("error"):
+                log.warning("skillhub 自动同步失败：%s", rep["error"])
+            elif rep.get("refused"):
+                log.warning("skillhub 自动同步：%s 个技能被拒绝（源漂移？先 "
+                            "skillhub update）：%s", len(rep["refused"]),
+                            list(rep["refused"]))
+            elif rep.get("installed"):
+                log.info("skillhub 自动同步：已补齐/修复 %s",
+                         ", ".join(rep["installed"]))
     runner_kind = os.environ.get("ORCH_RUNNER", "fake").lower()
     if runner_kind == "sdk":
         # 人设文件缺失 = 配置错误，启动即失败并列出可用人设（fail-fast）。

@@ -164,8 +164,9 @@ class LocalExecutorDispatcher(Dispatcher):
 
     # ---- 人设与工作目录 ----
 
-    def _resolve_persona(self, role: str, model: str | None = None) -> Persona:
-        """role → 人设。找不到定义文件时给最小人设兜底；model 非空则覆盖。"""
+    def _resolve_persona(self, role: str, model: str | None = None,
+                         provider: dict | None = None) -> Persona:
+        """role → 人设。找不到定义文件时给最小人设兜底；model/本地 provider 非空则覆盖。"""
         persona = self._persona_cache.get(role)
         if persona is None:
             try:
@@ -175,9 +176,22 @@ class LocalExecutorDispatcher(Dispatcher):
                                   description=f"{role}（未找到定义文件，使用最小人设）",
                                   system_prompt=f"你是 {role}。请按任务说明完成工作。")
             self._persona_cache[role] = persona
+        # 不改缓存原件，复制一份覆盖（dataclass 不可变语义更安全）
+        from agent_core.persona import replace_persona
+        overrides: dict = {}
         if model:
-            # 不改缓存原件，复制一份覆盖 model（dataclass 不可变语义更安全）
-            return replace(persona, model=model)
+            overrides["model"] = model
+        if provider and provider.get("name"):
+            overrides["provider"] = provider.get("name")
+        # 本地执行直接进程内跑内核：base_url/auth_token 经 persona 注入
+        # _build_options 的 options.env（不落盘）。
+        if provider:
+            if provider.get("base_url"):
+                overrides["base_url"] = provider["base_url"]
+            if provider.get("auth_token"):
+                overrides["auth_token"] = provider["auth_token"]
+        if overrides:
+            return replace_persona(persona, **overrides)
         return persona
 
     def _prepare_cwd(self, task_id: str) -> str:
@@ -212,7 +226,8 @@ class LocalExecutorDispatcher(Dispatcher):
                  model: str | None = None,
                  use_experience: bool = True,
                  enable_subagents: bool | None = None,
-                 worker_id: str | None = None) -> DispatchResult:
+                 worker_id: str | None = None,
+                 provider: dict | None = None) -> DispatchResult:
         """本地同步执行一个任务：写 pending → run_oneshot → 收尾更新。
 
         use_experience=False 为评测消融组的硬关：不检索/不注入历史经验（读关），
@@ -245,11 +260,16 @@ class LocalExecutorDispatcher(Dispatcher):
 
         cwd = self._prepare_cwd(task_id)
 
+        meta: dict = {}
+        if model:
+            meta["model"] = model
+        if provider and provider.get("name"):
+            meta["provider"] = provider["name"]
         self.task_store.write(TaskRecord(
             task_id=task_id, role=role, prompt=prompt, worker_id="local",
             status="pending", created_at=ts, updated_at=ts,
             output=None, artifacts=[], error=None,
-            trace_id=trace_id, meta={"model": model} if model else {},
+            trace_id=trace_id, meta=meta,
         ))
         log.info("[trace=%s] local exec dispatch role=%s task=%s", trace_id, role, task_id)
         publish_task_event(self.event_bus, task_id, event="status",
@@ -264,7 +284,7 @@ class LocalExecutorDispatcher(Dispatcher):
         with self._cancel_lock:
             self._cancel_events[task_id] = cancel_event
         try:
-            persona = self._resolve_persona(role, model=model)
+            persona = self._resolve_persona(role, model=model, provider=provider)
             # 消融硬关（读）：use_experience=False 时跳过经验检索/注入。
             enriched_ctx = (enrich_experience(self.experience_store, prompt, role,
                                               context_memory)

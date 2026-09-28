@@ -50,3 +50,9 @@ result/.last_run_id
 
 # agent 运行任务临时目录（run-<hash>）
 .agent_work/
+
+# skillhub 生成产物（install --with-mcp 的 mcp.json + 报告，生成物不入库）
+workspace/agent/skillhub_runtime/
+
+# brain provider 池（含 API 密钥；建议用 ${ENV} 引用避免明文）
+workspace/agent/orchestrator/runtime/providers.json

@@ -10,6 +10,35 @@ export interface WorkerInfo {
   load: number
 }
 
+/** 节点详情（GET /proxy/node/status → worker /agent/status） */
+export interface NodeSkill {
+  name: string
+  description: string
+  triggers: string[]
+}
+
+export interface NodeMcpServer {
+  name: string
+  command?: unknown
+  url?: unknown
+}
+
+export interface NodeWorkspaceInfo {
+  path: string
+  name: string
+  exists: boolean
+}
+
+export interface NodeStatus {
+  worker_id: string
+  role: string
+  panel_enabled: boolean
+  workspace: NodeWorkspaceInfo
+  skills: NodeSkill[]
+  mcp_servers: NodeMcpServer[]
+  runs: { running: number; total: number }
+}
+
 // awaiting_approval：安全拦截后等待人工审批（非终态，不参与重试/回收）
 export type TaskStatus = 'pending' | 'running' | 'done' | 'failed' | 'lost' | 'cancelled' | 'awaiting_approval'
 
@@ -124,6 +153,27 @@ export interface DispatchBody {
   enable_subagents?: boolean | null
   // 引用历史任务的上下文记忆笔记并入本次派发（续做任务）
   context_task_ids?: string[]
+  // 运行时 Provider：只传 provider 名（密钥不入请求体）；省略=用 brain 当前默认
+  provider?: string | null
+}
+
+/** Provider（brain providers.json 遮蔽视图）：密钥已打码 */
+export interface ProviderEntry {
+  model: string | null
+  base_url: string | null
+  auth_token: string
+}
+
+export interface ProviderList {
+  default: string
+  providers: Record<string, ProviderEntry>
+}
+
+export interface ProviderPutBody {
+  name: string
+  model?: string | null
+  base_url?: string | null
+  auth_token?: string | null
 }
 
 /** 顾问拆解计划的单个步骤 */
@@ -292,6 +342,7 @@ export interface ScheduleBody {
   prompt: string
   context_memory?: string | null
   model?: string | null
+  provider?: string | null
 }
 
 /** 安全裁决审计事件（GET /audit，JSONL 一行一事件） */

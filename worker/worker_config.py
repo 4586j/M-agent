@@ -1,7 +1,11 @@
 """worker 配置。"""
+import json
+import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
+
+log = logging.getLogger(__name__)
 
 _HERE = Path(__file__).resolve().parent
 
@@ -73,6 +77,9 @@ class WorkerConfig:
     permission_mode: str = "default"
     # Agent 面板（/agent/* + /panel）：默认开启；0 关闭（不挂面板路由）
     worker_panel: bool = True
+    # 启动时自动同步 skillhub verified 技能到本项目（只修技能不碰 MCP）。
+    # 默认关闭；ORCH_SKILLHUB_AUTO=1 开启。失败仅告警，不阻断启动。
+    skillhub_auto: bool = False
     auto_register: bool = True
     api_key: str = ""
     artifact_max_bytes: int = 20 * 1024 * 1024
@@ -81,6 +88,10 @@ class WorkerConfig:
     output_guard_enabled: bool = True
     output_guard_max_retries: int = 1
     fallback_model: str = ""
+    # 运行时 Provider 全局默认 + 故障切换池（任务/人设覆盖优先；空=回落进程 env）
+    provider_base_url: str = ""
+    provider_auth_token: str = ""
+    provider_pool: list[dict] | None = None
 
 
 def load_worker_config() -> WorkerConfig:
@@ -108,6 +119,7 @@ def load_worker_config() -> WorkerConfig:
         # 默认收敛为 default：权限门控生效；bypassPermissions 须显式环境变量指定
         permission_mode=os.environ.get("ORCH_PERMISSION_MODE", "default"),
         worker_panel=os.environ.get("ORCH_WORKER_PANEL", "1") not in ("0", "false", "False"),
+        skillhub_auto=os.environ.get("ORCH_SKILLHUB_AUTO", "0") not in ("0", "false", "False"),
         auto_register=os.environ.get("ORCH_AUTO_REGISTER", "1") not in ("0", "false", "False"),
         api_key=os.environ.get("ORCH_API_KEY", ""),
         artifact_max_bytes=int(os.environ.get("ORCH_ARTIFACT_MAX_BYTES",
@@ -121,4 +133,34 @@ def load_worker_config() -> WorkerConfig:
             "1", "AGENT_OUTPUT_GUARD_MAX_RETRIES",
             "ORCH_OUTPUT_GUARD_MAX_RETRIES")),
         fallback_model=_env("", "AGENT_FALLBACK_MODEL", "ORCH_FALLBACK_MODEL"),
+        provider_base_url=_env("", "AGENT_PROVIDER_BASE_URL",
+                               "ORCH_PROVIDER_BASE_URL"),
+        provider_auth_token=_env("", "AGENT_PROVIDER_AUTH_TOKEN",
+                                 "ORCH_PROVIDER_AUTH_TOKEN"),
+        provider_pool=_load_provider_pool(_env(
+            "", "AGENT_PROVIDER_POOL", "ORCH_PROVIDER_POOL")),
     )
+
+
+def _load_provider_pool(raw: str) -> list[dict] | None:
+    """把 AGENT/ORCH_PROVIDER_POOL 的 JSON 数组解析为候选池；空/非法 → None。"""
+    raw = (raw or "").strip()
+    if not raw:
+        return None
+    try:
+        parsed = json.loads(raw)
+    except Exception as e:
+        log.warning("provider_pool 解析失败，视为未配置：%s", e)
+        return None
+    if not isinstance(parsed, list):
+        return None
+    pool: list[dict] = []
+    for item in parsed:
+        if not isinstance(item, dict):
+            continue
+        pool.append({
+            "model": str(item["model"]) if item.get("model") else None,
+            "base_url": str(item["base_url"]) if item.get("base_url") else None,
+            "auth_token": str(item["auth_token"]) if item.get("auth_token") else None,
+        })
+    return pool or None

@@ -37,12 +37,18 @@ class Dispatcher(ABC):
                  model: str | None = None,
                  use_experience: bool = True,
                  enable_subagents: bool | None = None,
-                 worker_id: str | None = None) -> DispatchResult:
-        """worker_id 非空时定点派发到该节点（失败抛 RuntimeError，不静默回退）。"""
+                 worker_id: str | None = None,
+                 provider: dict | None = None) -> DispatchResult:
+        """worker_id 非空时定点派发到该节点（失败抛 RuntimeError，不静默回退）。
+
+        provider：解析后的 {name, model, base_url, auth_token} 或 None。派发层
+        只把 name 进 TaskRecord.meta（不含密钥）、把三元组放进瞬时 worker body。
+        """
 
     @abstractmethod
     def redispatch(self, task_id: str, model: str | None = None,
-                   worker_id: str | None = None) -> DispatchResult:
+                   worker_id: str | None = None,
+                   provider: dict | None = None) -> DispatchResult:
         """按已存在任务的 role/prompt 重新派发，返回新 DispatchResult。"""
 
 
@@ -61,7 +67,8 @@ class LocalDispatcher(Dispatcher):
                  context_memory: str | None = None, model: str | None = None,
                  use_experience: bool = True,
                  enable_subagents: bool | None = None,
-                 worker_id: str | None = None) -> DispatchResult:
+                 worker_id: str | None = None,
+                 provider: dict | None = None) -> DispatchResult:
         # V1 本地派发无 worker 概念：只能接受伪定点 "local"。
         if worker_id is not None and worker_id != "local":
             raise RuntimeError(
@@ -69,11 +76,16 @@ class LocalDispatcher(Dispatcher):
         task_id = f"task-{uuid.uuid4().hex[:8]}"
         trace_id = new_trace_id()
         ts = self._now()
+        meta: dict = {}
+        if model:
+            meta["model"] = model
+        if provider and provider.get("name"):
+            meta["provider"] = provider["name"]
         rec = TaskRecord(
             task_id=task_id, role=role, prompt=prompt, worker_id="local",
             status="done", created_at=ts, updated_at=ts,
             output="本地派发：由主会话 Agent 工具执行", artifacts=[], error=None,
-            trace_id=trace_id, meta={"model": model} if model else {},
+            trace_id=trace_id, meta=meta,
         )
         if self.product_check:
             rec.verdict = self.product_check(rec.output or "")
@@ -88,13 +100,14 @@ class LocalDispatcher(Dispatcher):
                               verdict=rec.verdict, trace_id=trace_id)
 
     def redispatch(self, task_id: str, model: str | None = None,
-                   worker_id: str | None = None) -> DispatchResult:
+                   worker_id: str | None = None,
+                   provider: dict | None = None) -> DispatchResult:
         rec = self.task_store.get(task_id)
         if rec is None:
             raise KeyError(f"task not found: {task_id}")
         return self.dispatch(role=rec.role, prompt=rec.prompt,
                              context_memory=None, model=model,
-                             worker_id=worker_id)
+                             worker_id=worker_id, provider=provider)
 
 
 class RemoteDispatcher(Dispatcher):
@@ -125,7 +138,8 @@ class RemoteDispatcher(Dispatcher):
                  context_memory: str | None = None, model: str | None = None,
                  use_experience: bool = True,
                  enable_subagents: bool | None = None,
-                 worker_id: str | None = None) -> DispatchResult:
+                 worker_id: str | None = None,
+                 provider: dict | None = None) -> DispatchResult:
         # enable_subagents：远程模式下每次请求覆盖暂不转发到 worker，
         # worker 侧统一受全局 AGENT_/ORCH_SUBAGENTS_ENABLED 闸（kernel._build_options）控制。
         # worker_id 定点：resolve_worker 会抛 RuntimeError（从未注册/心跳超时），
@@ -143,6 +157,9 @@ class RemoteDispatcher(Dispatcher):
         meta = {"model": model} if model else {}
         if pinned:
             meta["pinned"] = True
+        # 只记 provider 名进 meta（密钥绝不落盘）；三元组走瞬时 body
+        if provider and provider.get("name"):
+            meta["provider"] = provider["name"]
         self.task_store.write(TaskRecord(
             task_id=task_id, role=role, prompt=prompt, worker_id=worker.worker_id,
             status="pending", created_at=ts, updated_at=ts,
@@ -163,6 +180,13 @@ class RemoteDispatcher(Dispatcher):
                 "trace_id": trace_id}
         if model:
             body["model"] = model
+        # provider 三元组瞬时转发 worker（内存仅本次任务；不落任何持久化）
+        if provider:
+            body["provider"] = provider.get("name")
+            if provider.get("base_url"):
+                body["provider_base_url"] = provider["base_url"]
+            if provider.get("auth_token"):
+                body["provider_auth_token"] = provider["auth_token"]
         resp = self.http_call("POST", f"{base}/task", json=body)
         if resp.get("status_code") != 200:
             log.warning("[trace=%s] task=%s post failed: %s", trace_id, task_id, resp)
@@ -195,6 +219,8 @@ class RemoteDispatcher(Dispatcher):
                         **(data.get("meta") or {})}
                 if pinned:
                     meta["pinned"] = True
+                if provider and provider.get("name"):
+                    meta["provider"] = provider["name"]
                 self.task_store.update(
                     task_id, status=st, output=out,
                     artifacts=arts, error=data.get("error"), verdict=verdict,
@@ -246,7 +272,8 @@ class RemoteDispatcher(Dispatcher):
         return enrich_experience(self.experience_store, prompt, role, context_memory)
 
     def redispatch(self, task_id: str, model: str | None = None,
-                   worker_id: str | None = None) -> DispatchResult:
+                   worker_id: str | None = None,
+                   provider: dict | None = None) -> DispatchResult:
         """重派：显式 worker_id 优先；原任务若定点派发则沿用原节点。"""
         rec = self.task_store.get(task_id)
         if rec is None:
@@ -257,4 +284,4 @@ class RemoteDispatcher(Dispatcher):
             worker_id = rec.worker_id
         return self.dispatch(role=rec.role, prompt=rec.prompt,
                              context_memory=None, model=model,
-                             worker_id=worker_id)
+                             worker_id=worker_id, provider=provider)

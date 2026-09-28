@@ -23,6 +23,7 @@ class RetryManager:
         now_fn: Callable[[], float] | None = None,
         ts_fn: Callable[[], str] | None = None,
         event_bus: TaskEventBus | None = None,
+        provider_resolver: Callable[[str], dict | None] | None = None,
     ):
         self.task_store = task_store
         self.registry = registry
@@ -30,10 +31,36 @@ class RetryManager:
         self.sweeper_interval = sweeper_interval
         self.retry_base_delay = retry_base_delay
         self.event_bus = event_bus
+        # provider_resolver：provider 名 → 解析后的 {name, model, base_url, auth_token}。
+        # 注入 brain 的 ProviderStore.resolve，使重试能继承原任务的 provider（同名重试，
+        # 密钥重新从环境解析，不落盘）。None 时按无 provider 处理（不阻断重试）。
+        self.provider_resolver = provider_resolver
         self._now = now_fn or time.time
         self._ts = ts_fn or (lambda: str(int(time.time())))
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+
+    def _resume_overrides(self, rec: TaskRecord) -> dict:
+        """从原任务 meta 恢复派发覆盖（model / provider 三元组）。
+
+        顺带修复历史缺陷：此前重试派发不传 model，原任务的模型覆盖在重试时丢失，
+        重试跑成默认模型。provider 同名经 resolver 重新解析（密钥不落 meta）。
+        返回 dispatcher.dispatch 的 kwargs。
+        """
+        meta = rec.meta if isinstance(rec.meta, dict) else {}
+        kwargs: dict = {}
+        model = meta.get("model")
+        if model:
+            kwargs["model"] = model
+        pname = meta.get("provider")
+        if pname and self.provider_resolver:
+            resolved = self.provider_resolver(str(pname))
+            if resolved is not None:
+                kwargs["provider"] = resolved
+            else:
+                log.warning("[trace=%s] retry provider '%s' 不可解析，按无 provider 重试",
+                            rec.trace_id, pname)
+        return kwargs
 
     def start(self) -> None:
         self._thread = threading.Thread(target=self._sweep_loop, daemon=True)
@@ -99,6 +126,7 @@ class RetryManager:
                 res = self.dispatcher.dispatch(
                     role=rec.role, prompt=rec.prompt,
                     context_memory=self._retry_context(rec),
+                    **self._resume_overrides(rec),
                 )
                 self.task_store.update(
                     rec.task_id,
@@ -142,7 +170,9 @@ class RetryManager:
                 res = self.dispatcher.dispatch(
                     role=rec.role, prompt=rec.prompt,
                     context_memory=self._retry_context(rec),
-                    worker_id=heal_pin)
+                    worker_id=heal_pin,
+                    **self._resume_overrides(rec),
+                )
                 self.task_store.update(
                     rec.task_id, status="running",
                     worker_id=worker_id,

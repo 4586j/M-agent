@@ -16,6 +16,7 @@ class ScheduleRecord:
     prompt: str
     context_memory: str | None = None
     model: str | None = None
+    provider: str | None = None  # provider 名（触发时按当前环境再解析；不含密钥）
     enabled: bool = True
     last_run: str = ""
     next_run: str = ""

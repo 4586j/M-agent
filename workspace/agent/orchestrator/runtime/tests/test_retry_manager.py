@@ -16,14 +16,14 @@ def make_info(wid="worker-A"):
 
 
 def make_record(task_id="task-1", status="pending", worker_id="worker-A",
-                retry_count=0, max_retries=0, last_retry_at=""):
+                retry_count=0, max_retries=0, last_retry_at="", meta=None):
     return TaskRecord(
         task_id=task_id, role="executor", prompt="do x",
         worker_id=worker_id, status=status,
         created_at="100", updated_at="100",
         output=None, artifacts=[], error=None,
         retry_count=retry_count, max_retries=max_retries,
-        last_retry_at=last_retry_at,
+        last_retry_at=last_retry_at, meta=meta,
     )
 
 
@@ -33,11 +33,12 @@ class FakeDispatcher:
         self.result_status = result_status
 
     def dispatch(self, role, prompt, context_memory=None, model=None,
-                 worker_id=None):
-        self.calls.append({"role": role, "prompt": prompt, "worker_id": worker_id})
+                 worker_id=None, provider=None):
+        self.calls.append({"role": role, "prompt": prompt, "worker_id": worker_id,
+                           "model": model, "provider": provider})
         return DispatchResult(task_id="task-new", status=self.result_status)
 
-    def redispatch(self, task_id, model=None, worker_id=None):
+    def redispatch(self, task_id, model=None, worker_id=None, provider=None):
         return self.dispatch(role="executor", prompt="redispatched",
                              worker_id=worker_id)
 
@@ -255,3 +256,43 @@ def test_start_and_stop(tmp_path):
     mgr.stop()
     mgr._thread.join(timeout=3)
     assert not mgr._thread.is_alive()
+
+
+def test_retry_inherits_model_and_provider(tmp_path):
+    """重试继承原任务的 model 与 provider（同名经 resolver 重新解析）。
+
+    此前重试派发丢 model 覆盖（历史缺陷）；provider 同名重试且密钥不入 meta。
+    """
+    store = TaskStore(str(tmp_path))
+    reg = WorkerRegistry(heartbeat_timeout=45, now_fn=lambda: 0.0)
+    reg.register(make_info())
+    store.write(make_record(
+        "task-r", status="failed", max_retries=1,
+        meta={"model": "m1", "provider": "gw"}))
+    fake_disp = FakeDispatcher()
+    resolved = {"name": "gw", "model": "sonnet", "base_url": "https://gw",
+                "auth_token": "tok"}
+    mgr = RetryManager(store, reg, fake_disp, now_fn=lambda: 200.0,
+                       ts_fn=lambda: "200",
+                       provider_resolver=lambda name: resolved)
+    mgr._retry_eligible()
+    call = fake_disp.calls[-1]
+    assert call["model"] == "m1"                  # model 覆盖被继承
+    assert call["provider"]["name"] == "gw"       # provider 同名重试
+    assert call["provider"]["auth_token"] == "tok"
+
+
+def test_retry_unresolvable_provider_falls_back(tmp_path):
+    """provider 名在重试时已不可解析 → 告警并按无 provider 重试（不阻断）。"""
+    store = TaskStore(str(tmp_path))
+    reg = WorkerRegistry(heartbeat_timeout=45, now_fn=lambda: 0.0)
+    reg.register(make_info())
+    store.write(make_record(
+        "task-r2", status="failed", max_retries=1,
+        meta={"provider": "gone"}))
+    fake_disp = FakeDispatcher()
+    mgr = RetryManager(store, reg, fake_disp, now_fn=lambda: 200.0,
+                       ts_fn=lambda: "200",
+                       provider_resolver=lambda name: None)
+    mgr._retry_eligible()
+    assert fake_disp.calls[-1]["provider"] is None

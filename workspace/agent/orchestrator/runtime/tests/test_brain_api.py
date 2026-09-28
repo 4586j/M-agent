@@ -230,6 +230,87 @@ def test_proxy_artifact(tmp_path):
     assert r.json()["content"] == "报告内容"
 
 
+# ── /proxy/node/*（节点详情 / 工作区规定）──
+
+def _reg_worker_a(client):
+    client.post("/register", json={
+        "worker_id": "A", "role": "executor", "host": "127.0.0.1", "port": 8001, "capabilities": {}})
+
+
+def test_proxy_node_status(tmp_path):
+    calls = []
+
+    def fake_http(method, url, **kwargs):
+        calls.append((method, url))
+        return {"status_code": 200, "json": {
+            "worker_id": "A", "role": "executor", "panel_enabled": True,
+            "workspace": {"path": "/ws", "name": "ws", "exists": True},
+            "skills": [{"name": "web-expert", "description": "d", "triggers": []}],
+            "mcp_servers": [], "runs": {"running": 0, "total": 0}}}
+
+    reg = WorkerRegistry(heartbeat_timeout=45, now_fn=lambda: 0.0)
+    store = TaskStore(str(tmp_path))
+    cfg = Config(mode="remote", task_store_dir=str(tmp_path), security_llm=False)
+    client = TestClient(create_brain_app(reg, store, cfg, http_call=fake_http))
+    # 未注册节点 → 404
+    assert client.get("/proxy/node/status?worker_id=NOPE").status_code == 404
+    _reg_worker_a(client)
+    r = client.get("/proxy/node/status?worker_id=A")
+    assert r.status_code == 200
+    assert r.json()["skills"][0]["name"] == "web-expert"
+    assert calls[-1] == ("GET", "http://127.0.0.1:8001/agent/status")
+
+
+def test_proxy_node_status_worker_failure(tmp_path):
+    """worker 未开面板（/agent/status 404）或失联 → brain 502。"""
+
+    def fake_http(method, url, **kwargs):
+        return {"status_code": 404, "json": {"detail": "panel 未安装"}}
+
+    reg = WorkerRegistry(heartbeat_timeout=45, now_fn=lambda: 0.0)
+    store = TaskStore(str(tmp_path))
+    cfg = Config(mode="remote", task_store_dir=str(tmp_path), security_llm=False)
+    client = TestClient(create_brain_app(reg, store, cfg, http_call=fake_http))
+    _reg_worker_a(client)
+    assert client.get("/proxy/node/status?worker_id=A").status_code == 502
+
+
+def test_proxy_node_workspace(tmp_path):
+    calls = []
+
+    def fake_http(method, url, **kwargs):
+        calls.append((method, url, kwargs.get("json")))
+        return {"status_code": 200, "json": {"path": "/new-ws", "name": "new-ws"}}
+
+    reg = WorkerRegistry(heartbeat_timeout=45, now_fn=lambda: 0.0)
+    store = TaskStore(str(tmp_path))
+    cfg = Config(mode="remote", task_store_dir=str(tmp_path), security_llm=False)
+    client = TestClient(create_brain_app(reg, store, cfg, http_call=fake_http))
+    assert client.put("/proxy/node/workspace", json={
+        "worker_id": "A", "path": "/new-ws"}).status_code == 404  # 未注册
+    _reg_worker_a(client)
+    r = client.put("/proxy/node/workspace", json={"worker_id": "A", "path": "/new-ws"})
+    assert r.status_code == 200
+    assert r.json()["path"] == "/new-ws"
+    assert calls[-1] == ("PUT", "http://127.0.0.1:8001/agent/workspace", {"path": "/new-ws"})
+
+
+def test_proxy_node_workspace_bad_dir_passthrough(tmp_path):
+    """worker 端 400（目录不存在）原样透传 400。"""
+
+    def fake_http(method, url, **kwargs):
+        return {"status_code": 400, "json": {"detail": "目录不存在: /nope"}}
+
+    reg = WorkerRegistry(heartbeat_timeout=45, now_fn=lambda: 0.0)
+    store = TaskStore(str(tmp_path))
+    cfg = Config(mode="remote", task_store_dir=str(tmp_path), security_llm=False)
+    client = TestClient(create_brain_app(reg, store, cfg, http_call=fake_http))
+    _reg_worker_a(client)
+    r = client.put("/proxy/node/workspace", json={"worker_id": "A", "path": "/nope"})
+    assert r.status_code == 400
+    assert "目录不存在" in r.json()["detail"]
+
+
 # ── /dispatch ──
 
 def test_dispatch_success(tmp_path):
@@ -1262,3 +1343,128 @@ def test_approval_restores_pinned_worker(tmp_path, monkeypatch):
     assert r2.status_code == 200
     assert r2.json()["approved"] is True
     assert seen["post"][0] == "http://10.0.0.5:8002/task"  # approve 恢复原定点
+
+
+# ---- 运行时 Provider：池管理 + 派发路由 + 密钥不落盘 ----
+
+def _provider_client(tmp_path, *, default_provider=""):
+    """带 ProviderStore 与捕获派发器的 brain app。返回 (client, captured, store)。"""
+    from providers import ProviderStore
+    from dispatcher import Dispatcher, DispatchResult
+    captured = {"provider": None, "model": None}
+
+    class Cap(Dispatcher):
+        def dispatch(self, role, prompt, context_memory=None, model=None,
+                     use_experience=True, enable_subagents=None,
+                     worker_id=None, provider=None):
+            captured["provider"] = provider
+            captured["model"] = model
+            return DispatchResult("task-pr", "done", output="ok")
+
+        def redispatch(self, task_id, model=None, worker_id=None, provider=None):
+            raise KeyError(task_id)
+
+    reg = WorkerRegistry(heartbeat_timeout=45, now_fn=lambda: 0.0)
+    store = TaskStore(str(tmp_path / "tasks"))
+    cfg = Config(mode="remote", task_store_dir=str(tmp_path / "tasks"),
+                 security_llm=False, default_provider=default_provider)
+    pstore = ProviderStore(tmp_path / "providers.json", env={"K": "real-tok"})
+    app = create_brain_app(reg, store, cfg, dispatcher=Cap(),
+                           provider_store=pstore)
+    return TestClient(app), captured, pstore, store
+
+
+def test_providers_crud_and_masked(tmp_path):
+    client, _, pstore, _ = _provider_client(tmp_path)
+    # upsert（明文密钥 + ${ENV} 引用）
+    r = client.put("/providers", json={
+        "name": "gw", "model": "sonnet",
+        "base_url": "https://gw.example.com/v1", "auth_token": "${K}"})
+    assert r.status_code == 200
+    # GET 回显池：auth_token 已遮蔽、不含明文和引用原文
+    view = client.get("/providers").json()
+    assert set(view["providers"].keys()) == {"gw"}
+    assert view["providers"]["gw"]["auth_token"].startswith("***")
+    assert "real-tok" not in view["providers"]["gw"]["auth_token"]
+    # 设默认 + 查询
+    assert client.put("/providers/default", json={"name": "gw"}).json()["default"] == "gw"
+    assert client.get("/providers/default").json()["default"] == "gw"
+    # 未知默认 → 404
+    assert client.put("/providers/default", json={"name": "ghost"}).status_code == 404
+    # 删除 → 404
+    assert client.delete("/providers/gw").json()["status"] == "deleted"
+    assert client.delete("/providers/gw").status_code == 404
+
+
+def test_dispatch_routes_provider_and_resolves_env(tmp_path):
+    client, captured, pstore, _ = _provider_client(tmp_path)
+    pstore.upsert("gw", model="sonnet", base_url="https://gw.example.com",
+                  auth_token="sk-${K}")
+    r = client.post("/dispatch", json={
+        "prompt": "分析一下", "role": "executor", "model": None,
+        "provider": "gw"})
+    assert r.status_code == 200
+    assert r.json()["provider"] == "gw"
+    p = captured["provider"]
+    # brain 解析后的三元组（${ENV} 已替换）进入派发器
+    assert p["name"] == "gw"
+    assert p["model"] == "sonnet"
+    assert p["base_url"] == "https://gw.example.com"
+    assert p["auth_token"] == "sk-real-tok"
+
+
+def test_dispatch_provider_unknown_400(tmp_path):
+    client, _, _, _ = _provider_client(tmp_path)
+    r = client.post("/dispatch", json={
+        "prompt": "hi", "role": "executor", "model": None, "provider": "ghost"})
+    assert r.status_code == 400
+    assert "ghost" in r.json()["detail"]
+
+
+def test_dispatch_default_provider_applied(tmp_path):
+    client, captured, pstore, _ = _provider_client(
+        tmp_path, default_provider="gw")
+    pstore.upsert("gw", model="haiku", base_url="")
+    r = client.post("/dispatch", json={"prompt": "hi", "role": "executor"})
+    assert r.status_code == 200 and r.json()["provider"] == "gw"
+    # 默认 provider 的 model 覆盖（任务未显式指定）
+    assert captured["model"] == "haiku"
+
+
+def test_remote_dispatch_meta_never_contains_token(tmp_path):
+    """真实 RemoteDispatcher：TaskRecord.meta 只含 provider 名，三元组/密钥只走瞬时 body。
+
+    这是「密钥不落盘」的关键保证——TaskRecord 明文写 .tasks/*.json。
+    """
+    import json
+    from dispatcher import RemoteDispatcher
+    sent: dict = {}
+
+    def fake_http(method, url, **kw):
+        if method == "POST":
+            sent["body"] = kw.get("json") or {}
+            return {"status_code": 200}
+        return {"status_code": 200,
+                "json": {"status": "done", "output": "ok", "meta": {}}}
+
+    reg = WorkerRegistry(heartbeat_timeout=45, now_fn=lambda: 0.0)
+    reg.register(WorkerInfo(worker_id="w1", role="executor", host="127.0.0.1",
+                            port=8001, capabilities={}, last_heartbeat=0.0, load=0))
+    store = TaskStore(str(tmp_path / "tasks"))
+    disp = RemoteDispatcher(task_store=store, registry=reg, http_call=fake_http,
+                            max_retries=0)
+    disp.dispatch(role="executor", prompt="hi", model="sonnet",
+                  provider={"name": "gw", "model": "sonnet",
+                            "base_url": "https://gw.example.com",
+                            "auth_token": "top-secret-token"})
+    # 瞬时 body 确实带三元组（worker 本次任务执行用；不落任何持久化）
+    assert sent["body"]["provider"] == "gw"
+    assert sent["body"]["provider_base_url"] == "https://gw.example.com"
+    assert sent["body"]["provider_auth_token"] == "top-secret-token"
+    # 落盘的 TaskRecord.meta：只有 provider 名 + model，绝无 token/端点
+    rec = store.get(sent["body"]["task_id"])
+    meta = rec.meta if isinstance(rec.meta, dict) else {}
+    assert meta.get("provider") == "gw" and meta.get("model") == "sonnet"
+    dumped = json.dumps(meta, ensure_ascii=False)
+    assert "top-secret-token" not in dumped
+    assert "gw.example.com" not in dumped

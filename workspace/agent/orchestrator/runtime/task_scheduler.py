@@ -18,9 +18,14 @@ class TaskScheduler:
         now_fn: Callable[[], float] | None = None,
         ts_fn: Callable[[], str] | None = None,
         check_interval: int = 60,
+        provider_resolver: Callable[[str | None], dict | None] | None = None,
     ):
         self.schedule_store = schedule_store
         self.dispatcher = dispatcher
+        # provider_resolver：schedule 的 provider 名（或 None=默认）→ 解析后的三元组。
+        # 注入 brain 的 _resolve_provider_info（显式名或默认都落），触发时再解析，
+        # 保证定时任务用「触发当下」的默认 provider（热切语义）。
+        self.provider_resolver = provider_resolver
         self._now = now_fn or time.time
         self._ts = ts_fn or (lambda: str(int(time.time())))
         self.check_interval = check_interval
@@ -56,9 +61,12 @@ class TaskScheduler:
             if now < next_ts:
                 continue
             try:
+                provider = (self.provider_resolver(rec.provider)
+                            if self.provider_resolver else None)
                 res = self.dispatcher.dispatch(
                     role=rec.role, prompt=rec.prompt,
                     context_memory=rec.context_memory, model=rec.model,
+                    provider=provider,
                 )
                 self.schedule_store.update_last_run(rec.schedule_id, self._ts())
                 self._update_next_run(rec)
@@ -94,9 +102,12 @@ class TaskScheduler:
         if rec is None:
             return False
         try:
+            provider = (self.provider_resolver(rec.provider)
+                        if self.provider_resolver else None)
             res = self.dispatcher.dispatch(
                 role=rec.role, prompt=rec.prompt,
                 context_memory=rec.context_memory, model=rec.model,
+                provider=provider,
             )
             self.schedule_store.update_last_run(schedule_id, self._ts())
             self._update_next_run(rec)

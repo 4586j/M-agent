@@ -210,6 +210,39 @@ def test_sdk_runner_passes_mcp_servers(tmp_path, monkeypatch):
     assert captured["mcp_servers"] == mcp_servers  # MCP 工具挂载进 SDK 会话
 
 
+def test_sdk_runner_provider_fields_flow_into_options_env(tmp_path, monkeypatch):
+    """任务级 provider 四字段 → persona → 内核 options.env（模型/端点/密钥按次注入）。"""
+    captured = _install_fake_sdk(monkeypatch,
+                                 [{"result": "ok", "is_error": False, "num_turns": 1}])
+    runner = SdkAgentRunner(
+        work_dir=str(tmp_path),
+        persona_def_path=str(Path(PROJECT_ROOT) / ".claude" / "agents" / "executor.md"),
+        project_root=PROJECT_ROOT)
+    runner.run(TaskRequest(task_id="task-p", prompt="p", context_memory="",
+                           model="m", provider="gw-main",
+                           provider_base_url="https://gw.example.com/v1",
+                           provider_auth_token="sec-tok",
+                           provider_pool=[{"model": "haiku", "base_url": "https://alt"}]))
+    assert captured["env"]["ANTHROPIC_BASE_URL"] == "https://gw.example.com/v1"
+    assert captured["env"]["ANTHROPIC_AUTH_TOKEN"] == "sec-tok"
+    assert captured["model"] == "m"
+
+
+def test_get_kernel_passthrough_provider_config(tmp_path):
+    """_get_kernel 构造 AgentConfig 时透传 provider 全局默认 + 故障切换池。"""
+    runner = SdkAgentRunner(
+        work_dir=str(tmp_path),
+        persona_def_path=str(Path(PROJECT_ROOT) / ".claude" / "agents" / "executor.md"),
+        project_root=PROJECT_ROOT,
+        provider_base_url="https://cfg.example.com",
+        provider_auth_token="cfg-tok",
+        provider_pool=[{"model": "haiku", "base_url": "https://alt"}])
+    kernel = runner._get_kernel()
+    assert kernel.config.provider_base_url == "https://cfg.example.com"
+    assert kernel.config.provider_auth_token == "cfg-tok"
+    assert kernel.config.provider_pool == [{"model": "haiku", "base_url": "https://alt"}]
+
+
 def test_get_kernel_passthrough_output_guard_config(tmp_path):
     """_get_kernel 构造 AgentConfig 时透传守卫三配置。
 

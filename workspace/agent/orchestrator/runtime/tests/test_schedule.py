@@ -21,12 +21,14 @@ class FakeDispatcher:
     def __init__(self):
         self.calls = []
 
-    def dispatch(self, role, prompt, context_memory=None, model=None):
+    def dispatch(self, role, prompt, context_memory=None, model=None,
+                 provider=None):
         self.calls.append({"role": role, "prompt": prompt,
-                           "context_memory": context_memory, "model": model})
+                           "context_memory": context_memory, "model": model,
+                           "provider": provider})
         return DispatchResult(task_id="task-new", status="done")
 
-    def redispatch(self, task_id, model=None):
+    def redispatch(self, task_id, model=None, provider=None):
         return self.dispatch(role="executor", prompt="r")
 
 

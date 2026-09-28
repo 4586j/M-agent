@@ -1,3 +1,4 @@
+import json
 import sys
 import time
 from pathlib import Path
@@ -209,6 +210,59 @@ def test_workspace_get_put(tmp_path):
     r = client.put("/agent/workspace", json={"path": str(sub)})
     assert r.status_code == 200
     assert Path(r.json()["path"]) == sub.resolve()
+
+
+# ---------------------------------------------------------------------------
+# 节点状态（技能 / MCP / 工作区 / run 计数；编排面板经 brain 代理拉取）
+# ---------------------------------------------------------------------------
+
+
+def test_agent_status_reports_skills_mcp_workspace(tmp_path):
+    """/agent/status 汇报 scan_skills + load_mcp_servers 解析结果与当前工作区。"""
+    # 技能：project_root/workspace/agent/skills/<name>/SKILL.md（scan_skills 扫描点）
+    proj = tmp_path.parent
+    skill_dir = proj / "workspace" / "agent" / "skills" / "demo-skill"
+    skill_dir.mkdir(parents=True, exist_ok=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\nname: demo-skill\ndescription: 演示技能\n"
+        "triggers:\n  - 演示\n---\n正文\n", encoding="utf-8")
+    # MCP：临时 JSON（load_mcp_servers 读 ORCH/AGENT_MCP_CONFIG 指向的文件，
+    # 格式与 .mcp.json 一致：mcpServers 映射）
+    mcp_json = tmp_path / "mcp.json"
+    mcp_json.write_text(json.dumps({"mcpServers": {
+        "alpha": {"command": "python", "args": ["-m", "demo"]}}}), encoding="utf-8")
+
+    from worker_config import WorkerConfig
+    from worker_api import create_worker_app
+    from agent_panel import build_agent_panel_router
+    from agent_runner import FakeAgentRunner
+    cfg = WorkerConfig(work_dir=str(tmp_path), project_root=str(proj),
+                       mcp_config_path=str(mcp_json))
+    app = create_worker_app(FakeAgentRunner(work_dir=str(tmp_path)), cfg)
+    app.include_router(build_agent_panel_router(cfg, executor=FakePanelExecutor()))
+    client = TestClient(app)
+
+    r = client.get("/agent/status")
+    assert r.status_code == 200
+    data = r.json()
+    assert data["worker_id"] == cfg.worker_id
+    assert data["role"] == cfg.role
+    assert data["workspace"]["path"] == str(Path(tmp_path).resolve())
+    assert data["workspace"]["exists"] is True
+    assert any(s["name"] == "demo-skill"
+               and s["triggers"] == ["演示"] for s in data["skills"])
+    assert any(m["name"] == "alpha" and m["command"] == "python"
+               for m in data["mcp_servers"])
+    assert data["runs"] == {"running": 0, "total": 0}
+
+
+def test_agent_status_auth(tmp_path):
+    """状态归属 /agent/*：无 key → 401，?api_key= 放行。"""
+    client = make_app(tmp_path, api_key="secret")
+    assert client.get("/agent/status").status_code == 401
+    assert client.get("/agent/status?api_key=secret").status_code == 200
+    # 未配 key：环回直通
+    assert make_app(tmp_path).get("/agent/status").status_code == 200
 
 
 # ---------------------------------------------------------------------------

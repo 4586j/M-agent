@@ -3,9 +3,10 @@ from pathlib import Path
 
 import pytest
 
-from agent_core.persona import (Persona, _normalize_tools, _split_frontmatter,
-                                load_persona, load_persona_by_name,
-                                parse_subagents, strip_frontmatter)
+from agent_core.persona import (Persona, _normalize_provider_pool, _normalize_tools,
+                                _split_frontmatter, load_persona,
+                                load_persona_by_name, parse_subagents,
+                                replace_persona, strip_frontmatter)
 
 
 # ---- strip_frontmatter ----
@@ -161,6 +162,59 @@ def test_parse_subagents_skips_entries_without_name_or_description(tmp_path):
     assert set(agents.keys()) == {"good"}
     assert agents["good"]["description"] == "好人设"
     assert agents["good"]["prompt"] == "好正文"
+
+
+# ---- 运行时 Provider（provider / base_url / auth_token / provider_pool）----
+
+def test_load_persona_provider_fields_from_frontmatter(tmp_path):
+    f = tmp_path / "gw.md"
+    f.write_text(
+        "---\nname: gw\nmodel: sonnet\nbase_url: https://gw.example.com/v1\n"
+        "auth_token: ${GW_TOKEN}\nprovider: gw-main\n"
+        "provider_pool:\n"
+        "  - model: haiku\n    base_url: https://alt.example.com/v1\n"
+        "    auth_token: ${ALT_TOKEN}\n"
+        "---\n正文\n", encoding="utf-8")
+    p = load_persona(f)
+    assert p.provider == "gw-main"
+    assert p.base_url == "https://gw.example.com/v1"
+    assert p.auth_token == "${GW_TOKEN}"     # 占位符原样进 persona，_build_options 时替换
+    assert p.provider_pool == [{
+        "model": "haiku", "base_url": "https://alt.example.com/v1",
+        "auth_token": "${ALT_TOKEN}"}]
+
+
+def test_load_persona_provider_fields_absent(tmp_path):
+    f = tmp_path / "plain.md"
+    f.write_text("---\nname: plain\n---\n正文", encoding="utf-8")
+    p = load_persona(f)
+    assert p.provider is None and p.base_url is None
+    assert p.auth_token is None and p.provider_pool is None
+
+
+def test_normalize_provider_pool_skips_broken_items():
+    assert _normalize_provider_pool(None) is None
+    assert _normalize_provider_pool([]) is None
+    assert _normalize_provider_pool([{"model": "x"}, 42, "junk"]) == [
+        {"model": "x", "base_url": None, "auth_token": None}]
+    assert _normalize_provider_pool([{"model": "m", "base_url": "b", "auth_token": "t"}])[0][
+        "base_url"] == "b"
+
+
+def test_replace_persona_copies_all_fields_preserving_provider():
+    """replace_persona 覆盖 model 时不丢 persona 的 provider/base_url/auth_token。"""
+    p = Persona(name="x", model="a", base_url="https://gw", auth_token="tok",
+                provider="p1", provider_pool=[{"model": "f"}],
+                tools=["Read"], system_prompt="sp", sub_agents={"s": {}})
+    r = replace_persona(p, model="b")
+    assert r.model == "b"
+    assert r.base_url == "https://gw" and r.auth_token == "tok"
+    assert r.provider == "p1" and r.provider_pool == [{"model": "f"}]
+    assert r.tools == ["Read"] and r.system_prompt == "sp"
+    assert r.sub_agents == {"s": {}}
+    # 显式清空
+    r2 = replace_persona(p, auth_token=None)
+    assert r2.auth_token is None
 
 
 # ---- 损坏文件容错 ----

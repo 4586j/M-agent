@@ -39,13 +39,14 @@ class _CapDispatcher(Dispatcher):
 
     def dispatch(self, role, prompt, context_memory=None, model=None,
                  use_experience=True, enable_subagents=None,
-                 worker_id=None):
+                 worker_id=None, provider=None):
         self.calls.append({"role": role, "prompt": prompt,
-                           "enable_subagents": enable_subagents})
+                           "enable_subagents": enable_subagents,
+                           "provider": provider})
         return DispatchResult("task-adv1", "done", output="ok",
                               artifacts=[], error=None)
 
-    def redispatch(self, task_id, model=None, worker_id=None):
+    def redispatch(self, task_id, model=None, worker_id=None, provider=None):
         raise KeyError(task_id)
 
 

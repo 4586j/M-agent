@@ -3,7 +3,7 @@ import { useNavigate } from 'react-router-dom'
 import { api } from '../api/client'
 import { usePolling } from '../hooks/usePolling'
 import TaskList from '../components/TaskList'
-import type { WorkerInfo } from '../types'
+import type { NodeStatus, WorkerInfo } from '../types'
 
 /** 节点 Agent 面板地址：{host}:{port}/。host 为 0.0.0.0 / ::（监听全网卡）时
  * 回退 127.0.0.1——浏览器访问 0.0.0.0/:: 打不开，本机访问该节点面板必然落在环回。 */
@@ -26,6 +26,44 @@ export default function NodeManage() {
   const [msg, setMsg] = useState<string | null>(null)
   // 内嵌查看：抽屉 iframe 嵌入选中节点的 Agent 面板（面板自向请求，无需 worker 额外 CORS）
   const [embedded, setEmbedded] = useState<WorkerInfo | null>(null)
+  // 节点详情：展开某行的技能/MCP/工作区状态（按需经 brain 代理拉取，非心跳轮询）
+  const [expanded, setExpanded] = useState<string | null>(null)
+  const [statuses, setStatuses] = useState<Record<string, NodeStatus>>({})
+  const [statusErrors, setStatusErrors] = useState<Record<string, string>>({})
+  const [wsInputs, setWsInputs] = useState<Record<string, string>>({})
+
+  const fetchStatus = async (id: string) => {
+    try {
+      const s = await api.nodeStatus(id)
+      setStatuses((m) => ({ ...m, [id]: s }))
+      setWsInputs((m) => ({ ...m, [id]: s.workspace.path }))
+      setStatusErrors((m) => ({ ...m, [id]: '' }))
+    } catch (e) {
+      setStatusErrors((m) => ({ ...m, [id]: e instanceof Error ? e.message : String(e) }))
+    }
+  }
+  const toggleDetail = (id: string) => {
+    if (expanded === id) {
+      setExpanded(null)
+      return
+    }
+    setExpanded(id)
+    void fetchStatus(id)
+  }
+  const switchWorkspace = async (id: string) => {
+    const path = (wsInputs[id] ?? '').trim()
+    if (!path) {
+      setStatusErrors((m) => ({ ...m, [id]: '请输入工作区路径' }))
+      return
+    }
+    try {
+      const res = await api.setNodeWorkspace(id, path)
+      setMsg(`节点 ${id} 工作区 → ${res.path}`)
+      await fetchStatus(id)
+    } catch (e) {
+      setStatusErrors((m) => ({ ...m, [id]: e instanceof Error ? e.message : String(e) }))
+    }
+  }
 
   const submit = async () => {
     setMsg(null)
@@ -96,60 +134,151 @@ export default function NodeManage() {
       <section>
         <h2 className="text-base font-semibold mb-3">节点操作</h2>
         <div className="space-y-2">
-          {(workers.data || []).map((w) => (
-            <div
-              key={w.worker_id}
-              onClick={() => window.open(panelUrl(w), '_blank', 'noopener')}
-              className="bg-white rounded-lg shadow p-3 flex items-center justify-between cursor-pointer hover:bg-slate-50"
-              title={`点击打开该节点 Agent 面板（${panelUrl(w)}）`}
-            >
-              <div>
-                <span className="font-medium">{w.worker_id}</span>
-                <span className="text-xs text-slate-400 ml-2">
-                  {w.role} ·{' '}
-                  <a
-                    href={panelUrl(w)}
-                    target="_blank"
-                    rel="noopener"
-                    onClick={(e) => e.stopPropagation()}
-                    className="text-sky-600 hover:underline"
-                    title="新标签页打开该节点 Agent 面板"
-                  >
-                    {w.host}:{w.port}
-                  </a>{' '}
-                  · load {w.load}
-                </span>
+          {(workers.data || []).map((w) => {
+            const st = statuses[w.worker_id]
+            const err = statusErrors[w.worker_id]
+            const isOpen = expanded === w.worker_id
+            return (
+              <div key={w.worker_id} className="bg-white rounded-lg shadow overflow-hidden">
+                <div
+                  onClick={() => window.open(panelUrl(w), '_blank', 'noopener')}
+                  className="p-3 flex items-center justify-between cursor-pointer hover:bg-slate-50"
+                  title={`点击打开该节点 Agent 面板（${panelUrl(w)}）`}
+                >
+                  <div>
+                    <span className="font-medium">{w.worker_id}</span>
+                    <span className="text-xs text-slate-400 ml-2">
+                      {w.role} ·{' '}
+                      <a
+                        href={panelUrl(w)}
+                        target="_blank"
+                        rel="noopener"
+                        onClick={(e) => e.stopPropagation()}
+                        className="text-sky-600 hover:underline"
+                        title="新标签页打开该节点 Agent 面板"
+                      >
+                        {w.host}:{w.port}
+                      </a>{' '}
+                      · load {w.load}
+                      {st && <span className="ml-2 text-slate-300">· 工作区 {st.workspace.name}</span>}
+                    </span>
+                  </div>
+                  <div className="flex gap-2">
+                    <button
+                      onClick={(e) => { e.stopPropagation(); toggleDetail(w.worker_id) }}
+                      className={`px-2 py-1 text-xs rounded border ${isOpen ? 'bg-emerald-50 border-emerald-300 text-emerald-700' : 'bg-slate-50 border-slate-300 hover:bg-slate-100'}`}
+                      title="展开节点详情：技能 / MCP / 工作区 / run 状态"
+                    >
+                      {isOpen ? '收起详情' : '详情'}
+                    </button>
+                    <button
+                      onClick={(e) => { e.stopPropagation(); setEmbedded(w) }}
+                      className="px-2 py-1 text-xs rounded bg-violet-600 text-white hover:bg-violet-500"
+                      title={`抽屉内嵌该节点 Agent 面板（${panelUrl(w)}）`}
+                    >
+                      内嵌查看
+                    </button>
+                    <button
+                      onClick={(e) => { e.stopPropagation(); navigate('/command', { state: { workerId: w.worker_id } }) }}
+                      className="px-2 py-1 text-xs rounded bg-mint-600 text-white hover:bg-mint-500"
+                      title={`定点派发到此节点（role=${w.role}）`}
+                    >
+                      派发到此节点
+                    </button>
+                    <button
+                      onClick={(e) => { e.stopPropagation(); ping(w.worker_id) }}
+                      className="px-2 py-1 text-xs rounded bg-slate-100 hover:bg-slate-200"
+                    >
+                      刷新心跳
+                    </button>
+                    <button
+                      onClick={(e) => { e.stopPropagation(); unregister(w.worker_id) }}
+                      className="px-2 py-1 text-xs rounded bg-rose-100 text-rose-700 hover:bg-rose-200"
+                    >
+                      注销
+                    </button>
+                  </div>
+                </div>
+                {isOpen && (
+                  <div className="border-t border-slate-100 p-3 text-sm">
+                    {err && !st ? (
+                      <div className="flex flex-wrap items-center gap-2 text-rose-600">
+                        <span className="text-rose-700">状态拉取失败：{err}</span>
+                        <button
+                          onClick={(e) => { e.stopPropagation(); void fetchStatus(w.worker_id) }}
+                          className="px-2 py-0.5 text-xs rounded border border-rose-300 hover:bg-rose-50"
+                        >
+                          重试
+                        </button>
+                      </div>
+                    ) : !st ? (
+                      <div className="text-slate-400">加载中…</div>
+                    ) : (
+                      <div className="grid gap-3 md:grid-cols-2">
+                        {/* 工作区规定 */}
+                        <div>
+                          <div className="text-xs text-slate-400 mb-1">对话工作区 {st.workspace.exists ? '' : '（目录缺失）'}</div>
+                          <div className="flex gap-2">
+                            <input
+                              value={wsInputs[w.worker_id] ?? st.workspace.path}
+                              onChange={(e) => {
+                                e.stopPropagation()
+                                setWsInputs((m) => ({ ...m, [w.worker_id]: e.target.value }))
+                              }}
+                              spellCheck={false}
+                              className="flex-1 min-w-0 px-2 py-1 font-mono text-xs border border-slate-300 rounded"
+                              placeholder="绝对路径（目录须存在）"
+                              title="输入已存在的目录绝对路径后点「切换」"
+                            />
+                            <button
+                              onClick={(e) => { e.stopPropagation(); void switchWorkspace(w.worker_id) }}
+                              className="px-2 py-1 text-xs rounded bg-emerald-600 text-white hover:bg-emerald-500 whitespace-nowrap"
+                            >
+                              切换
+                            </button>
+                          </div>
+                          <div className="text-xs text-slate-400 mt-2">面板 run：{st.runs.running} 运行中 / {st.runs.total} 总数</div>
+                        </div>
+                        {/* 技能 / MCP */}
+                        <div className="grid gap-3">
+                          <div>
+                            <div className="text-xs text-slate-400 mb-1">技能（{st.skills.length}）</div>
+                            {st.skills.length === 0 ? (
+                              <div className="text-slate-300">无</div>
+                            ) : (
+                              <div className="flex flex-wrap gap-1.5">
+                                {st.skills.map((s) => (
+                                  <span key={s.name} className="px-2 py-0.5 text-xs rounded-full bg-sky-50 text-sky-700 border border-sky-200" title={`${s.description}${s.triggers.length ? `\n触发词: ${s.triggers.join('、')}` : ''}`}>
+                                    {s.name}
+                                  </span>
+                                ))}
+                              </div>
+                            )}
+                          </div>
+                          <div>
+                            <div className="text-xs text-slate-400 mb-1">MCP 服务（{st.mcp_servers.length}）</div>
+                            {st.mcp_servers.length === 0 ? (
+                              <div className="text-slate-300">无</div>
+                            ) : (
+                              <ul className="space-y-0.5">
+                                {st.mcp_servers.map((m) => (
+                                  <li key={m.name} className="font-mono text-xs text-slate-600 truncate"
+                                      title={m.command != null ? String(m.command) : m.url != null ? String(m.url) : ''}>
+                                    {m.name}
+                                    <span className="text-slate-400"> — {m.command != null ? String(m.command) : m.url != null ? String(m.url) : '（远程）'}</span>
+                                  </li>
+                                ))}
+                              </ul>
+                            )}
+                          </div>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                )}
               </div>
-              <div className="flex gap-2">
-                <button
-                  onClick={(e) => { e.stopPropagation(); setEmbedded(w) }}
-                  className="px-2 py-1 text-xs rounded bg-violet-600 text-white hover:bg-violet-500"
-                  title={`抽屉内嵌该节点 Agent 面板（${panelUrl(w)}）`}
-                >
-                  内嵌查看
-                </button>
-                <button
-                  onClick={(e) => { e.stopPropagation(); navigate('/command', { state: { workerId: w.worker_id } }) }}
-                  className="px-2 py-1 text-xs rounded bg-mint-600 text-white hover:bg-mint-500"
-                  title={`定点派发到此节点（role=${w.role}）`}
-                >
-                  派发到此节点
-                </button>
-                <button
-                  onClick={(e) => { e.stopPropagation(); ping(w.worker_id) }}
-                  className="px-2 py-1 text-xs rounded bg-slate-100 hover:bg-slate-200"
-                >
-                  刷新心跳
-                </button>
-                <button
-                  onClick={(e) => { e.stopPropagation(); unregister(w.worker_id) }}
-                  className="px-2 py-1 text-xs rounded bg-rose-100 text-rose-700 hover:bg-rose-200"
-                >
-                  注销
-                </button>
-              </div>
-            </div>
-          ))}
+            )
+          })}
           {workers.data && workers.data.length === 0 && (
             <div className="text-slate-400 text-sm">暂无节点</div>
           )}

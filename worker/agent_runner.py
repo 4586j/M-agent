@@ -29,6 +29,12 @@ class TaskRequest:
     cancel_event: Any = None
     # 链路追踪 ID：brain 派发 payload 下发，贯穿 worker 日志与结果 callback（顶层字段）
     trace_id: str | None = None
+    # 运行时 Provider 四字段（brain 解析后透传；密钥只走内存，不落日志/持久化）：
+    # provider 名进 meta 对账；base_url/auth_token 本次任务生效；provider_pool 故障切换候选
+    provider: str | None = None
+    provider_base_url: str | None = None
+    provider_auth_token: str | None = None
+    provider_pool: list[dict] | None = None
 
 
 @dataclass
@@ -95,6 +101,10 @@ def build_worker_kernel(cfg, mcp_servers: dict | None = None) -> Any:
         output_guard_enabled=cfg.output_guard_enabled,
         output_guard_max_retries=cfg.output_guard_max_retries,
         fallback_model=cfg.fallback_model,
+        # 运行时 Provider 全局默认 + 故障切换池（persona/任务级覆盖优先）
+        provider_base_url=cfg.provider_base_url,
+        provider_auth_token=cfg.provider_auth_token,
+        provider_pool=cfg.provider_pool,
     )
     return AgentKernel(config)
 
@@ -122,6 +132,9 @@ class SdkAgentRunner(AgentRunner):
                  output_guard_enabled: bool = True,
                  output_guard_max_retries: int = 1,
                  fallback_model: str = "",
+                 provider_base_url: str = "",
+                 provider_auth_token: str = "",
+                 provider_pool: list[dict] | None = None,
                  kernel: Any = None):
         self.work_dir = Path(work_dir)
         self.work_dir.mkdir(parents=True, exist_ok=True)
@@ -140,6 +153,10 @@ class SdkAgentRunner(AgentRunner):
         self.output_guard_enabled = output_guard_enabled
         self.output_guard_max_retries = output_guard_max_retries
         self.fallback_model = fallback_model
+        # 运行时 Provider 全局默认 + 故障切换池（任务/人设覆盖优先）
+        self.provider_base_url = provider_base_url
+        self.provider_auth_token = provider_auth_token
+        self.provider_pool = provider_pool
         self._kernel = kernel  # 可注入（测试替身）；None 时 run() 内延迟自建
 
     def _get_kernel(self):
@@ -158,24 +175,36 @@ class SdkAgentRunner(AgentRunner):
             output_guard_enabled=self.output_guard_enabled,
             output_guard_max_retries=self.output_guard_max_retries,
             fallback_model=self.fallback_model,
+            provider_base_url=self.provider_base_url,
+            provider_auth_token=self.provider_auth_token,
+            provider_pool=self.provider_pool,
         )
         self._kernel = build_worker_kernel(cfg, mcp_servers=self.mcp_servers)
         return self._kernel
 
     def run(self, req: TaskRequest) -> TaskResult:
-        from agent_core.persona import load_persona, Persona
+        from agent_core.persona import load_persona
         from agent_core.kernel import KernelResult
 
         # 加载 persona（默认 .claude/agents/{role}.md；等价于原 _parse_executor_def）
+        from agent_core.persona import replace_persona
         persona = load_persona(self.persona_def_path)
-        # 请求级 model 覆盖：req.model 优先，其次 persona 定义文件 frontmatter
+        # 任务级覆盖（四层优先级最高，次之 persona frontmatter）：
+        # model 与 provider 三元组一律经 replace_persona 整体复制，
+        # 保留未覆盖字段。密钥只进内存 Persona，不落日志/持久化。
+        overrides: dict = {}
         if req.model:
-            persona = Persona(
-                name=persona.name, description=persona.description,
-                model=req.model, tools=persona.tools,
-                system_prompt=persona.system_prompt,
-                sub_agents=persona.sub_agents,
-            )
+            overrides["model"] = req.model
+        if req.provider:
+            overrides["provider"] = req.provider
+        if req.provider_base_url:
+            overrides["base_url"] = req.provider_base_url
+        if req.provider_auth_token:
+            overrides["auth_token"] = req.provider_auth_token
+        if req.provider_pool:
+            overrides["provider_pool"] = req.provider_pool
+        if overrides:
+            persona = replace_persona(persona, **overrides)
 
         # 任务工作目录隔离（每任务独立子目录，产物扫描以此为根）
         task_dir = self.work_dir / req.task_id

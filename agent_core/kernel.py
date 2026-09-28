@@ -22,7 +22,7 @@ from agent_core.config import AgentConfig
 from agent_core.context import build_system_prompt, build_user_message_prefix
 from agent_core.errors import humanize_sdk_error, humanize_timeout
 from agent_core.output_guard import detect_degenerate
-from agent_core.persona import Persona
+from agent_core.persona import Persona, replace_persona
 from agent_core.result_validator import validate_output, build_correction_hint
 from agent_core.prompt_guard import detect_injection
 from agent_core.tools import build_memory_mcp_server, load_mcp_servers, scan_skills
@@ -754,6 +754,20 @@ class AgentKernel:
         )
         if model:
             kwargs["model"] = model
+        # 运行时 Provider：注入 base_url/auth_token 到 SDK options.env（CLI 子进程
+        # 环境，SDK 合并顺序 {**os.environ, **options.env} → 本层优先）。优先级：
+        # persona（任务级/人设 frontmatter）> config.provider_*（全局默认）> 进程 env
+        # （不设则缺省键沿用，即第三/四层兜底）。只注入非空键，避免用空串覆盖
+        # 子进程里已有的真实端点；memory MCP 是进程内 server，不受此 env 影响。
+        base_url = persona.base_url or self.config.provider_base_url
+        auth_token = persona.auth_token or self.config.provider_auth_token
+        provider_env = {}
+        if base_url:
+            provider_env["ANTHROPIC_BASE_URL"] = base_url
+        if auth_token:
+            provider_env["ANTHROPIC_AUTH_TOKEN"] = auth_token
+        if provider_env:
+            kwargs["env"] = provider_env
         # 成本控制：思考 token 是最大成本项；max_budget_usd 是单任务硬预算熔断
         if self.config.max_thinking_tokens:
             kwargs["max_thinking_tokens"] = self.config.max_thinking_tokens
@@ -850,52 +864,87 @@ class AgentKernel:
                 "confidence": profile.confidence, "reason": profile.reason,
             }
 
-        if use_planning:
-            core = self._execute_plan_engine(prompt, persona, cwd, context_memory,
-                                             cancel_event, resume, emitter=emitter)
-        else:
-            # 输出质量守卫：普通单轮路径带退化检测与三级兜底（默认开，可关）。
-            core = self._execute_oneshot_guarded(prompt, persona, cwd,
-                                                 context_memory, cancel_event,
-                                                 emitter=emitter)
+        # 自动故障切换（「有池才切」）：persona.provider_pool 非空时，属于瞬时
+        # 传输层/服务端错误（sdk_error / rate_limit / no_result / timeout）→ 依序
+        # 切下一候选（_apply_provider 换 model+base_url+auth_token）重试，最多
+        # len(pool) 次；无池则本次循环只有 persona 一项，行为与既有实现完全一致。
+        _FAILOVER_TRIGGERS = {"sdk_error", "rate_limit", "no_result", "timeout"}
+        pool = persona.provider_pool or []
+        candidates = [persona] + [self._apply_provider(persona, c) for c in pool]
+        fail_over: dict = {"attempts": [], "count": 0}
+        result: KernelResult | None = None
+        for idx, try_persona in enumerate(candidates):
+            if use_planning:
+                core = self._execute_plan_engine(prompt, try_persona, cwd,
+                                                 context_memory,
+                                                 cancel_event, resume, emitter=emitter)
+            else:
+                # 输出质量守卫：普通单轮路径带退化检测与三级兜底（默认开，可关）。
+                core = self._execute_oneshot_guarded(prompt, try_persona, cwd,
+                                                     context_memory, cancel_event,
+                                                     emitter=emitter)
 
-        async def _run_with_timeout() -> KernelResult:
-            # 用整任务截止点的剩余时间作为核心执行上限（入口时≈task_timeout）。
-            return await asyncio.wait_for(core, timeout=max(0.0, deadline.remaining()))
+            async def _run_with_timeout() -> KernelResult:
+                # 用整任务截止点的剩余时间作为核心执行上限（入口时≈task_timeout）
+                return await asyncio.wait_for(
+                    core, timeout=max(0.0, deadline.remaining()))
 
-        try:
-            result = self._run_async(_run_with_timeout())
-        except asyncio.TimeoutError:
-            msg, hint = humanize_timeout(self.config.task_timeout)
-            prog = self._last_progress or {}
-            result = KernelResult(
-                output=f"{msg}。建议：{hint}", is_error=True,
-                turns=prog.get("turns") or 0,
-                usage=prog.get("usage"),
-                cost_usd=prog.get("cost_usd"),
-                duration_ms=self.config.task_timeout * 1000, error_type="timeout",
-            )
-            if prog.get("degenerate_last_reason"):
-                result.meta["degenerate"] = {
-                    "detected": True, "recovered": False,
-                    "reasons": [prog["degenerate_last_reason"]],
-                    "note": "timeout",
-                }
-            tracer.finish()
-            result.meta["trace"] = tracer.to_dict()
-            if routing_info:
-                result.meta["routing"] = routing_info
-            return result
-        except Exception as e:  # noqa: BLE001 - SDK 异常统一收敛为错误结果
-            error_type, message, hint = humanize_sdk_error(e)
-            tracer.finish()
-            kr = KernelResult(
-                output=f"{message}\n原始错误：{e}\n建议：{hint}",
-                is_error=True, error_type="sdk_error")
-            kr.meta["trace"] = tracer.to_dict()
-            if routing_info:
-                kr.meta["routing"] = routing_info
-            return kr
+            # 异常路径产物：timeout / sdk_error（可变瞬时错误，进 failover 候选）；
+            # 非异常路径产物：SDK 正常返回的 KernelResult（error_type 已定）
+            early_return: KernelResult | None = None
+            try:
+                result = self._run_async(_run_with_timeout())
+            except asyncio.TimeoutError:
+                msg, hint = humanize_timeout(self.config.task_timeout)
+                prog = self._last_progress or {}
+                result = KernelResult(
+                    output=f"{msg}。建议：{hint}", is_error=True,
+                    turns=prog.get("turns") or 0,
+                    usage=prog.get("usage"),
+                    cost_usd=prog.get("cost_usd"),
+                    duration_ms=self.config.task_timeout * 1000,
+                    error_type="timeout",
+                )
+                if prog.get("degenerate_last_reason"):
+                    result.meta["degenerate"] = {
+                        "detected": True, "recovered": False,
+                        "reasons": [prog["degenerate_last_reason"]],
+                        "note": "timeout",
+                    }
+                early_return = result
+            except Exception as e:  # noqa: BLE001 - SDK 异常统一收敛为错误结果
+                _, message, hint = humanize_sdk_error(e)
+                result = KernelResult(
+                    output=f"{message}\n原始错误：{e}\n建议：{hint}",
+                    is_error=True, error_type="sdk_error")
+                early_return = result
+
+            # 故障切换判定：瞬时错误 + 还有下一候选 → 切 candidate 重试。
+            if (result.error_type in _FAILOVER_TRIGGERS
+                    and idx + 1 < len(candidates)):
+                fail_over["count"] += 1
+                fail_over["attempts"].append(
+                    f"{result.error_type} → 切换候选 {idx + 1}")
+                log.warning("run_oneshot provider failover：%s（候选 %d/%d）",
+                            result.error_type, idx + 1, len(candidates) - 1)
+                # 干净重开：进度快照与 tracer 都按本次尝试隔离，防上一候选择漏
+                self._last_progress = {}
+                tracer = ExecutionTracer("run_oneshot")
+                continue
+
+            # 无池 或 终态尝试：恢复既有早退语义（timeout/sdk_error 直达返回，
+            # 不进入 correction / 经验沉淀 / 反思，与改动前一致）
+            if early_return is not None:
+                tracer.finish()
+                result.meta["trace"] = tracer.to_dict()
+                if routing_info:
+                    result.meta["routing"] = routing_info
+                return result
+            break
+
+        # 故障切换留痕（可观测：次数 + 每次切换触发的错误类型）
+        if fail_over["count"]:
+            result.meta["provider_failover"] = fail_over
 
         # 自纠错闭环：退化检测通过后追加结果验证 + 修正循环（共享整任务截止点）
         if use_correction and not result.cancelled and not result.is_error:
@@ -1353,16 +1402,24 @@ class AgentKernel:
         return await self._run_sdk_query(full_prompt, options, cancel_event,
                                          emitter=emitter)
 
-    def _guard_persona_with_model(self, persona: Persona, model: str) -> Persona:
-        """复制 persona 并覆盖 model（退化第 2 次重试换 fallback_model 用）。
+    def _apply_provider(self, persona: Persona,
+                        provider: dict | None) -> Persona:
+        """复制 persona 并覆盖 provider 三元组（model/base_url/auth_token）。
 
-        _build_options 里 model 取 persona.model or config.model，覆盖 persona
-        即等价于按次覆盖构造 options 的 model。
+        _build_options 从 persona 读三元组（model + env 注入），覆盖 persona
+        即按次覆盖本次 run 的模型/端点/密钥。**候选字段优先，缺省/空回落
+        persona 原值**——换模型（fallback_model）不丢端点密钥，换候选（failover）
+        也不误清「候选未声明、但上层已设」的字段。
+        provider=None/空 → 原样返回 persona。
         """
-        return Persona(name=persona.name, description=persona.description,
-                       model=model, tools=persona.tools,
-                       system_prompt=persona.system_prompt,
-                       sub_agents=persona.sub_agents)
+        if not provider:
+            return persona
+        return replace_persona(
+            persona,
+            model=provider.get("model") or persona.model,
+            base_url=provider.get("base_url") or persona.base_url,
+            auth_token=provider.get("auth_token") or persona.auth_token,
+        )
 
     async def _execute_oneshot_guarded(self, prompt: str, persona: Persona,
                                        cwd: str, context_memory: str,
@@ -1445,7 +1502,7 @@ class AgentKernel:
                 }
                 return fin
             if attempt == 2 and fallback and fallback != cur_model:
-                persona_try = self._guard_persona_with_model(persona, fallback)
+                persona_try = self._apply_provider(persona, {"model": fallback})
                 models_tried.append(fallback)
                 cur_model = fallback
             else:

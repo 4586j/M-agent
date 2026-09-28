@@ -463,3 +463,67 @@ def test_session_guard_disabled_no_marker(monkeypatch, project_root, tmp_path):
     events = asyncio.run(scenario())
     result_ev = next(e for e in events if e.type == "result")
     assert "degenerate" not in result_ev.data
+
+
+# ---- 运行时 Provider 自动故障切换（有池才切）----
+
+def _install_failover_sdk(monkeypatch):
+    """假 SDK：首次 query() 抛限流错误，其后返回 OK。捕获 models/envs。"""
+    calls = {"count": 0, "models": [], "envs": []}
+
+    class ClaudeAgentOptions:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+
+    def query(prompt, options):
+        calls["count"] += 1
+        calls["models"].append(getattr(options, "model", None))
+        calls["envs"].append(dict(getattr(options, "env", None) or {}))
+        if calls["count"] == 1:
+            raise RuntimeError("429 rate limit exceeded, retry later")
+        msgs = [ResultMessage(result=OK)]
+
+        async def gen():
+            for m in msgs:
+                yield m
+        return gen()
+
+    fake = types.ModuleType("claude_agent_sdk")
+    fake.ClaudeAgentOptions = ClaudeAgentOptions
+    fake.query = query
+    fake.ClaudeSDKClient = object
+    monkeypatch.setitem(sys.modules, "claude_agent_sdk", fake)
+    return calls
+
+
+def test_run_oneshot_failover_switches_provider_candidate(
+        monkeypatch, project_root, tmp_path):
+    """provider_pool 非空 + 首候遇 429 → 自动切候选（model+端点+密钥）重试成功。"""
+    calls = _install_failover_sdk(monkeypatch)
+    cfg = _kernel_config(project_root, tmp_path)
+    kernel = AgentKernel(cfg)
+    persona = Persona(name="executor", system_prompt="p",
+                      base_url="https://primary", auth_token="pri-key",
+                      provider_pool=[{"model": "alt-model",
+                                      "base_url": "https://alt",
+                                      "auth_token": "alt-key"}])
+    res = kernel.run_oneshot(OK, persona, str(tmp_path))
+    # 首候 env=主端点/密钥；第 2 次切到候选的 model+env
+    assert calls["envs"][0]["ANTHROPIC_BASE_URL"] == "https://primary"
+    assert calls["models"][1] == "alt-model"
+    assert calls["envs"][1]["ANTHROPIC_AUTH_TOKEN"] == "alt-key"
+    assert res.is_error is False
+    assert res.meta["provider_failover"]["count"] == 1
+    assert res.meta["provider_failover"]["attempts"] == ["sdk_error → 切换候选 1"]
+
+
+def test_run_oneshot_no_pool_no_failover(monkeypatch, project_root, tmp_path):
+    """无 provider_pool：一次 SDK 异常即返回错误，不重试（既有行为保持不变）。"""
+    calls = _install_failover_sdk(monkeypatch)
+    cfg = _kernel_config(project_root, tmp_path)
+    kernel = AgentKernel(cfg)
+    res = kernel.run_oneshot(OK, Persona(name="e", system_prompt="p"),
+                             str(tmp_path), record_experience=False)
+    assert calls["count"] == 1            # 只试一次
+    assert res.is_error is True
+    assert "rate limit" in (res.output or "").lower()

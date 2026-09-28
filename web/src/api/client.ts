@@ -3,6 +3,7 @@ import type {
   RecommendBody, RecommendResponse, TranslateBody, TranslateResponse,
   MemoryCoreItem, ContextNotesResponse, ExperienceRecord, ExperienceSearchBody,
   ProposalRecord, ReflectionReport, ScheduleRecord, ScheduleBody, AuditEntry,
+  NodeStatus, ProviderList, ProviderPutBody,
 } from '../types'
 import { getActiveConnection } from './connections'
 
@@ -173,6 +174,29 @@ export const api = {
     request<{ content: string; encoding?: string; size?: number }>(
       `/proxy/artifact?worker_id=${encodeURIComponent(workerId)}&task_id=${encodeURIComponent(taskId)}&path=${encodeURIComponent(path)}`,
     ),
+
+  // ---- 运行时 Provider 池（模型/端点/密钥；密钥只写 brain providers.json） ----
+
+  providers: () => request<ProviderList>('/providers'),
+  putProvider: (body: ProviderPutBody) =>
+    request<{ status: string; name: string }>('/providers', {
+      method: 'PUT', body: JSON.stringify(body),
+    }),
+  deleteProvider: (name: string) =>
+    request<{ status: string }>(`/providers/${encodeURIComponent(name)}`, { method: 'DELETE' }),
+  setDefaultProvider: (name: string) =>
+    request<{ status: string; default: string }>('/providers/default', {
+      method: 'PUT', body: JSON.stringify({ name }),
+    }),
+
+  // ---- 节点详情（brain 代理 worker /agent/status 与工作区切换） ----
+
+  nodeStatus: (workerId: string) =>
+    request<NodeStatus>(`/proxy/node/status?worker_id=${encodeURIComponent(workerId)}`),
+  setNodeWorkspace: (workerId: string, path: string) =>
+    request<{ path: string; name: string }>('/proxy/node/workspace', {
+      method: 'PUT', body: JSON.stringify({ worker_id: workerId, path }),
+    }),
 }
 
 // SSE 实时事件流地址。EventSource 无法携带自定义 header，

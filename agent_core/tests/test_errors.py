@@ -73,6 +73,18 @@ def test_classify_model_not_found_unknown_model_only():
     assert _classify_of(Exception("unknown variable foo")) == "unknown"
 
 
+def test_classify_rate_limit():
+    """429 / rate limit 归 rate_limit（自动故障切换「有池才切」的触发信号）。"""
+    for text in ("429 Too Many Requests", "rate limit exceeded",
+                 "error 429: request_rate_limit_exceeded", "too many requests"):
+        assert _classify_of(Exception(text)) == "rate_limit", text
+
+
+def test_classify_rate_limit_precedes_budget():
+    """rate limit 判定置于 budget 之前：限流语义与预算不足不同（限流可切池重试）。"""
+    assert _classify_of(Exception("429 usage limit reached")) == "rate_limit"
+
+
 def test_classify_budget():
     for text in ("max_budget_usd exceeded", "Your credit balance is too low",
                  "billing error", "usage limit reached"):

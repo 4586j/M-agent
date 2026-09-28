@@ -10,7 +10,7 @@
 tools 在 frontmatter 中为逗号分隔字符串，加载时统一转为列表；缺省为 None
 表示放开全部工具。单个文件损坏不拖垮整体（try/except continue）。
 """
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields as _dataclass_fields
 from pathlib import Path
 
 
@@ -36,6 +36,19 @@ class Persona:
     tools: list[str] | None = None
     system_prompt: str = ""
     sub_agents: dict = field(default_factory=dict)  # SDK agents 选项
+
+    # ---- 运行时 Provider 覆盖（四层：任务级 > persona > 全局默认 > 进程 env）----
+    # provider：provider 名（供上层对账/展示；结束后端，内核不解析名字）
+    provider: str | None = None
+    # base_url / auth_token：本次 run 的端点与密钥。非空时 kernel._build_options
+    # 注入 SDK options.env（ANTHROPIC_BASE_URL / ANTHROPIC_AUTH_TOKEN），覆盖子进程
+    # 继承的进程 env；为空则沿用进程 env（兜底层）。密钥只存 Persona（内存），
+    # 不落任何持久化/审计/日志。
+    base_url: str | None = None
+    auth_token: str | None = None
+    # provider_pool：自动故障切换候选（[{model, base_url, auth_token}, ...]）。
+    # 「有池才切」：sdk_error/429/超时/空结果时依序切下一候选重试，最多 len(pool) 次。
+    provider_pool: list[dict] | None = None
 
 
 def _split_frontmatter(text: str) -> tuple[dict, str]:
@@ -81,11 +94,47 @@ def strip_frontmatter(text: str) -> str:
     return _split_frontmatter(text)[1]
 
 
+def replace_persona(persona: Persona, **overrides) -> Persona:
+    """复制 persona，用 overrides 覆盖指定字段，其余字段原样保留。
+
+    Persona 字段会持续增长（model / provider 三元组等），各处手工重建容易漏拷
+    新字段造成静默丢失；统一经此函数重建一次拷全。overrides 显式传 None 表示
+    「清空该字段」（换 provider 清密钥用）。
+    """
+    merged = {f.name: getattr(persona, f.name) for f in _dataclass_fields(Persona)}
+    merged.update(overrides)
+    return Persona(**merged)
+
+
+def _normalize_provider_pool(raw) -> list[dict] | None:
+    """frontmatter 的 provider_pool 归一化为 [{model, base_url, auth_token}, ...]。
+
+    透传入口（TaskRequest / brain）给的是已归一化的 dict 列表；frontmatter 里可以是
+    YAML 列表（每项含 model/base_url/auth_token）。损坏条目跳过。
+    """
+    if raw is None:
+        return None
+    pool: list[dict] = []
+    for item in raw if isinstance(raw, list) else []:
+        if not isinstance(item, dict):
+            continue
+        norm = {
+            "model": str(item["model"]) if item.get("model") else None,
+            "base_url": str(item["base_url"]) if item.get("base_url") else None,
+            "auth_token": str(item["auth_token"]) if item.get("auth_token") else None,
+        }
+        # 至少要有模型或端点，否则切无可切
+        if norm["model"] or norm["base_url"]:
+            pool.append(norm)
+    return pool or None
+
+
 def load_persona(path: str | Path) -> Persona:
     """从单个 .md 文件加载人设。
 
     文件不存在时抛出 FileNotFoundError（由调用方决定是否兜底）。
-    name 缺省取文件名主干；tools 逗号串转列表；model 透传。
+    name 缺省取文件名主干；tools 逗号串转列表；model 透传；
+    provider / base_url / auth_token / provider_pool 亦从 frontmatter 读取。
     """
     p = Path(path)
     text = p.read_text(encoding="utf-8")
@@ -96,6 +145,10 @@ def load_persona(path: str | Path) -> Persona:
         model=meta.get("model") or None,
         tools=_normalize_tools(meta.get("tools")),
         system_prompt=body,
+        provider=str(meta["provider"]) if meta.get("provider") else None,
+        base_url=str(meta["base_url"]) if meta.get("base_url") else None,
+        auth_token=str(meta["auth_token"]) if meta.get("auth_token") else None,
+        provider_pool=_normalize_provider_pool(meta.get("provider_pool")),
     )
 
 

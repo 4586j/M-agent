@@ -2,6 +2,7 @@ import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { MemoryRouter } from 'react-router-dom'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import NodeManage, { panelUrl } from './NodeManage'
+import { api } from '../api/client'
 import type { WorkerInfo } from '../types'
 
 /** NodeManage 节点面板入口：行点击新标签打开 / 内嵌抽屉 iframe / host 环回回退。
@@ -14,6 +15,19 @@ const WORKERS: WorkerInfo[] = [
     capabilities: {}, last_heartbeat: 0, load: 2 },
 ]
 
+const NODE_STATUS = {
+  worker_id: 'worker-a',
+  role: 'executor',
+  panel_enabled: true,
+  workspace: { path: 'D:/ws', name: 'ws', exists: true },
+  skills: [
+    { name: 'web-expert', description: '前端页面', triggers: ['页面'] },
+    { name: 'back-expert', description: '后端服务', triggers: [] },
+  ],
+  mcp_servers: [{ name: 'orchestrator', command: 'python', url: undefined }],
+  runs: { running: 0, total: 3 },
+}
+
 vi.mock('../api/client', () => ({
   api: {
     workers: vi.fn(() => Promise.resolve(WORKERS)),
@@ -21,6 +35,8 @@ vi.mock('../api/client', () => ({
     heartbeat: vi.fn(() => Promise.resolve({ status: 'ok' })),
     deleteWorker: vi.fn(() => Promise.resolve({ status: 'ok' })),
     register: vi.fn(() => Promise.resolve({ status: 'ok' })),
+    nodeStatus: vi.fn(() => Promise.resolve(NODE_STATUS)),
+    setNodeWorkspace: vi.fn(() => Promise.resolve({ path: '/new-ws', name: 'new-ws' })),
   },
 }))
 
@@ -79,5 +95,38 @@ describe('NodeManage 节点面板入口', () => {
     // 点击「刷新心跳」只走心跳，不触发行级 window.open
     fireEvent.click(screen.getAllByRole('button', { name: '刷新心跳' })[0])
     expect(window.open).not.toHaveBeenCalled()
+  })
+})
+
+describe('NodeManage 节点详情（技能 / MCP / 工作区）', () => {
+  it('展开详情显示 skill / mcp / workspace，切换工作区走 brain 代理 PUT', async () => {
+    render(<MemoryRouter><NodeManage /></MemoryRouter>)
+    await waitFor(() => expect(screen.getByText('worker-a')).toBeTruthy())
+
+    fireEvent.click(screen.getAllByRole('button', { name: '详情' })[0])
+    // 技能 / MCP / 工作区信息来自 api.nodeStatus
+    await waitFor(() => expect(screen.getByText('web-expert')).toBeTruthy())
+    expect(screen.getByText('back-expert')).toBeTruthy()
+    expect(screen.getByText('orchestrator')).toBeTruthy()
+    expect(screen.getByText('对话工作区')).toBeTruthy()
+    const input = screen.getByPlaceholderText('绝对路径（目录须存在）')
+    expect((input as HTMLInputElement).value).toBe('D:/ws')
+
+    // 规定工作区：输入新路径 → 切换 → PUT /proxy/node/workspace
+    fireEvent.change(input, { target: { value: '/new-ws' } })
+    fireEvent.click(screen.getAllByRole('button', { name: '切换' })[0])
+    await waitFor(() =>
+      expect(api.setNodeWorkspace).toHaveBeenCalledWith('worker-a', '/new-ws'))
+    // 展开按钮点击不触发新标签打开
+    expect(window.open).not.toHaveBeenCalled()
+  })
+
+  it('状态拉取失败显示错误并可重试', async () => {
+    vi.mocked(api.nodeStatus).mockRejectedValueOnce(new Error('worker 返回 502'))
+    render(<MemoryRouter><NodeManage /></MemoryRouter>)
+    await waitFor(() => expect(screen.getByText('worker-a')).toBeTruthy())
+
+    fireEvent.click(screen.getAllByRole('button', { name: '详情' })[0])
+    await waitFor(() => expect(screen.getByText(/状态拉取失败：worker 返回 502/)).toBeTruthy())
   })
 })

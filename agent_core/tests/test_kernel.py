@@ -228,6 +228,52 @@ def test_build_options_resume_and_subagents(monkeypatch, project_root, tmp_path)
     assert kw["agents"] == {"executor": {"description": "d"}}
 
 
+# ---- 运行时 Provider（base_url / auth_token → options.env）----
+
+def test_build_options_injects_persona_provider_env(monkeypatch, project_root, tmp_path):
+    """persona 的 base_url/auth_token（任务级/人设级）→ options.env 覆盖子进程端点密钥。"""
+    captured = _install_fake_sdk(monkeypatch, [])
+    cfg = _kernel_config(project_root, tmp_path)
+    kernel = AgentKernel(cfg)
+    persona = Persona(name="x", system_prompt="p",
+                      base_url="https://gw.example.com/v1",
+                      auth_token="secret-token")
+    kernel._build_options(persona, str(tmp_path))
+    env = captured["options_kwargs"]["env"]
+    assert env == {"ANTHROPIC_BASE_URL": "https://gw.example.com/v1",
+                   "ANTHROPIC_AUTH_TOKEN": "secret-token"}
+
+
+def test_build_options_config_provider_fallback(monkeypatch, project_root, tmp_path):
+    """persona 未设时回落 config.provider_*（全局默认）；都不设则不传 env（进程 env 兜底）。"""
+    captured = _install_fake_sdk(monkeypatch, [])
+    cfg = _kernel_config(project_root, tmp_path,
+                         provider_base_url="https://default.example.com",
+                         provider_auth_token="cfg-key")
+    kernel = AgentKernel(cfg)
+    options = kernel._build_options(Persona(name="x", system_prompt="p"), str(tmp_path))
+    assert captured["options_kwargs"]["env"] == {
+        "ANTHROPIC_BASE_URL": "https://default.example.com",
+        "ANTHROPIC_AUTH_TOKEN": "cfg-key"}
+    assert options is not None
+    # 都不设 → 无 env 键（不覆盖进程 env）
+    captured2 = _install_fake_sdk(monkeypatch, [])
+    kernel2 = AgentKernel(_kernel_config(project_root, tmp_path))
+    kernel2._build_options(Persona(name="x", system_prompt="p"), str(tmp_path))
+    assert "env" not in captured2["options_kwargs"]
+
+
+def test_build_options_persona_env_wins_over_config(monkeypatch, project_root, tmp_path):
+    """persona 三元组优先于 config（任务级/人设级 > 全局默认）。"""
+    captured = _install_fake_sdk(monkeypatch, [])
+    cfg = _kernel_config(project_root, tmp_path, provider_base_url="https://cfg")
+    kernel = AgentKernel(cfg)
+    persona = Persona(name="x", system_prompt="p",
+                      base_url="https://persona", auth_token="pt")
+    kernel._build_options(persona, str(tmp_path))
+    assert captured["options_kwargs"]["env"]["ANTHROPIC_BASE_URL"] == "https://persona"
+
+
 def test_build_options_subagents_gate(monkeypatch, project_root, tmp_path):
     """全局闸（Slice: 子代理开关）：config.subagents_enabled=False 时即使人设带
     sub_agents 也不映射为 options.agents；True（默认）时照常映射。"""

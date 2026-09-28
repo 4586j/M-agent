@@ -74,6 +74,7 @@ class AsyncRemoteDispatcher:
         use_experience: bool = True,
         enable_subagents: bool | None = None,
         worker_id: str | None = None,
+        provider: dict | None = None,
     ) -> str:
         """异步派发：写 pending、POST worker、起后台轮询，立即返回 task_id。
 
@@ -98,6 +99,9 @@ class AsyncRemoteDispatcher:
                 "use_experience": bool(use_experience)}
         if pinned:
             meta["pinned"] = True
+        # 只记 provider 名进 meta（密钥绝不落盘）；三元组走瞬时 body
+        if provider and provider.get("name"):
+            meta["provider"] = provider["name"]
         self.task_store.write(TaskRecord(
             task_id=task_id, role=role, prompt=prompt,
             worker_id=worker.worker_id, status="pending",
@@ -121,6 +125,13 @@ class AsyncRemoteDispatcher:
         }
         if model:
             body["model"] = model
+        # provider 三元组瞬时转发 worker（内存仅本次任务；不落任何持久化）
+        if provider:
+            body["provider"] = provider.get("name")
+            if provider.get("base_url"):
+                body["provider_base_url"] = provider["base_url"]
+            if provider.get("auth_token"):
+                body["provider_auth_token"] = provider["auth_token"]
         resp = await self.async_http("POST", f"{base}/task", json=body)
         if resp.get("status_code") != 200:
             log.warning("[trace=%s] task=%s post failed: %s", trace_id, task_id, resp)

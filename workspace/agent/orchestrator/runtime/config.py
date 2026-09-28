@@ -58,6 +58,9 @@ class Config:
     async_poll_interval: float = 1.0
     async_poll_max: int = 600
     api_key: str = ""
+    # provider 池（runtime/providers.json，gitignore）+ 默认 provider 热切起点
+    providers_file: str = str(_default_runtime_dir() / "providers.json")
+    default_provider: str = ""  # ORCH_DEFAULT_PROVIDER：起始默认，面板/API 可热切
 
 
 def load_config() -> Config:
@@ -90,4 +93,8 @@ def load_config() -> Config:
         async_poll_interval=float(os.environ.get("ORCH_ASYNC_POLL_INTERVAL", "1.0")),
         async_poll_max=int(os.environ.get("ORCH_ASYNC_POLL_MAX", "600")),
         api_key=os.environ.get("ORCH_API_KEY", ""),
+        providers_file=os.environ.get(
+            "ORCH_PROVIDERS_FILE",
+            str(_default_runtime_dir() / "providers.json")),
+        default_provider=os.environ.get("ORCH_DEFAULT_PROVIDER", ""),
     )
