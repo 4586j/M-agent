@@ -1,0 +1,363 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>Agent 面板 · 单机 Agent 运行实况</title>
+<style>
+  /* ZCode 式深色主题 */
+  :root{
+    --bg:#0d1117; --bg2:#161b22; --bg3:#1c2129; --border:#30363d;
+    --fg:#e6edf3; --fg-dim:#8b949e; --fg-faint:#6e7681;
+    --accent:#3fb950; --accent-dim:#238636; --warn:#d29922; --err:#f85149;
+    --info:#58a6ff; --think:#8b949e; --mono:'Consolas','SF Mono',monospace;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:var(--bg);color:var(--fg);font-family:-apple-system,'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif;font-size:13px;height:100vh;display:flex;flex-direction:column;overflow:hidden}
+  header{height:46px;display:flex;align-items:center;gap:12px;padding:0 16px;border-bottom:1px solid var(--border);background:var(--bg2);flex-shrink:0}
+  header .logo{width:24px;height:24px;border-radius:6px;background:linear-gradient(135deg,#238636,#3fb950);display:flex;align-items:center;justify-content:center;font-size:13px}
+  header h1{font-size:14px;font-weight:600}
+  header .conn{margin-left:auto;display:flex;align-items:center;gap:6px;font-size:12px;color:var(--fg-dim)}
+  .dot{width:8px;height:8px;border-radius:50%;background:var(--accent);animation:pulse 2s infinite}
+  .dot.off{background:var(--err);animation:none}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+  .layout{flex:1;display:flex;overflow:hidden}
+  /* 左栏 */
+  .sidebar{width:230px;border-right:1px solid var(--border);background:var(--bg2);display:flex;flex-direction:column;flex-shrink:0}
+  .sidebar .head{padding:10px 12px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center}
+  .sidebar .head button{background:var(--accent-dim);color:#fff;border:none;border-radius:6px;padding:5px 10px;font-size:12px;cursor:pointer}
+  .runlist{flex:1;overflow-y:auto;padding:6px}
+  .runitem{padding:8px 10px;border-radius:6px;cursor:pointer;margin-bottom:2px;border:1px solid transparent}
+  .runitem:hover{background:var(--bg3)}
+  .runitem.active{background:var(--bg3);border-color:var(--border)}
+  .runitem .id{font-family:var(--mono);font-size:11px;color:var(--fg)}
+  .runitem .meta{font-size:11px;color:var(--fg-faint);margin-top:2px;display:flex;gap:8px}
+  .status-badge{padding:1px 6px;border-radius:8px;font-size:10px;font-weight:600}
+  .st-running{background:rgba(63,185,80,.15);color:var(--accent)}
+  .st-completed,.st-done{background:rgba(88,166,255,.12);color:var(--info)}
+  .st-failed{background:rgba(248,81,73,.12);color:var(--err)}
+  /* 中栏 */
+  .main{flex:1;display:flex;flex-direction:column;overflow:hidden}
+  .newtask{background:var(--bg2);border-bottom:1px solid var(--border);padding:12px 14px;flex-shrink:0}
+  .newtask textarea{width:100%;background:var(--bg);border:1px solid var(--border);border-radius:8px;color:var(--fg);padding:8px 10px;font-size:13px;resize:vertical;min-height:56px;font-family:inherit}
+  .newtask textarea:focus{outline:none;border-color:var(--accent-dim)}
+  .newtask .row{display:flex;gap:8px;margin-top:8px;align-items:center;flex-wrap:wrap}
+  .newtask input,.newtask select{background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--fg);padding:5px 8px;font-size:12px}
+  .newtask input:focus,.newtask select:focus{outline:none;border-color:var(--accent-dim)}
+  .newtask label{font-size:12px;color:var(--fg-dim);display:flex;align-items:center;gap:5px}
+  .btn-primary{background:var(--accent-dim);color:#fff;border:none;border-radius:6px;padding:6px 16px;font-size:13px;font-weight:600;cursor:pointer;margin-left:auto}
+  .btn-primary:hover{background:var(--accent)}
+  .btn-primary:disabled{opacity:.4;cursor:not-allowed}
+  .btn-cancel{background:transparent;color:var(--err);border:1px solid var(--err);border-radius:6px;padding:5px 12px;font-size:12px;cursor:pointer}
+  .stream{flex:1;overflow-y:auto;padding:14px 16px}
+  /* 事件块 */
+  .ev{margin-bottom:10px;border-radius:8px}
+  .ev-think{background:var(--bg2);border:1px solid var(--border);padding:8px 12px;color:var(--think);font-style:italic;white-space:pre-wrap;font-size:12px;line-height:1.6}
+  .ev-think .label{font-size:10px;text-transform:uppercase;letter-spacing:.5px;color:var(--fg-faint);font-style:normal;margin-bottom:4px;cursor:pointer;user-select:none}
+  .ev-text{color:var(--fg);line-height:1.7;white-space:pre-wrap;font-size:13px;padding:2px 4px}
+  .ev-tool{background:var(--bg2);border:1px solid var(--border);padding:8px 12px;font-family:var(--mono);font-size:12px}
+  .ev-tool .thead{display:flex;align-items:center;gap:8px;cursor:pointer}
+  .ev-tool .ticon{color:var(--warn)}
+  .ev-tool .tname{color:var(--info);font-weight:600}
+  .ev-tool .tsum{color:var(--fg-dim);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1}
+  .ev-tool .tinput{margin-top:6px;padding:6px 8px;background:var(--bg);border-radius:6px;color:var(--fg-dim);white-space:pre-wrap;word-break:break-all;display:none}
+  .ev-tool.open .tinput{display:block}
+  .ev-tool .tres{margin-top:6px;padding:6px 8px;background:var(--bg);border-radius:6px;color:var(--fg-dim);white-space:pre-wrap;word-break:break-all;max-height:180px;overflow:auto;display:none}
+  .ev-tool.open .tres{display:block}
+  .ev-tool .tres.err{color:var(--err)}
+  .ev-plan{background:var(--bg2);border:1px solid var(--border);border-radius:8px;padding:10px 14px}
+  .ev-plan .pstep{display:flex;align-items:flex-start;gap:8px;padding:3px 0;font-size:12px;color:var(--fg-dim)}
+  .ev-plan .pstep .ic{width:16px;text-align:center;flex-shrink:0}
+  .ev-plan .pstep.done{color:var(--accent)}
+  .ev-plan .pstep.in_progress{color:var(--warn)}
+  .ev-plan .pstep.failed{color:var(--err)}
+  .ev-result{background:linear-gradient(135deg,rgba(35,134,54,.12),var(--bg2));border:1px solid var(--accent-dim);border-radius:8px;padding:12px 14px}
+  .ev-result.err{border-color:var(--err)}
+  .ev-result .rrow{display:flex;gap:16px;font-size:12px;margin-bottom:6px;color:var(--fg-dim)}
+  .ev-result .rrow b{color:var(--fg)}
+  .ev-result .rout{white-space:pre-wrap;font-size:12px;max-height:240px;overflow:auto;background:var(--bg);border-radius:6px;padding:8px}
+  .ev-err{background:rgba(248,81,73,.08);border:1px solid var(--err);border-radius:8px;padding:10px 12px;color:var(--err);font-size:12px;white-space:pre-wrap}
+  .replay-badge{background:rgba(210,153,34,.15);color:var(--warn);padding:2px 8px;border-radius:8px;font-size:11px;font-weight:600}
+  /* 右栏 */
+  .rightbar{width:280px;border-left:1px solid var(--border);background:var(--bg2);overflow-y:auto;padding:12px;flex-shrink:0}
+  .panel-sec{margin-bottom:16px}
+  .panel-sec h3{font-size:11px;text-transform:uppercase;letter-spacing:.5px;color:var(--fg-faint);margin-bottom:8px}
+  .statgrid{display:grid;grid-template-columns:1fr 1fr;gap:6px}
+  .statgrid .cell{background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:8px;text-align:center}
+  .statgrid .cell .v{font-weight:700;font-size:14px;color:var(--fg)}
+  .statgrid .cell .k{font-size:10px;color:var(--fg-faint);margin-top:2px}
+  .preview-frame{width:100%;height:420px;border:1px solid var(--border);border-radius:8px;background:#fff}
+  .trace-tree{font-family:var(--mono);font-size:11px;color:var(--fg-dim);white-space:pre-wrap}
+  .empty-tip{color:var(--fg-faint);text-align:center;padding:40px 16px;font-size:12px;line-height:1.8}
+  .iframe-btn{display:block;width:100%;text-align:center;background:var(--accent-dim);color:#fff;border:none;border-radius:6px;padding:6px;font-size:12px;cursor:pointer;margin-top:6px}
+  ::-webkit-scrollbar{width:6px;height:6px}
+  ::-webkit-scrollbar-thumb{background:var(--border);border-radius:3px}
+</style>
+</head>
+<body>
+<header>
+  <div class="logo">⚡</div>
+  <h1>Agent 面板 <span style="color:var(--fg-faint);font-weight:400;font-size:12px">· 单机 Agent 运行实况</span></h1>
+  <div class="conn"><span class="dot" id="conn-dot"></span><span id="conn-text">就绪</span></div>
+</header>
+<div class="layout">
+  <div class="sidebar">
+    <div class="head"><span style="font-size:12px;color:var(--fg-dim)">运行历史</span><button onclick="newTask()">+ 新任务</button></div>
+    <div class="runlist" id="runlist"><div class="empty-tip">加载中…</div></div>
+  </div>
+  <div class="main">
+    <div class="newtask" id="newtask-box">
+      <textarea id="prompt" placeholder="给 Agent 下发任务…（例如：分析本项目目录结构并写一份摘要.md）"></textarea>
+      <div class="row">
+        <label>model <input id="model" placeholder="默认" style="width:120px"/></label>
+        <label><input type="checkbox" id="plan-cb"/> 启用规划引擎（分步执行+计划勾选）</label>
+        <button class="btn-primary" id="btn-dispatch" onclick="dispatch()">派发</button>
+      </div>
+    </div>
+    <div class="stream" id="stream"><div class="empty-tip">左栏选择历史运行可回放；或在上方输入任务实时派发。<br/>事件流将展示：思考过程 · 执行的命令 · 工具/skill/MCP 调用 · 计划步骤 · 最终结果</div></div>
+  </div>
+  <div class="rightbar" id="rightbar">
+    <div class="empty-tip">运行开始后显示<br/>统计 · trace · 产物预览</div>
+  </div>
+</div>
+<script>
+const $=id=>document.getElementById(id);
+let currentRunId=null, eventSource=null, live=false, lastSeq=0;
+let planSteps=null; // 最近一次 plan_update 的步骤（用于增量渲染）
+
+function setConn(ok,text){ $('conn-dot').className='dot'+(ok?'':' off'); $('conn-text').textContent=text; }
+
+/* ---- 任务输入 / 派发 ---- */
+function newTask(){
+  live=true; currentRunId=null; planSteps=null;
+  $('newtask-box').style.display='block';
+  $('stream').innerHTML='<div class="empty-tip">输入任务后点击「派发」。<br/>事件流：思考 · 命令 · 工具/skill/MCP 调用 · 计划步骤 · 结果</div>';
+  renderRight(null);
+}
+function dispatch(){
+  const prompt=$('prompt').value.trim();
+  if(!prompt) return;
+  const model=$('model').value.trim();
+  const planning=$('plan-cb').checked;
+  live=true; planSteps=null; lastSeq=0; currentRunId=null;
+  $('stream').innerHTML='';
+  $('btn-dispatch').disabled=true; $('btn-dispatch').textContent='执行中…';
+  setConn(true,'执行中');
+  const body={prompt, planning_enabled: planning};
+  if(model) body.model=model;
+  if(planning){
+    // 规划任务走异步 run：事件经 sink 落盘，面板轮询回放（准实时）
+    fetch('/agent/run/async',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
+      .then(r=>r.json()).then(d=>{
+        currentRunId=d.run_id;
+        renderRight({num_turns:0});
+        const poll=()=>{
+          if(currentRunId!==d.run_id) return;
+          fetch(`/agent/run/${d.run_id}/events`).then(r=>r.json()).then(events=>{
+            for(const e of events){
+              if(e.seq<=lastSeq) continue;
+              lastSeq=e.seq;
+              if(e.type==='result'){ renderResult(e.data,false); finishRun(); return; }
+              if(e.type==='plan_update'){ renderPlan(e.data); continue; }
+              if(e.type==='error'){ appendError(typeof e.data==='string'?e.data:JSON.stringify(e.data)); continue; }
+              handleEvent(e.type,e.data);
+            }
+            if(live) setTimeout(poll,2000);
+          }).catch(()=>{ if(live) setTimeout(poll,4000); });
+        };
+        poll();
+      }).catch(e=>{ appendError(e.message||String(e)); finishRun(); });
+    return;
+  }
+  fetch('/agent/run/stream',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
+    .then(resp=>{
+      if(!resp.ok||!resp.headers.get('content-type').includes('event-stream')){
+        return resp.json().then(j=>{ throw new Error(j.message||('HTTP '+resp.status)); });
+      }
+      const reader=resp.body.getReader(), dec=new TextDecoder();
+      let buf='';
+      function pump(){
+        return reader.read().then(({done,value})=>{
+          if(done){ finishRun(); return; }
+          buf+=dec.decode(value,{stream:true});
+          let idx;
+          while((idx=buf.indexOf('\n\n'))>=0){
+            const frame=buf.slice(0,idx); buf=buf.slice(idx+2);
+            let ev=null,data=null;
+            for(const line of frame.split('\n')){
+              if(line.startsWith('event: ')) ev=line.slice(7).trim();
+              else if(line.startsWith('data: ')){ try{data=JSON.parse(line.slice(6));}catch(e){} }
+            }
+            if(ev&&data) handleEvent(ev,data);
+          }
+          return pump();
+        });
+      }
+      return pump();
+    })
+    .catch(e=>{ appendError(e.message||String(e)); finishRun(); });
+}
+function finishRun(){
+  $('btn-dispatch').disabled=false; $('btn-dispatch').textContent='派发';
+  setConn(true,'就绪'); live=false;
+  loadRuns();
+}
+
+/* ---- 事件渲染 ---- */
+function el(html){ const d=document.createElement('div'); d.innerHTML=html; return d.firstElementChild; }
+function esc(s){ return String(s??'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+function toolIcon(name){
+  if(name==='Bash') return '⌨'; if(/Write|Edit|NotebookEdit/.test(name)) return '📝';
+  if(name==='Read'||name==='Glob'||name==='Grep') return '🔍';
+  if(/Task|Agent/.test(name)) return '🤖'; if(/^mcp__/.test(name)) return '🔌';
+  if(/Skill|skill/i.test(name)) return '🧩'; if(/WebFetch|WebSearch/.test(name)) return '🌐';
+  return '⚙';
+}
+function toolSummary(name,input){
+  input=input||{};
+  if(name==='Bash') return input.command||'';
+  if(/Write|Edit|NotebookEdit/.test(name)) return input.file_path||'';
+  if(name==='Read') return input.file_path||'';
+  if(/Task|Agent/.test(name)) return (input.subagent_type||'')+' '+(input.prompt||'').slice(0,80);
+  if(/^mcp__/.test(name)) return name;
+  return JSON.stringify(input).slice(0,120);
+}
+function handleEvent(ev,data){
+  const stream=$('stream');
+  if(ev==='text_delta'){
+    let last=stream.lastElementChild;
+    if(!last||!last.classList.contains('ev-text')){ stream.appendChild(el('<div class="ev ev-text"></div>')); last=stream.lastElementChild; }
+    last.textContent+=data;
+    stream.scrollTop=stream.scrollHeight; return;
+  }
+  if(ev==='thinking_delta'||ev==='thinking'){
+    const text=data&&typeof data==='string'?data:(data&&data.thinking)||'';
+    if(!text) return;
+    let last=stream.lastElementChild;
+    let thinkBox=(last&&last.classList.contains('ev-think'))?last:null;
+    if(!thinkBox){
+      thinkBox=el('<div class="ev ev-think"><div class="label">💭 思考过程</div><div class="tcontent"></div></div>');
+      thinkBox.querySelector('.label').onclick=()=>{ const c=thinkBox.querySelector('.tcontent'); c.style.display=c.style.display==='none'?'block':'none'; };
+      stream.appendChild(thinkBox);
+    }
+    if(ev==='thinking_delta') thinkBox.querySelector('.tcontent').textContent+=text;
+    else thinkBox.querySelector('.tcontent').textContent+=text;
+    stream.scrollTop=stream.scrollHeight; return;
+  }
+  if(ev==='tool_use'){
+    const name=data.name, input=data.input||{};
+    const card=el(`<div class="ev ev-tool"><div class="thead"><span class="ticon">${toolIcon(name)}</span><span class="tname">${esc(name)}</span><span class="tsum">${esc(toolSummary(name,input))}</span></div><div class="tinput">${esc(JSON.stringify(input,null,1)).slice(0,2000)}</div><div class="tres"></div></div>`);
+    card.querySelector('.thead').onclick=()=>card.classList.toggle('open');
+    stream.appendChild(card); stream.scrollTop=stream.scrollHeight; return;
+  }
+  if(ev==='tool_result'){
+    const last=stream.lastElementChild;
+    if(last&&last.classList.contains('ev-tool')){
+      const content=data&&data.content!==undefined?data.content:data;
+      const resEl=last.querySelector('.tres');
+      resEl.textContent=typeof content==='string'?content.slice(0,1500):JSON.stringify(content).slice(0,1500);
+      try{ if(data&&data.is_error) resEl.classList.add('err'); }catch(e){}
+    }
+    return;
+  }
+  if(ev==='plan_update'){ renderPlan(data); return; }
+  if(ev==='result'){ renderResult(data,false); return; }
+  if(ev==='error'){ appendError(typeof data==='string'?data:(data&&data.message)||JSON.stringify(data)); return; }
+  if(ev==='budget_warning'){ appendError('⚠ 预算预警：'+JSON.stringify(data)); return; }
+}
+function renderPlan(planDict){
+  planSteps=planDict;
+  let box=$('stream').querySelector('.ev-plan:last-of-type');
+  if(!box){ box=el('<div class="ev ev-plan"><div class="label" style="font-size:10px;color:var(--fg-faint);margin-bottom:6px">📋 计划步骤</div><div class="steps"></div></div>'); $('stream').appendChild(box); }
+  const stepsEl=box.querySelector('.steps'); stepsEl.innerHTML='';
+  const icon={pending:'○',in_progress:'◐',done:'●',failed:'✕'};
+  (planDict.steps||[]).forEach(s=>{
+    stepsEl.appendChild(el(`<div class="pstep ${s.status}"><span class="ic">${icon[s.status]||'○'}</span><span>${esc(s.action)}</span></div>`));
+  });
+  $('stream').scrollTop=$('stream').scrollHeight;
+}
+function renderResult(data,replay){
+  const stream=$('stream');
+  const err=!!data.is_error;
+  const box=el(`<div class="ev ev-result ${err?'err':''}">
+    <div class="rrow"><span>状态 <b>${err?'失败':'完成'}</b></span><span>轮次 <b>${data.num_turns||0}</b></span><span>耗时 <b>${((data.duration_ms||0)/1000).toFixed(1)}s</b></span><span>成本 <b>$${data.cost_usd!=null?data.cost_usd.toFixed(4):'—'}</b></span></div>
+    <div class="rout">${esc(String(data.result||''))}</div></div>`);
+  stream.appendChild(box); stream.scrollTop=stream.scrollHeight;
+  renderRight(data,replay);
+}
+function appendError(text){
+  $('stream').appendChild(el(`<div class="ev ev-err">${esc(text)}</div>`));
+  $('stream').scrollTop=$('stream').scrollHeight;
+}
+
+/* ---- 右栏：统计 / 产物预览 / trace ---- */
+function renderRight(result,replay){
+  const rb=$('rightbar');
+  if(!result){ rb.innerHTML='<div class="empty-tip">运行开始后显示<br/>统计 · 产物预览</div>'; return; }
+  const u=result.usage||{};
+  const tokens=(u.input_tokens||0)+(u.output_tokens||0)+(u.cache_read_input_tokens||0)+(u.cache_creation_input_tokens||0);
+  let html=`<div class="panel-sec"><h3>用量统计</h3><div class="statgrid">
+    <div class="cell"><div class="v">${tokens.toLocaleString()}</div><div class="k">tokens</div></div>
+    <div class="cell"><div class="v">${result.num_turns||0}</div><div class="k">turns</div></div>
+    <div class="cell"><div class="v">${result.cost_usd!=null?'$'+result.cost_usd.toFixed(4):'—'}</div><div class="k">成本</div></div>
+    <div class="cell"><div class="v">${((result.duration_ms||0)/1000).toFixed(1)}s</div><div class="k">耗时</div></div>
+  </div></div>`;
+  // 产物预览：当前 run 的 cwd 由后端 meta 提供；尝试常见入口文件
+  if(currentRunId){
+    html+=`<div class="panel-sec"><h3>产物预览</h3>
+      <div style="font-size:11px;color:var(--fg-faint);margin-bottom:4px">常见入口：index.html / demo.html</div>
+      <button class="iframe-btn" onclick="previewArtifact('index.html')">预览 index.html</button>
+      <button class="iframe-btn" style="background:var(--bg3);color:var(--fg-dim)" onclick="previewArtifact('demo.html')">尝试 demo.html</button>
+      <iframe id="preview" class="preview-frame" style="display:none;margin-top:8px"></iframe>
+    </div>`;
+  }
+  html+=`<div class="panel-sec"><h3>Trace</h3><div class="trace-tree" id="trace-box">加载中…</div></div>`;
+  rb.innerHTML=html;
+  if(currentRunId) fetch(`/agent/trace/${currentRunId}`).then(r=>r.json()).then(tr=>{
+    const box=$('trace-box'); if(!box) return;
+    box.textContent=JSON.stringify(tr,null,1).slice(0,3000);
+  }).catch(()=>{ const b=$('trace-box'); if(b) b.textContent='（trace 不可用）'; });
+}
+function previewArtifact(path){
+  if(!currentRunId) return;
+  const f=$('preview'); f.style.display='block';
+  f.src=`/agent/artifact/${encodeURIComponent(currentRunId)}?path=${encodeURIComponent(path)}`;
+}
+
+/* ---- 运行历史（左栏） ---- */
+function loadRuns(){
+  fetch('/agent/runs').then(r=>r.json()).then(d=>{
+    const list=$('runlist'); list.innerHTML='';
+    const runs=d.runs||[];
+    if(runs.length===0){ list.innerHTML='<div class="empty-tip">暂无运行记录</div>'; return; }
+    runs.forEach(r=>{
+      const div=el(`<div class="runitem" data-rid="${esc(r.run_id)}">
+        <div class="id">${esc(r.run_id)}</div>
+        <div class="meta"><span class="status-badge st-${esc(r.status)}">${esc(r.status)}</span><span>${esc((r.prompt||'').slice(0,26))}</span></div>
+      </div>`);
+      div.onclick=()=>replayRun(r.run_id);
+      list.appendChild(div);
+    });
+  }).catch(()=>{ $('runlist').innerHTML='<div class="empty-tip">历史加载失败</div>'; });
+}
+function replayRun(runId){
+  live=false; currentRunId=runId; planSteps=null;
+  document.querySelectorAll('.runitem').forEach(n=>n.classList.toggle('active',n.dataset.rid===runId));
+  $('stream').innerHTML='<div class="replay-badge">⏮ 回放模式</div>';
+  renderRight({num_turns:0});
+  fetch(`/agent/run/${encodeURIComponent(runId)}/events`).then(r=>r.json()).then(events=>{
+    for(const e of events){
+      if(e.type==='plan_update'){ renderPlan(e.data); continue; }
+      if(e.type==='result'){ renderResult(e.data,true); continue; }
+      handleEvent(e.type,e.data);
+    }
+    $('stream').scrollTop=$('stream').scrollHeight;
+  }).catch(e=>appendError('回放加载失败: '+e.message));
+}
+
+/* ---- 初始化 ---- */
+loadRuns();
+fetch('/health').then(r=>r.json()).then(()=>setConn(true,'就绪')).catch(()=>setConn(false,'服务离线'));
+</script>
+</body>
+</html>

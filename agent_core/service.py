@@ -100,6 +100,8 @@ class RunReq(BaseModel):
     persona: str | None = Field(None, description="人设名（如 executor）；缺省用服务默认人设")
     context_memory: str | None = Field(None, description="附加上下文记忆/参考资料，拼在任务说明之前")
     cwd: str | None = Field(None, description="任务工作目录（绝对路径）；缺省在 work_dir 下自动创建")
+    model: str | None = Field(None, description="模型覆盖（如 qwen3.8-flash）；缺省用 persona/配置默认")
+    planning_enabled: bool | None = Field(None, description="true 时用 Plan-Execute 引擎（异步路径）；计划步骤实时产出 plan_update 事件")
 
 
 class SessionCreateReq(BaseModel):
@@ -149,7 +151,8 @@ def _error(status_code: int, code: str, message: str,
                         content={"code": code, "message": message, "detail": detail})
 
 
-def _accumulate_oneshot(result_dict: dict, prompt: str = "", persona: str = "") -> None:
+def _accumulate_oneshot(result_dict: dict, prompt: str = "",
+                        persona: str = "", run_id: str | None = None) -> None:
     """oneshot 用量累加（/agent/status 的 oneshot_usage 数据源）+ 指标采集 + 历史持久化。"""
     _ONESHOT_TOTALS["runs"] += 1
     if result_dict.get("is_error") or result_dict.get("cancelled"):
@@ -176,7 +179,8 @@ def _accumulate_oneshot(result_dict: dict, prompt: str = "", persona: str = "") 
     try:
         store = _get_history_store()
         config = get_config()
-        record = build_run_record(prompt, persona, config.model or "", result_dict)
+        record = build_run_record(prompt, persona, config.model or "",
+                                  result_dict, run_id=run_id)
         store.append(record)
     except Exception as e:
         logger.warning("运行历史持久化失败: %s", e)
@@ -285,6 +289,45 @@ def _prepare_cwd(explicit: str | None, tag: str) -> str:
     p = base / f"{tag}-{uuid.uuid4().hex[:8]}"
     p.mkdir(parents=True, exist_ok=True)
     return str(p)
+
+
+# ---- 运行事件持久化（Agent 面板数据源：实时流落 JSONL 供回放/预览） ----
+
+def _runs_dir() -> Path:
+    """运行事件落盘目录：<work_dir>/runs/。"""
+    config = get_config()
+    d = Path(config.work_dir or (config.project_root or ".") + "/.agent_work") / "runs"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _run_meta_path(run_id: str) -> Path:
+    return _runs_dir() / f"{run_id}.meta.json"
+
+
+def _write_run_meta(run_id: str, **updates: Any) -> None:
+    """写/更新 run 元数据 sidecar（cwd/prompt/status 等，供回放与产物预览定位）。"""
+    p = _run_meta_path(run_id)
+    meta: dict = {}
+    if p.exists():
+        try:
+            meta = json.loads(p.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001
+            meta = {}
+    meta.update(updates)
+    meta["run_id"] = run_id  # 权威字段：回放/预览端点按此定位
+    p.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _make_event_sink(run_id: str):
+    """事件 sink：把 (run_id, {seq,ts,type,data}) 逐条追加到 runs/<id>.jsonl。"""
+    path = _runs_dir() / f"{run_id}.jsonl"
+
+    def sink(rid: str, event: dict) -> None:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(event, ensure_ascii=False, default=str) + "\n")
+
+    return sink
 
 
 async def _run_session_turn(session: Any, prompt: str,
@@ -549,13 +592,54 @@ def create_app(default_persona: str = "executor") -> FastAPI:
 
     @app.post("/agent/run/stream")
     async def agent_run_stream(req: RunReq):
-        """单发流式执行（SSE）。事件名：text_delta/tool_use/tool_result/
-        budget_warning/result/error；data 为 JSON，payload 超长截断（2000 字符）。"""
+        """单发流式执行（SSE）。事件名：thinking/thinking_delta/text_delta/
+        tool_use/tool_result/plan_update/budget_warning/result/error；
+        data 为 JSON，payload 超长截断（2000 字符）。
+        全量事件落 <work_dir>/runs/<run_id>.jsonl 供面板回放；结束后写历史。"""
         persona = resolve_persona(req.persona or _DEFAULT_PERSONA)
         cwd = _prepare_cwd(req.cwd, tag="run")
         kernel = get_kernel()
-        events = kernel.stream(req.prompt, persona, cwd, req.context_memory or "")
-        return _streaming_response(events)
+        run_id = f"run-{uuid.uuid4().hex[:12]}"
+        _write_run_meta(run_id, cwd=cwd,
+                        prompt=req.prompt[:2000], persona=persona.name,
+                        model=req.model or "", status="running",
+                        started_at=round(time.time(), 3))
+        sink = _make_event_sink(run_id)
+        events = kernel.stream(req.prompt, persona, cwd, req.context_memory or "",
+                               run_id=run_id, event_sink=sink)
+
+        async def _events_with_bookkeeping():
+            final: dict | None = None
+            try:
+                async for ev in events:
+                    if ev.type == "result" and isinstance(ev.data, dict):
+                        final = dict(ev.data)
+                    yield ev
+            except Exception as e:  # noqa: BLE001
+                _write_run_meta(run_id, status="failed",
+                                error=f"流式转发异常：{e}")
+                yield AgentEvent("error", f"流式转发异常：{e}")
+            finally:
+                # 客户端提前断连（生成器 aclose）也落终态，不留 running 残留
+                if final is not None:
+                    _write_run_meta(run_id, status=("failed" if final.get("is_error")
+                                                    else "completed"))
+                    # 修复"流式 run 不入历史"：同一 run_id 聚合入 history
+                    result_dict = {"is_error": bool(final.get("is_error")),
+                                   "cancelled": False,
+                                   "error_type": final.get("error_type") or "",
+                                   "cost_usd": final.get("cost_usd"),
+                                   "turns": final.get("num_turns") or 0,
+                                   "duration_ms": final.get("duration_ms") or 0,
+                                   "usage": final.get("usage"),
+                                   "output": final.get("result"),
+                                   "meta": {}}
+                    _accumulate_oneshot(result_dict, prompt=req.prompt,
+                                        persona=persona.name, run_id=run_id)
+                else:
+                    _write_run_meta(run_id, status="interrupted")
+
+        return _streaming_response(_events_with_bookkeeping())
 
     @app.post("/agent/run/async", status_code=202)
     async def agent_run_async(req: RunReq):
@@ -566,7 +650,13 @@ def create_app(default_persona: str = "executor") -> FastAPI:
         """
         persona = resolve_persona(req.persona or _DEFAULT_PERSONA)
         cwd = _prepare_cwd(req.cwd, tag="run")
-        kernel = get_kernel()
+        if req.planning_enabled:
+            # 请求级规划开关：replace 出独立 config，避免污染共享内核
+            import dataclasses
+            run_cfg = dataclasses.replace(get_config(), planning_enabled=True)
+            kernel = AgentKernel(run_cfg)
+        else:
+            kernel = get_kernel()
         run_id = uuid.uuid4().hex[:12]
         cancel_event = threading.Event()
         entry: dict = {
@@ -576,17 +666,25 @@ def create_app(default_persona: str = "executor") -> FastAPI:
             "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         }
         _ASYNC_RUNS[run_id] = entry
+        _write_run_meta(run_id, cwd=cwd,
+                        prompt=req.prompt[:2000], persona=persona.name,
+                        model=req.model or "", status="running",
+                        started_at=round(time.time(), 3))
+        sink = _make_event_sink(run_id)
 
         async def _worker():
             try:
                 result = await asyncio.to_thread(
                     kernel.run_oneshot, req.prompt, persona, cwd,
-                    req.context_memory or "", cancel_event)
+                    req.context_memory or "", cancel_event,
+                    run_id=run_id, event_sink=sink)
                 d = asdict(result)
                 entry["result"] = d
                 entry["status"] = ("cancelled" if result.cancelled
                                    else "failed" if result.is_error else "completed")
-                _accumulate_oneshot(d)
+                _accumulate_oneshot(d, prompt=req.prompt, persona=persona.name,
+                                    run_id=run_id)
+                _write_run_meta(run_id, status=entry["status"])
             except Exception as e:  # noqa: BLE001 - 后台任务异常收敛进条目
                 entry["status"] = "failed"
                 error_type, message, hint = humanize_sdk_error(e)
@@ -623,6 +721,86 @@ def create_app(default_persona: str = "executor") -> FastAPI:
         entry["cancel_event"].set()
         return {"run_id": run_id, "status": entry["status"],
                 "cancel_requested": True}
+
+    # ---- 运行事件回放 / 产物只读 / 面板（Agent 面板数据源） ----
+
+    @app.get("/agent/runs")
+    def list_runs(limit: int = 50) -> dict:
+        """列出运行（runs/<id>.meta.json，按 started_at 新→旧）。"""
+        items = []
+        for meta_path in sorted(_runs_dir().glob("*.meta.json"),
+                                key=lambda p: p.stat().st_mtime, reverse=True)[:max(0, limit)]:
+            try:
+                meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                items.append(meta)
+            except Exception:  # noqa: BLE001 - 坏文件跳过
+                continue
+        return {"runs": items}
+
+    @app.get("/agent/run/{run_id}/events")
+    def replay_run_events(run_id: str, limit: int = 5000) -> list:
+        """回放一次 run 的全量事件（按 seq 升序，供面板回放模式）。"""
+        events_path = _runs_dir() / f"{run_id}.jsonl"
+        if not events_path.exists():
+            raise HTTPException(status_code=404,
+                                detail=f"run 事件不存在: {run_id}")
+        out = []
+        with open(events_path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    out.append(json.loads(line))
+                except ValueError:
+                    continue
+        return out[:max(0, limit)]
+
+    @app.get("/agent/artifact/{run_id}")
+    def read_run_artifact(run_id: str, path: str):
+        """只读回传该 run 工作目录下的产物文件（防路径穿越；二进制 base64）。"""
+        meta_path = _run_meta_path(run_id)
+        if not meta_path.exists():
+            raise HTTPException(status_code=404, detail=f"run not found: {run_id}")
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        except ValueError:
+            raise HTTPException(status_code=404, detail="run meta corrupted")
+        cwd = meta.get("cwd") or ""
+        if not cwd or ".." in path or path.startswith(("/", "\\")) or "\\" in path:
+            raise HTTPException(status_code=400, detail="invalid path")
+        base = Path(cwd).resolve()
+        full = (base / path).resolve()
+        try:
+            full.relative_to(base)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="invalid path")
+        if not full.is_file():
+            raise HTTPException(status_code=404, detail="artifact not found")
+        size = full.stat().st_size
+        data = full.read_bytes()
+        try:
+            return {"path": path, "content": data.decode("utf-8"),
+                    "encoding": "utf-8", "size": size}
+        except UnicodeDecodeError:
+            import base64
+            return {"path": path, "content": base64.b64encode(data).decode("ascii"),
+                    "encoding": "base64", "size": size}
+
+    @app.get("/panel")
+    def serve_panel():
+        """Agent 面板（单文件深色 UI，由本服务直接托管）。"""
+        from fastapi.responses import FileResponse
+        panel = Path(__file__).resolve().parent / "panel" / "index.html"
+        if not panel.exists():
+            raise HTTPException(status_code=404, detail="panel 未安装")
+        return FileResponse(panel, media_type="text/html")
+
+    @app.get("/")
+    def root_redirect():
+        """根路径重定向到面板。"""
+        from fastapi.responses import RedirectResponse
+        return RedirectResponse(url="/panel")
 
     # ---- 多轮会话 ----
 
@@ -929,10 +1107,32 @@ def create_app(default_persona: str = "executor") -> FastAPI:
 
     @app.get("/agent/trace/{run_id}")
     def agent_trace(run_id: str) -> dict:
-        """查询单次执行的 trace 详情。"""
+        """查询单次执行的 trace 详情。
+
+        面板的 run_id（runs/<id>）与历史库 run_id 现已统一；仍兼容
+        仅存在于历史库的旧记录（先查历史，miss 再回退读事件流末帧结果）。
+        """
         store = _get_history_store()
         record = store.get_by_run_id(run_id)
         if record is None:
+            # 面板 run：从事件 JSONL 的 result 帧还原统计（无 trace 树）
+            events_path = _runs_dir() / f"{run_id}.jsonl"
+            if events_path.exists():
+                last_result = None
+                with open(events_path, encoding="utf-8") as f:
+                    for line in f:
+                        try:
+                            e = json.loads(line)
+                        except ValueError:
+                            continue
+                        if e.get("type") == "result":
+                            last_result = e.get("data")
+                if last_result is not None:
+                    return {"run_id": run_id, "trace": None,
+                            "summary": {k: last_result.get(k) for k in
+                                        ("num_turns", "cost_usd", "duration_ms",
+                                         "is_error")},
+                            "note": "该 run 未落 trace 树（流式路径），以上为终态统计"}
             return _error(404, "not_found", f"运行记录不存在: {run_id}")
         trace = record.get("trace")
         if trace is None:
