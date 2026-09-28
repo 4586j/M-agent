@@ -42,6 +42,9 @@ import asyncio
 import json
 import logging
 import os
+import re
+import shutil
+import subprocess
 import threading
 import time
 import uuid
@@ -49,7 +52,7 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any, AsyncIterator
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
@@ -721,6 +724,139 @@ def create_app(default_persona: str = "executor") -> FastAPI:
         entry["cancel_event"].set()
         return {"run_id": run_id, "status": entry["status"],
                 "cancel_requested": True}
+
+    # ---- 内嵌终端（WebSocket：持久 cwd 会话，用户直接操作终端） ----
+
+    def _ws_authorized(ws: WebSocket) -> bool:
+        """WebSocket 鉴权：与 HTTP 同口径（AGENT_API_KEY 或仅环回）。"""
+        key = os.environ.get("AGENT_API_KEY", "")
+        if not key:
+            host = (ws.client.host if ws.client else "") or ""
+            return host in ("127.0.0.1", "::1", "localhost")
+        supplied = (ws.query_params.get("api_key")
+                    or ws.headers.get("x-api-key", ""))
+        return supplied == key
+
+    @app.websocket("/agent/terminal")
+    async def agent_terminal(ws: WebSocket):
+        """内嵌终端：WebSocket 双向通道。
+
+        协议（客户端 → 服务端）：
+          {"type":"run","cmd":"dir"}   执行命令（cd 特判，保持会话 cwd）
+          {"type":"interrupt"}         中断当前命令
+          {"type":"ping"}              保活
+        服务端 → 客户端：
+          {"type":"ready","cwd":..,"shell":..} / {"type":"output","data":..}
+          {"type":"done","code":0,"cwd":..} / {"type":"error","message":..}
+        """
+        if not _ws_authorized(ws):
+            await ws.close(code=4401)
+            return
+        await ws.accept()
+        cfg = get_config()
+        cwd = str(Path(cfg.project_root or os.getcwd()))
+        shell = os.environ.get("AGENT_TERMINAL_SHELL") or (
+            "cmd.exe" if os.name == "nt" else (os.environ.get("SHELL") or "/bin/sh"))
+        session = {"cwd": cwd, "proc": None}
+        await ws.send_json({"type": "ready", "cwd": cwd, "shell": shell})
+        current: asyncio.Task | None = None
+
+        async def _stream(cmd: str) -> None:
+            """执行一条命令并流式回传输出（cd 特判保持会话目录）。"""
+            raw = cmd.strip()
+            if not raw:
+                await ws.send_json({"type": "done", "code": 0, "cwd": session["cwd"]})
+                return
+            # cd 特判：更新会话 cwd（支持 cd /d 跨盘、~、相对路径、引号）
+            m = re.match(r'^(cd|chdir|set-location)\s*(.*)$', raw, re.I)
+            if m:
+                target = m.group(2).strip().strip('"').strip("'")
+                target = re.sub(r'^/d\s+', '', target, flags=re.I) or "~"
+                if target == "~":
+                    target = os.path.expanduser("~")
+                p = Path(target)
+                if not p.is_absolute():
+                    p = Path(session["cwd"]) / p
+                try:
+                    p = p.resolve()
+                except OSError:
+                    p = None
+                if p is not None and p.is_dir():
+                    session["cwd"] = str(p)
+                    await ws.send_json({"type": "output", "data": str(p) + "\n"})
+                    await ws.send_json({"type": "done", "code": 0, "cwd": session["cwd"]})
+                else:
+                    await ws.send_json({"type": "error", "message": f"目录不存在: {target}"})
+                    await ws.send_json({"type": "done", "code": 1, "cwd": session["cwd"]})
+                return
+
+            loop = asyncio.get_running_loop()
+            queue: asyncio.Queue = asyncio.Queue()
+            kwargs: dict = dict(shell=True, cwd=session["cwd"], stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                                text=True, encoding="utf-8", errors="replace", bufsize=1)
+            if os.name == "nt":
+                kwargs["creationflags"] = 0x08000000  # CREATE_NO_WINDOW
+            try:
+                proc = subprocess.Popen(raw, **kwargs)
+            except Exception as e:  # noqa: BLE001
+                await ws.send_json({"type": "error", "message": f"启动失败: {e}"})
+                await ws.send_json({"type": "done", "code": 1, "cwd": session["cwd"]})
+                return
+            session["proc"] = proc
+
+            def _reader() -> None:
+                try:
+                    for line in proc.stdout:  # type: ignore[union-attr]
+                        loop.call_soon_threadsafe(queue.put_nowait, line)
+                except Exception:  # noqa: BLE001
+                    pass
+                finally:
+                    loop.call_soon_threadsafe(queue.put_nowait, None)
+
+            threading.Thread(target=_reader, daemon=True, name="term-reader").start()
+            while True:
+                item = await queue.get()
+                if item is None:
+                    break
+                await ws.send_json({"type": "output", "data": item})
+            code = proc.wait()
+            session["proc"] = None
+            await ws.send_json({"type": "done", "code": code, "cwd": session["cwd"]})
+
+        try:
+            while True:
+                msg = await ws.receive_json()
+                mtype = msg.get("type")
+                if mtype == "run":
+                    if current is not None and not current.done():
+                        await ws.send_json({"type": "error",
+                                            "message": "有命令正在执行，请先中断（Ctrl+C）"})
+                        continue
+                    current = asyncio.create_task(_stream(str(msg.get("cmd") or "")))
+                elif mtype == "interrupt":
+                    proc = session.get("proc")
+                    if proc is not None:
+                        try:
+                            proc.terminate()
+                        except Exception:  # noqa: BLE001
+                            pass
+                    await ws.send_json({"type": "output", "data": "^C\n"})
+                elif mtype == "ping":
+                    await ws.send_json({"type": "pong"})
+        except WebSocketDisconnect:
+            pass
+        except Exception as e:  # noqa: BLE001 - 连接异常不污染服务日志
+            logger.info("terminal ws closed: %s", e)
+        finally:
+            if current is not None and not current.done():
+                current.cancel()
+            proc = session.get("proc")
+            if proc is not None:
+                try:
+                    proc.terminate()
+                except Exception:  # noqa: BLE001
+                    pass
 
     # ---- 运行事件回放 / 产物只读 / 面板（Agent 面板数据源） ----
 

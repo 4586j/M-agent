@@ -147,3 +147,76 @@ def test_artifact_readonly_and_traversal(client):
     # 不存在的 run
     assert client.get("/agent/artifact/run-missing",
                       params={"path": "a.txt"}).status_code == 404
+
+
+# ---- 内嵌终端（WebSocket） ----
+
+def test_terminal_ws_requires_auth(client, monkeypatch):
+    """配了 AGENT_API_KEY 时，无 key 连接应被拒（4401）。"""
+    monkeypatch.setenv("AGENT_API_KEY", "k1")
+    with pytest.raises(Exception):
+        with client.websocket_connect("/agent/terminal") as ws:
+            ws.receive_json()
+
+
+def test_terminal_ws_run_and_cd_persist(client, monkeypatch):
+    """终端跑命令并保持会话 cwd（cd 特判）。"""
+    monkeypatch.setenv("AGENT_API_KEY", "k1")
+    with client.websocket_connect("/agent/terminal?api_key=k1") as ws:
+        ready = ws.receive_json()
+        assert ready["type"] == "ready"
+        assert ready["cwd"]
+        assert ready["shell"]
+
+        def run(cmd):
+            ws.send_json({"type": "run", "cmd": cmd})
+            out, done = "", None
+            while True:
+                m = ws.receive_json()
+                if m["type"] == "output":
+                    out += m["data"]
+                elif m["type"] == "error":
+                    out += m["message"]
+                elif m["type"] == "done":
+                    done = m
+                    break
+            return out, done
+
+        out, done = run("echo term_ok")
+        assert done["code"] == 0 and "term_ok" in out
+
+        before = done["cwd"]
+        _, done = run("cd ..")
+        assert done["cwd"] != before  # cwd 已变更（向上）
+        after = done["cwd"]
+        _, done = run("cd .")
+        assert done["cwd"] == after  # 会话 cwd 持久
+
+
+def test_terminal_ws_bad_cd_reports_error(client, monkeypatch):
+    monkeypatch.setenv("AGENT_API_KEY", "k1")
+    with client.websocket_connect("/agent/terminal?api_key=k1") as ws:
+        ws.receive_json()
+        ws.send_json({"type": "run", "cmd": "cd no_such_dir_xyz"})
+        msgs = []
+        while True:
+            m = ws.receive_json()
+            msgs.append(m)
+            if m["type"] == "done":
+                break
+        assert any(m["type"] == "error" for m in msgs)
+        assert msgs[-1]["code"] == 1
+
+
+def test_terminal_ws_ping(client, monkeypatch):
+    monkeypatch.setenv("AGENT_API_KEY", "k1")
+    with client.websocket_connect("/agent/terminal?api_key=k1") as ws:
+        ws.receive_json()
+        ws.send_json({"type": "ping"})
+        assert ws.receive_json()["type"] == "pong"
+
+
+def test_panel_has_terminal_ui(client):
+    r = client.get("/panel")
+    assert "⌨ 终端" in r.text
+    assert "switchView" in r.text and "termRun" in r.text

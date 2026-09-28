@@ -309,6 +309,38 @@
   body.resizing{cursor:col-resize}
   body.resizing *{user-select:none !important}
 
+  /* 视图切换 Tab */
+  .viewtabs{display:flex;gap:2px;padding:0 18px;flex-shrink:0;background:var(--bg-1);
+    border-bottom:1px solid var(--bd)}
+  .vt{background:transparent;border:none;border-bottom:2px solid transparent;color:var(--fg-3);
+    padding:9px 14px;font-size:12.5px;font-weight:600;cursor:pointer;transition:.15s;font-family:inherit}
+  .vt:hover{color:var(--fg-2)}
+  .vt.active{color:var(--ac);border-bottom-color:var(--ac)}
+
+  /* 内嵌终端 */
+  .term{flex:1;display:none;flex-direction:column;overflow:hidden;background:var(--bg-0)}
+  .term.show{display:flex}
+  .term-out{flex:1;overflow-y:auto;padding:12px 16px;font:400 12.5px/1.65 var(--mono);
+    color:var(--fg-2);white-space:pre-wrap;word-break:break-all}
+  .term-out .cmd{color:var(--ac);font-weight:600}
+  .term-out .err{color:var(--err)}
+  .term-out .info{color:var(--fg-4)}
+  .term-bar{display:flex;align-items:center;gap:12px;padding:7px 16px;flex-shrink:0;
+    border-top:1px solid var(--bd);font-size:11.5px;color:var(--fg-4)}
+  .term-cwd{font-family:var(--mono);color:var(--fg-3);overflow:hidden;text-overflow:ellipsis;
+    white-space:nowrap;max-width:46%}
+  .term-hint{margin-left:auto;color:var(--fg-4);white-space:nowrap;overflow:hidden;
+    text-overflow:ellipsis;flex-shrink:1}
+  .term-bar .btn-art{width:auto;padding:3px 10px;font-size:11px;white-space:nowrap;flex-shrink:0}
+  .term-input-row{display:flex;align-items:center;gap:9px;padding:10px 16px 12px;flex-shrink:0;
+    border-top:1px solid var(--bd);background:var(--bg-1)}
+  .term-prompt{color:var(--ac);font:700 13px var(--mono);flex-shrink:0}
+  .term-input{flex:1;min-width:0;background:var(--bg-0);border:1px solid var(--bd);border-radius:8px;
+    color:var(--fg);padding:8px 11px;font:400 12.5px var(--mono);outline:none;transition:.15s}
+  .term-input:focus{border-color:var(--bd-ac);box-shadow:var(--shadow-glow)}
+  .term-input-row .btn-primary{margin-left:0;padding:8px 16px;font-size:12.5px;
+    white-space:nowrap;flex-shrink:0}
+
   /* 空态 */
   .empty{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;
     padding:60px 24px;color:var(--fg-4);text-align:center;font-size:12.5px;line-height:1.9}
@@ -357,6 +389,10 @@
       <span id="runbar-state">执行中…</span>
       <button class="btn-abort" onclick="abortRun()">中断</button>
     </div>
+    <div class="viewtabs">
+      <button class="vt active" id="vt-stream" onclick="switchView('stream')">▤ 事件流</button>
+      <button class="vt" id="vt-terminal" onclick="switchView('terminal')">⌨ 终端</button>
+    </div>
     <div class="stream" id="stream">
       <div class="empty">
         <div class="glyph">🛰️</div>
@@ -365,6 +401,20 @@
         <b style="color:var(--warn)">执行的命令</b> ·
         <b style="color:var(--info)">工具 / skill / MCP 调用</b> ·
         <b style="color:var(--ac)">计划步骤</b> · 最终结果</div>
+      </div>
+    </div>
+    <div class="term" id="term-view">
+      <div class="term-out" id="term-out"></div>
+      <div class="term-bar">
+        <span class="term-cwd" id="term-cwd">未连接</span>
+        <span class="term-hint">↑↓ 历史 · Ctrl+C 中断 · Ctrl+L 清屏</span>
+        <button class="btn-art" onclick="termClear()">清屏</button>
+      </div>
+      <div class="term-input-row">
+        <span class="term-prompt">$</span>
+        <input id="term-in" class="term-input" placeholder="输入命令，Enter 执行（cd 保持会话目录）"
+               autocomplete="off" spellcheck="false"/>
+        <button class="btn-primary" onclick="termRun()">运行</button>
       </div>
     </div>
     <div class="composer" id="composer">
@@ -807,6 +857,102 @@ function resetLayout(){
     drag = null;
   });
 })();
+
+/* ================= 内嵌终端（WebSocket 直连，持久 cwd 会话） ================= */
+let termWS = null, termBusy = false, termHistory = [], termHistIdx = 0;
+const TERM_HIST_KEY = 'agent_panel_term_history';
+
+function switchView(v){
+  const isTerm = v === 'terminal';
+  $('stream').style.display = isTerm ? 'none' : '';
+  $('composer').style.display = isTerm ? 'none' : '';
+  $('term-view').classList.toggle('show', isTerm);
+  $('vt-stream').classList.toggle('active', !isTerm);
+  $('vt-terminal').classList.toggle('active', isTerm);
+  if(isTerm){ termConnect(); $('term-in').focus(); }
+}
+
+function termConnect(){
+  if(termWS && termWS.readyState <= 1) return;
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  let key = '';
+  try{ key = localStorage.getItem('orch_api_key') || ''; }catch(e){}
+  const url = proto + '//' + location.host + '/agent/terminal' +
+              (key ? '?api_key=' + encodeURIComponent(key) : '');
+  try{ termWS = new WebSocket(url); }catch(e){ termPrint('[无法建立连接: ' + e.message + ']\n', 'err'); return; }
+  termWS.onopen = () => termPrint('[已连接 · 输入命令直接执行]\n', 'info');
+  termWS.onmessage = ev => {
+    let m; try{ m = JSON.parse(ev.data); }catch(e){ return; }
+    if(m.type === 'ready'){
+      $('term-cwd').textContent = m.cwd;
+      termPrint('[shell: ' + m.shell + ']\n', 'info');
+    } else if(m.type === 'output'){
+      termPrint(m.data);
+    } else if(m.type === 'error'){
+      termPrint(m.message + '\n', 'err');
+    } else if(m.type === 'done'){
+      termBusy = false;
+      if(m.cwd) $('term-cwd').textContent = m.cwd;
+      if(m.code) termPrint('[退出码 ' + m.code + ']\n', 'info');
+    }
+  };
+  termWS.onclose = () => { termPrint('[连接已断开 · 重新切到终端标签可重连]\n', 'info'); termWS = null; termBusy = false; };
+  termWS.onerror = () => termPrint('[连接错误]\n', 'err');
+}
+
+function termPrint(text, cls){
+  const out = $('term-out');
+  const span = document.createElement('span');
+  if(cls) span.className = cls;
+  span.textContent = text;
+  out.appendChild(span);
+  out.scrollTop = out.scrollHeight;
+}
+
+function termRun(){
+  const inp = $('term-in');
+  const cmd = inp.value.trim();
+  if(!cmd) return;
+  if(!termWS || termWS.readyState !== 1){
+    termPrint('[未连接，正在重连…]\n', 'err'); termConnect(); return;
+  }
+  if(termBusy){ termPrint('[有命令正在执行，Ctrl+C 可中断]\n', 'err'); return; }
+  termPrint('$ ' + cmd + '\n', 'cmd');
+  termWS.send(JSON.stringify({ type:'run', cmd }));
+  termBusy = true;
+  if(termHistory[termHistory.length - 1] !== cmd){
+    termHistory.push(cmd);
+    if(termHistory.length > 200) termHistory.shift();
+    try{ localStorage.setItem(TERM_HIST_KEY, JSON.stringify(termHistory)); }catch(e){}
+  }
+  termHistIdx = termHistory.length;
+  inp.value = '';
+}
+function termInterrupt(){
+  if(termWS && termWS.readyState === 1) termWS.send(JSON.stringify({ type:'interrupt' }));
+}
+function termClear(){ $('term-out').innerHTML = ''; }
+
+$('term-in').addEventListener('keydown', e => {
+  if(e.key === 'Enter'){ e.preventDefault(); termRun(); return; }
+  if(e.key === 'ArrowUp'){
+    e.preventDefault();
+    if(termHistIdx > 0){ termHistIdx--; $('term-in').value = termHistory[termHistIdx] || ''; }
+    return;
+  }
+  if(e.key === 'ArrowDown'){
+    e.preventDefault();
+    if(termHistIdx < termHistory.length - 1){ termHistIdx++; $('term-in').value = termHistory[termHistIdx] || ''; }
+    else { termHistIdx = termHistory.length; $('term-in').value = ''; }
+    return;
+  }
+  if(e.ctrlKey && (e.key === 'c' || e.key === 'C')){ e.preventDefault(); termInterrupt(); return; }
+  if(e.ctrlKey && (e.key === 'l' || e.key === 'L')){ e.preventDefault(); termClear(); }
+});
+try{
+  termHistory = JSON.parse(localStorage.getItem(TERM_HIST_KEY) || '[]');
+  termHistIdx = termHistory.length;
+}catch(e){ termHistory = []; }
 
 /* ================= 初始化 ================= */
 $('prompt').addEventListener('keydown', e => {
