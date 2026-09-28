@@ -114,7 +114,8 @@
   }
   .btn-abort:hover{background:rgba(255,107,107,.2);box-shadow:0 0 16px -4px rgba(255,107,107,.5)}
 
-  .composer{padding:14px 18px 12px;flex-shrink:0;background:linear-gradient(180deg,var(--bg-1),transparent)}
+  .composer{padding:12px 18px 14px;flex-shrink:0;border-top:1px solid var(--bd);
+    background:linear-gradient(0deg,var(--bg-2),var(--bg-1))}
   .composer .card{
     background:var(--bg-2);border:1px solid var(--bd);border-radius:var(--radius-lg);
     box-shadow:var(--shadow-2);transition:.2s;overflow:hidden;
@@ -150,7 +151,7 @@
   .btn-primary:active:not(:disabled){transform:translateY(0)}
   .btn-primary:disabled{opacity:.45;cursor:not-allowed;filter:saturate(.5)}
 
-  .stream{flex:1;overflow-y:auto;padding:6px 18px 24px}
+  .stream{flex:1;overflow-y:auto;padding:14px 18px 14px}
 
   /* ================= 事件块 ================= */
   .ev{margin-bottom:9px;animation:evIn .22s cubic-bezier(.2,.7,.3,1)}
@@ -311,6 +312,16 @@
       <span id="runbar-state">执行中…</span>
       <button class="btn-abort" onclick="abortRun()">中断</button>
     </div>
+    <div class="stream" id="stream">
+      <div class="empty">
+        <div class="glyph">🛰️</div>
+        <div>输入任务后点击 <kbd>派发</kbd>，或点击左栏历史运行回放。<br/>
+        事件流将实时展示：<b style="color:var(--think)">思考过程</b> ·
+        <b style="color:var(--warn)">执行的命令</b> ·
+        <b style="color:var(--info)">工具 / skill / MCP 调用</b> ·
+        <b style="color:var(--ac)">计划步骤</b> · 最终结果</div>
+      </div>
+    </div>
     <div class="composer" id="composer">
       <div class="card">
         <textarea id="prompt" placeholder="给 Agent 下发任务…（Ctrl + Enter 派发）"></textarea>
@@ -323,16 +334,6 @@
           </label>
           <button class="btn-primary" id="btn-dispatch" onclick="dispatch()">派发 ▸</button>
         </div>
-      </div>
-    </div>
-    <div class="stream" id="stream">
-      <div class="empty">
-        <div class="glyph">🛰️</div>
-        <div>输入任务后点击 <kbd>派发</kbd>，或点击左栏历史运行回放。<br/>
-        事件流将实时展示：<b style="color:var(--think)">思考过程</b> ·
-        <b style="color:var(--warn)">执行的命令</b> ·
-        <b style="color:var(--info)">工具 / skill / MCP 调用</b> ·
-        <b style="color:var(--ac)">计划步骤</b> · 最终结果</div>
       </div>
     </div>
   </main>
