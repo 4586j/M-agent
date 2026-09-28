@@ -124,13 +124,16 @@ class AgentEvent:
 
     type 取值：
     - ``text_delta``：模型输出的一段文本（data 为 str）
+    - ``thinking``：完整的思考块（data 为 str；仅在未开启增量流时出现）
+    - ``thinking_delta``：思考增量（data 为 str；streaming 开启时优先出现）
     - ``tool_use``：模型发起工具调用（data 为 {"name": ..., "input": ...}）
     - ``tool_result``：工具执行结果回填（data 为结果内容）
+    - ``plan_update``：Plan-Execute 计划状态变化（data 为 plan.to_dict()）
     - ``result``：本轮/本任务终结（data 为统计 dict）
     - ``error``：执行异常（data 为错误字符串）
     """
 
-    type: str  # "text_delta" | "tool_use" | "tool_result" | "result" | "error"
+    type: str  # "text_delta" | "thinking" | "thinking_delta" | "tool_use" | "tool_result" | "plan_update" | "result" | "error"
     data: Any = None
 
 
@@ -169,6 +172,8 @@ def _msg_to_events(msg: Any) -> list[AgentEvent]:
             kind = type(block).__name__
             if kind == "TextBlock":
                 events.append(AgentEvent("text_delta", getattr(block, "text", "") or ""))
+            elif kind == "ThinkingBlock":
+                events.append(AgentEvent("thinking", getattr(block, "thinking", "") or ""))
             elif kind == "ToolUseBlock":
                 events.append(AgentEvent("tool_use", {
                     "name": getattr(block, "name", None),
@@ -191,7 +196,7 @@ def _msg_to_events(msg: Any) -> list[AgentEvent]:
         }))
     elif name == "StreamEvent":
         # SDK include_partial_messages 开启时的增量事件（原始 Anthropic 流事件）。
-        # 只翻译文本增量；thinking/工具入参增量不产出事件。
+        # 翻译文本增量与思考增量；工具入参增量不产出事件（靠完整消息）。
         event = getattr(msg, "event", None)
         if isinstance(event, dict) and event.get("type") == "content_block_delta":
             delta = event.get("delta") or {}
@@ -199,6 +204,10 @@ def _msg_to_events(msg: Any) -> list[AgentEvent]:
                 text = delta.get("text", "") or ""
                 if text:
                     events.append(AgentEvent("text_delta", text))
+            elif delta.get("type") == "thinking_delta":
+                t = delta.get("thinking", "") or ""
+                if t:
+                    events.append(AgentEvent("thinking_delta", t))
     return events
 
 
@@ -213,7 +222,8 @@ class _StreamFilter:
 
     def __init__(self, partial_text: bool):
         self._partial_text = partial_text
-        self._saw_partial = False
+        self._saw_text_partial = False
+        self._saw_think_partial = False
 
     def reset(self) -> None:
         """复位去重标志（每轮 result 到达或流结束/异常路径统一调用）。
@@ -221,29 +231,45 @@ class _StreamFilter:
         中断/异常轮次可能只出现增量、未到达完整 AssistantMessage；不复位的话
         残留标志会把下一轮完整消息的文本误吞。
         """
-        self._saw_partial = False
+        self._saw_text_partial = False
+        self._saw_think_partial = False
 
     def translate(self, msg: Any) -> list[AgentEvent]:
         name = type(msg).__name__
         if name == "StreamEvent":
             evs = _msg_to_events(msg)
-            if any(e.type == "text_delta" for e in evs):
-                self._saw_partial = True
+            for e in evs:
+                if e.type == "text_delta":
+                    self._saw_text_partial = True
+                elif e.type == "thinking_delta":
+                    self._saw_think_partial = True
             return evs
         if name == "ResultMessage":
             # 每轮 result 到达即复位去重标志：无论本轮是否被中断/异常打断，
             # 下一轮完整消息的文本都不应再被误吞
-            self._saw_partial = False
+            self._saw_text_partial = False
+            self._saw_think_partial = False
             return _msg_to_events(msg)
-        if self._partial_text and name == "AssistantMessage" and self._saw_partial:
-            self._saw_partial = False
+        if self._partial_text and name == "AssistantMessage" and (
+                self._saw_text_partial or self._saw_think_partial):
+            # 增量已流出的 Text/Thinking 块跳过（防双份）；ToolUseBlock 保留
+            # ——工具入参增量不翻译为事件，必须靠完整消息。
+            saw_text = self._saw_text_partial
+            saw_think = self._saw_think_partial
+            self._saw_text_partial = False
+            self._saw_think_partial = False
             events: list[AgentEvent] = []
             for block in getattr(msg, "content", []) or []:
-                if type(block).__name__ == "ToolUseBlock":
+                kind = type(block).__name__
+                if kind == "ToolUseBlock":
                     events.append(AgentEvent("tool_use", {
                         "name": getattr(block, "name", None),
                         "input": getattr(block, "input", None),
                     }))
+                elif kind == "TextBlock" and not saw_text:
+                    events.append(AgentEvent("text_delta", getattr(block, "text", "") or ""))
+                elif kind == "ThinkingBlock" and not saw_think:
+                    events.append(AgentEvent("thinking", getattr(block, "thinking", "") or ""))
             return events
         return _msg_to_events(msg)
 
@@ -589,6 +615,30 @@ class AgentSession:
         return self._total_turns
 
 
+class _RunEventEmitter:
+    """run 级事件发射器：给每条事件盖序号与时间戳后转发外部 sink。
+
+    run_oneshot / stream 统一经此把 AgentEvent 与 plan_update 等节点事件
+    回调给调用方（service 层据此落 JSONL 供面板实时流与回放）。
+    sink 异常吞掉并告警——观测失效绝不能拖垮执行主流程。
+    """
+
+    def __init__(self, run_id: str, sink: Any):
+        self.run_id = run_id
+        self._sink = sink
+        self.seq = 0
+
+    def emit(self, ev_type: str, data: Any) -> None:
+        self.seq += 1
+        try:
+            self._sink(self.run_id, {
+                "seq": self.seq, "ts": round(time.time(), 3),
+                "type": ev_type, "data": data,
+            })
+        except Exception:  # noqa: BLE001 - 观测失效不拖垮执行
+            log.warning("event_sink 回调异常（seq=%d）", self.seq, exc_info=True)
+
+
 class AgentKernel:
     """统一 Agent 执行内核。
 
@@ -750,7 +800,9 @@ class AgentKernel:
     def run_oneshot(self, prompt: str, persona: Persona, cwd: str,
                     context_memory: str = "",
                     cancel_event: Any = None, resume: bool = False,
-                    record_experience: bool = True) -> KernelResult:
+                    record_experience: bool = True,
+                    run_id: str | None = None,
+                    event_sink: Any = None) -> KernelResult:
         """同步单发执行。
 
         内部调用 _run_async(...)，并施加墙钟超时（task_timeout）。
@@ -770,6 +822,9 @@ class AgentKernel:
         """
         self._last_progress = {}  # 重置进度快照，防上一任务残留误透传
         tracer = ExecutionTracer("run_oneshot")
+        # 事件发射器（可选）：面板/持久化消费每一步 AgentEvent 与计划状态
+        emitter = (_RunEventEmitter(run_id, event_sink)
+                   if (run_id and event_sink) else None)
         # 整任务截止点（P0）：在入口（admission）即起算，贯穿核心执行、自纠错
         # 与验证，使各阶段共享同一份墙钟预算，纠错/重试不再游离于主超时之外。
         deadline = _Deadline(self.config.task_timeout)
@@ -797,11 +852,12 @@ class AgentKernel:
 
         if use_planning:
             core = self._execute_plan_engine(prompt, persona, cwd, context_memory,
-                                             cancel_event, resume)
+                                             cancel_event, resume, emitter=emitter)
         else:
             # 输出质量守卫：普通单轮路径带退化检测与三级兜底（默认开，可关）。
             core = self._execute_oneshot_guarded(prompt, persona, cwd,
-                                                 context_memory, cancel_event)
+                                                 context_memory, cancel_event,
+                                                 emitter=emitter)
 
         async def _run_with_timeout() -> KernelResult:
             # 用整任务截止点的剩余时间作为核心执行上限（入口时≈task_timeout）。
@@ -845,7 +901,7 @@ class AgentKernel:
         if use_correction and not result.cancelled and not result.is_error:
             result = self._run_correction_loop(
                 result, prompt, persona, cwd, context_memory, cancel_event, tracer,
-                deadline)
+                deadline, emitter=emitter)
 
         # artifacts 收集：仅在未取消/未报错且 cwd 存在时扫描产物文件
         if not result.cancelled and not result.is_error:
@@ -1018,7 +1074,7 @@ class AgentKernel:
 
     async def _execute_plan_engine(self, prompt: str, persona: Persona, cwd: str,
                                    context_memory: str, cancel_event: Any,
-                                   resume: bool) -> KernelResult:
+                                   resume: bool, emitter: Any = None) -> KernelResult:
         """Plan-Execute 两阶段引擎（config.planning_enabled 时由 run_oneshot 接管）。
 
         流程：
@@ -1071,6 +1127,8 @@ class AgentKernel:
                             s.status = "pending"
                             s.output = ""
                     mgr.save_plan(session_id, plan)
+                    if emitter:
+                        emitter.emit("plan_update", plan.to_dict())
                 log.info("resume plan %s (%d steps, goal=%s)", session_id,
                          len(plan.steps), plan.goal)
 
@@ -1081,7 +1139,8 @@ class AgentKernel:
                                + f"\n\n[任务]\n{prompt}")
             planning_prompt = build_planning_prompt(planning_prompt)
             planning_prompt = self.rag_enrich(planning_prompt)
-            plan_round = await self._run_sdk_query(planning_prompt, options, cancel_event)
+            plan_round = await self._run_sdk_query(planning_prompt, options, cancel_event,
+                                                   emitter=emitter)
             acc.absorb(plan_round)
             if plan_round.cancelled:
                 return acc.result(output=plan_round.output or "(无输出)",
@@ -1128,7 +1187,8 @@ class AgentKernel:
                     else:
                         log.warning("计划无法自动修复，降级为单轮执行")
                         fallback = await self._execute_oneshot(
-                            prompt, persona, cwd, context_memory, cancel_event)
+                            prompt, persona, cwd, context_memory, cancel_event,
+                            emitter=emitter)
                         acc.absorb(fallback)
                         return acc.result(
                             output=fallback.output,
@@ -1138,6 +1198,8 @@ class AgentKernel:
                 if vresult.warnings:
                     log.info("计划验证警告：%s", "; ".join(vresult.warnings))
             mgr.save_plan(session_id, plan)
+            if emitter:
+                emitter.emit("plan_update", plan.to_dict())
 
         # 3. 步骤轮：逐步骤驱动
         replanned = False
@@ -1155,7 +1217,8 @@ class AgentKernel:
             for attempt in range(_PLAN_STEP_MAX_RETRIES + 1):
                 options = self._build_options(persona, cwd, query=step_prompt)
                 step_round = await self._run_sdk_query(
-                    self.rag_enrich(step_prompt), options, cancel_event)
+                    self.rag_enrich(step_prompt), options, cancel_event,
+                    emitter=emitter)
                 acc.absorb(step_round)
                 if step_round.cancelled:
                     return acc.result(output=step_round.output or _plan_summary(plan),
@@ -1166,6 +1229,8 @@ class AgentKernel:
                     step.status = "done"
                     step.output = step_round.output
                     mgr.save_plan(session_id, plan)
+                    if emitter:
+                        emitter.emit("plan_update", plan.to_dict())
                     success = True
                     break
                 if attempt < _PLAN_STEP_MAX_RETRIES:
@@ -1177,6 +1242,8 @@ class AgentKernel:
                 step.status = "failed"
                 step.output = (last_output or "")[:500]
                 mgr.save_plan(session_id, plan)
+                if emitter:
+                    emitter.emit("plan_update", plan.to_dict())
                 # 动态重规划（plan_replan_enabled 时尝试重新规划而非直接终止）
                 if (getattr(self.config, "plan_replan_enabled", True)
                         and not replanned):
@@ -1196,7 +1263,7 @@ class AgentKernel:
                                                          query=replan_prompt)
                     replan_round = await self._run_sdk_query(
                         self.rag_enrich(build_planning_prompt(replan_prompt)),
-                        replan_options, cancel_event)
+                        replan_options, cancel_event, emitter=emitter)
                     acc.absorb(replan_round)
                     new_plan = parse_plan_from_output(replan_round.output)
                     if new_plan and new_plan.steps:
@@ -1222,6 +1289,8 @@ class AgentKernel:
                         if replan_ok:
                             plan = merged
                             mgr.save_plan(session_id, plan)
+                            if emitter:
+                                emitter.emit("plan_update", plan.to_dict())
                             replanned = True
                             log.info("重新规划成功，新计划 %d 个步骤",
                                      len(plan.steps))
@@ -1266,7 +1335,8 @@ class AgentKernel:
 
     async def _execute_oneshot(self, prompt: str, persona: Persona, cwd: str,
                                context_memory: str, cancel_event: Any,
-                               retry_hint: str = "") -> KernelResult:
+                               retry_hint: str = "",
+                               emitter: Any = None) -> KernelResult:
         """异步单轮执行：拼装用户消息前缀与 RAG 后消费 sdk.query() 消息流。
 
         retry_hint（退化重试纠偏提示）：非空时追加到用户消息末尾——
@@ -1280,7 +1350,8 @@ class AgentKernel:
         full_prompt = self.rag_enrich(full_prompt)
         if retry_hint:
             full_prompt = f"{full_prompt}\n\n{retry_hint}"
-        return await self._run_sdk_query(full_prompt, options, cancel_event)
+        return await self._run_sdk_query(full_prompt, options, cancel_event,
+                                         emitter=emitter)
 
     def _guard_persona_with_model(self, persona: Persona, model: str) -> Persona:
         """复制 persona 并覆盖 model（退化第 2 次重试换 fallback_model 用）。
@@ -1295,7 +1366,8 @@ class AgentKernel:
 
     async def _execute_oneshot_guarded(self, prompt: str, persona: Persona,
                                        cwd: str, context_memory: str,
-                                       cancel_event: Any) -> KernelResult:
+                                       cancel_event: Any,
+                                       emitter: Any = None) -> KernelResult:
         """单轮执行 + 退化输出三级兜底（config.output_guard_enabled，默认开）。
 
         流程：执行 → detect_degenerate 检测（tool 轮无文本/取消/错误轮跳过）
@@ -1317,7 +1389,7 @@ class AgentKernel:
         （recovered）口径返回。
         """
         result = await self._execute_oneshot(prompt, persona, cwd, context_memory,
-                                             cancel_event)
+                                             cancel_event, emitter=emitter)
         if (not getattr(self.config, "output_guard_enabled", True)
                 or result.cancelled or result.is_error
                 or result.output in ("", "(无输出)")):
@@ -1382,7 +1454,7 @@ class AgentKernel:
             hint = _GUARD_RETRY_HINT.format(reason=reasons[-1])
             retry = await self._execute_oneshot(prompt, persona_try, cwd,
                                                 context_memory, cancel_event,
-                                                retry_hint=hint)
+                                                retry_hint=hint, emitter=emitter)
             acc.absorb(retry)
             last = retry
             if retry.cancelled:
@@ -1449,7 +1521,8 @@ class AgentKernel:
                              persona: Persona, cwd: str, context_memory: str,
                              cancel_event: Any,
                              tracer: ExecutionTracer,
-                             deadline: "_Deadline | None" = None) -> KernelResult:
+                             deadline: "_Deadline | None" = None,
+                             emitter: Any = None) -> KernelResult:
         """自纠错闭环：对成功的执行结果做结构化验证，失败则修正重试。
 
         流程：validate_output -> 验证通过则直接返回 -> 验证失败则构造
@@ -1518,7 +1591,8 @@ class AgentKernel:
                 hint = build_correction_hint(verdict)
                 corrected_prompt = f"{prompt}\n\n{hint}"
                 coro = self._execute_oneshot(corrected_prompt, persona, cwd,
-                                             context_memory, cancel_event)
+                                             context_memory, cancel_event,
+                                             emitter=emitter)
                 if remaining is not None:
                     # 修正轮也受剩余预算约束，不获得无限期的新超时。
                     coro = asyncio.wait_for(coro, timeout=remaining)
@@ -1564,7 +1638,8 @@ class AgentKernel:
             error_type="validation_failed" if hard_fail else "")
 
     async def _run_sdk_query(self, full_prompt: str, options: Any,
-                             cancel_event: Any) -> KernelResult:
+                             cancel_event: Any,
+                             emitter: Any = None) -> KernelResult:
         """消费 sdk.query() 的消息流（prompt 已拼装好），聚合为 KernelResult。
 
         从 _execute_oneshot 拆出的消息循环：单轮执行与 Plan-Execute 引擎
@@ -1581,9 +1656,16 @@ class AgentKernel:
         duration_ms = 0
         session_id: str | None = None
         saw_result = False  # 是否收到终结 ResultMessage（缺失=流异常提前结束）
+        # 事件发射（可选）：oneshot 本无事件流出，接了 sink 后经 _StreamFilter
+        # 翻译同样的 AgentEvent 序列（增量去重语义与 stream() 一致）
+        flt = _StreamFilter(partial_text=bool(self.config.streaming)) if emitter else None
 
         async for msg in sdk.query(prompt=full_prompt, options=options):
             name = type(msg).__name__
+            if emitter is not None:
+                for ev in flt.translate(msg):
+                    if ev.type != "result":
+                        emitter.emit(ev.type, ev.data)
             if name == "AssistantMessage":
                 for block in getattr(msg, "content", []) or []:
                     if type(block).__name__ == "TextBlock":
@@ -1603,6 +1685,12 @@ class AgentKernel:
                     cost_usd = c
                 duration_ms = int(getattr(msg, "duration_ms", 0) or 0)
                 session_id = getattr(msg, "session_id", None)
+                if emitter is not None:
+                    emitter.emit("result", {
+                        "result": final_result, "num_turns": turns,
+                        "is_error": is_error, "usage": usage,
+                        "cost_usd": cost_usd, "duration_ms": duration_ms,
+                        "session_id": session_id})
 
             # 协作式取消：在消息边界检查，当前 turn 结束即停
             if cancel_event is not None and cancel_event.is_set():
@@ -1641,7 +1729,8 @@ class AgentKernel:
         return _rag_enrich(prompt, self.config, context_budget=context_budget)
 
     async def stream(self, prompt: str, persona: Persona, cwd: str,
-                     context_memory: str = "") -> AsyncIterator[AgentEvent]:
+                     context_memory: str = "", run_id: str | None = None,
+                     event_sink: Any = None) -> AsyncIterator[AgentEvent]:
         """流式执行，边消费边 yield AgentEvent。供 CLI 打印和 HTTP SSE 使用。
 
         墙钟截止（P0）：与 oneshot 同口径，取 config.task_timeout 为整轮上限
@@ -1672,6 +1761,8 @@ class AgentKernel:
         if isinstance(task_timeout, (int, float)) and task_timeout > 0:
             deadline = time.monotonic() + task_timeout
         saw_result = False
+        emitter = (_RunEventEmitter(run_id, event_sink)
+                   if (run_id and event_sink) else None)
         try:
             ait = sdk.query(prompt=full_prompt, options=options).__aiter__()
             while True:
@@ -1698,6 +1789,8 @@ class AgentKernel:
                 for ev in flt.translate(msg):
                     if ev.type == "result":
                         saw_result = True
+                    if emitter is not None and ev.type != "result":
+                        emitter.emit(ev.type, ev.data)
                     yield ev
         except Exception as e:  # noqa: BLE001 - 流式异常转 error 事件（人性化）
             flt.reset()  # 流结束/异常路径统一复位去重标志，防残留误吞后续轮次

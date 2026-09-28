@@ -26,6 +26,11 @@ class TextBlock:
         self.text = text
 
 
+class ThinkingBlock:
+    def __init__(self, thinking):
+        self.thinking = thinking
+
+
 class ToolUseBlock:
     def __init__(self, name, input=None):
         self.name = name
@@ -561,14 +566,35 @@ def test_msg_to_events_stream_event_text_delta():
 
 
 def test_msg_to_events_stream_event_ignores_non_text():
-    # thinking / 工具入参增量 / 其他类型不产出事件
+    # 工具入参增量与其他类型不产出事件；thinking 增量改为产出（面板需要）
     thinking = StreamEvent({"type": "content_block_delta",
                             "delta": {"type": "thinking_delta", "thinking": "x"}})
     tool_json = StreamEvent({"type": "content_block_delta",
                              "delta": {"type": "input_json_delta", "partial_json": "{}"}})
     other = StreamEvent({"type": "message_start"})
-    for ev in (thinking, tool_json, other):
+    assert [(e.type, e.data) for e in _msg_to_events(thinking)] == [
+        ("thinking_delta", "x")]
+    for ev in (tool_json, other):
         assert _msg_to_events(ev) == []
+
+
+def test_msg_to_events_thinking_block():
+    # 完整 AssistantMessage 的 ThinkingBlock 翻译为 thinking 事件
+    msg = AssistantMessage([ThinkingBlock("推演中"), TextBlock("答案")])
+    evs = _msg_to_events(msg)
+    assert [(e.type, e.data) for e in evs] == [("thinking", "推演中"), ("text_delta", "答案")]
+
+
+def test_stream_filter_dedup_thinking_partial_and_full():
+    """thinking 增量与完整块去重：增量流出后完整消息的 ThinkingBlock 跳过。"""
+    flt = kernel_module._StreamFilter(partial_text=True)
+    flt.translate(StreamEvent({"type": "content_block_delta",
+                               "delta": {"type": "thinking_delta", "thinking": "思"}}))
+    full = AssistantMessage([ThinkingBlock("思考全文"), TextBlock("答")])
+    evs = flt.translate(full)
+    # 增量已流出 → 完整 ThinkingBlock 跳过；TextBlock 无增量前缀 → 保留
+    assert [e.type for e in evs] == ["text_delta"]
+    assert evs[0].data == "答"
 
 
 def test_stream_filter_dedup_partial_and_full_message():

@@ -134,12 +134,16 @@ class RunHistoryStore:
 
 
 def build_run_record(prompt: str, persona: str, model: str,
-                     result_dict: dict) -> dict:
-    """从 KernelResult dict 构建运行历史记录。"""
+                     result_dict: dict, run_id: str | None = None) -> dict:
+    """从 KernelResult dict 构建运行历史记录。
+
+    run_id 可选：传入时用同一 id 与 runs/<id>.jsonl 事件流对齐
+    （面板按 run_id 同时查事件回放与 trace）；缺省生成新 uuid。
+    """
     meta = result_dict.get("meta") or {}
     trace = meta.get("trace")
     return {
-        "run_id": str(uuid.uuid4()),
+        "run_id": run_id or str(uuid.uuid4()),
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "prompt_preview": prompt[:200] if prompt else "",
         "persona": persona,
