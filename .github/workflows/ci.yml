@@ -128,18 +128,61 @@ jobs:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: python -m pytest agent_core/tests -q -m sdk_smoke
 
-  frontend-build:
-    name: 前端构建（node 20 + vite）
+  frontend:
+    name: 前端（Vitest 单测 + 构建，门禁）   # 硬门禁：前端挂了阻塞合并
     runs-on: ubuntu-latest
-    continue-on-error: true  # 前端构建失败不阻塞主流程
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 20
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
       - name: 安装依赖
+        run: |
+          pip install -r workspace/agent/orchestrator/runtime/requirements.txt
+          pip install -e ./agent_core
+          pip install pytest
+      - name: 安装前端依赖
         working-directory: web
         run: npm install
+      - name: Vitest 单测
+        working-directory: web
+        run: npm test
       - name: 构建
         working-directory: web
         run: npm run build
+
+  # Playwright UI E2E：Agent 面板 + 编排面板（Linux 自起 service/brain）
+  ui-e2e:
+    name: Playwright UI E2E（Agent 面板 / 编排面板）
+    runs-on: ubuntu-latest
+    env:
+      CI: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: 安装后端依赖（service/brain 需要）
+        run: |
+          pip install -r workspace/agent/orchestrator/runtime/requirements.txt
+          pip install -e ./agent_core
+      - name: 前端依赖 + chromium
+        working-directory: web
+        run: |
+          npm install
+          npx playwright install --with-deps chromium
+      - name: 构建 dist（编排面板测试由 brain 托管）
+        working-directory: web
+        run: npm run build
+      - name: Agent 面板 E2E
+        working-directory: web
+        run: npx playwright test
+      - name: 编排面板 E2E
+        working-directory: web
+        run: npx playwright test --config=playwright.orchest.config.js

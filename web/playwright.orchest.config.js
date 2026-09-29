@@ -1,9 +1,23 @@
 import { defineConfig } from '@playwright/test';
+import { fileURLToPath } from 'node:url';
+import path from 'node:path';
 
-// 编排面板（web/ dist）UI E2E。
-// 面由 brain_api(7000) 同源托管 web/dist，local 空数据。
-// 说明：Windows 下 node spawn 解析 python 的 PATH 不稳，brain 由外部脚本/CI 手动或
-// 经 workflow 启动；此处 webServer 用占位命令 + reuseExistingServer 复用手动进程。
+// 编排面板（web/ dist）UI E2E。面由 brain_api(7000) 同源托管 web/dist，local 空数据。
+// webServer 双态：
+//  - CI 环境：起真实 brain（uvicorn 托管 build 后的 dist）
+//  - 本地 Windows：占位 + reuseExistingServer（node 解析 python 的 PATH 在此环境不稳，
+//    由外部手动起 brain 提供 7000）
+const webDir = path.dirname(fileURLToPath(import.meta.url));
+const runtimeDir = path.resolve(webDir, '../workspace/agent/orchestrator/runtime');
+const distDir = path.resolve(webDir, 'dist');
+
+const realServerCommand =
+  `bash -c 'cd ${runtimeDir} && ` +
+  `ORCH_MODE=local ` +
+  `ORCH_TASK_STORE_DIR=${runtimeDir}/.e2e_ci_tasks ` +
+  `ORCH_WEB_DIST=${distDir} ` +
+  `python -m uvicorn brain_api:_build_app --factory --port 7000 --log-level warning'`;
+
 export default defineConfig({
   testDir: './e2e',
   testMatch: 'orchest-panel.spec.js',
@@ -15,8 +29,7 @@ export default defineConfig({
     screenshot: 'only-on-failure',
   },
   webServer: {
-    // 占位：本机测试由外部已启动的 brain(7000) 提供；reuseExistingServer 复用。
-    command: 'node -e "setTimeout(()=>{}, 120000)"',
+    command: process.env.CI ? realServerCommand : 'node -e "setTimeout(()=>{}, 120000)"',
     url: 'http://127.0.0.1:7000/stats',
     reuseExistingServer: true,
     timeout: 30_000,
