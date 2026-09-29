@@ -688,9 +688,7 @@ function handleEvent(ev, data){
       pre.textContent = typeof content === 'string' ? content.slice(0, 2200) : JSON.stringify(content).slice(0, 2200);
       if(data && data.is_error) pre.classList.add('err');
       sect.style.display = 'block';
-      if(termX) termWrite('
-[工具结果已写入上方卡片]
-', 'info');
+      if(termX) termWrite('\n[工具结果已写入上方卡片]\n', 'info');
     }
     return;
   }
