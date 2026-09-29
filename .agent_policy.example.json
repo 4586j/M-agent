@@ -1,0 +1,8 @@
+{
+  "workspace_boundary": {
+    "enforce": true,
+    "scan_command_paths": true,
+    "confirm_granularity": "per_action",
+    "extra_allowed_dirs": ["D:/shared-libs", "C:/Users/me/projects/trusted"]
+  }
+}
