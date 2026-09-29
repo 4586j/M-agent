@@ -9,7 +9,9 @@
     "preview": "vite preview",
     "test": "vitest run",
     "test:watch": "vitest",
-    "test:e2e": "playwright test"
+    "test:e2e": "playwright test",
+    "test:e2e:panel": "playwright test",
+    "test:e2e:orchest": "playwright test --config=playwright.orchest.config.js"
   },
   "dependencies": {
     "react": "^18.3.1",
