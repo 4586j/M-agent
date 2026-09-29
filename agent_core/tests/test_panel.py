@@ -320,3 +320,75 @@ def test_prepare_cwd_rejects_outside():
     with _pytest.raises(HTTPException) as ei:
         service._prepare_cwd(str(Path(service._workspace_path()).parent), tag="x")
     assert ei.value.status_code == 400
+
+
+# ---- 策略配置化（.agent_policy.json） ----
+
+def test_policy_enforce_false_disables_boundary(client, monkeypatch, tmp_path, project_root):
+    """enforce=false 时终端越界直接放行（总开关生效）。"""
+    monkeypatch.setenv("AGENT_API_KEY", "k1")
+    policy_file = Path(project_root) / ".agent_policy.json"
+    monkeypatch.setattr(service, "_POLICY", None)  # 重置缓存
+    policy_file.write_text(json.dumps(
+        {"workspace_boundary": {"enforce": False}}), encoding="utf-8")
+    outside = tmp_path / "pol_outside"
+    outside.mkdir(exist_ok=True)
+    with client.websocket_connect("/agent/terminal?api_key=k1") as ws:
+        ws.receive_json()
+        ws.send_json({"type": "run", "cmd": f"cd {outside}"})
+        msgs = []
+        while True:
+            m = ws.receive_json()
+            msgs.append(m)
+            if m["type"] == "done":
+                break
+        assert not any(m["type"] == "confirm" for m in msgs)
+        assert msgs[-1]["code"] == 0
+
+
+def test_policy_extra_allowed_dirs_passthrough(client, monkeypatch, tmp_path, project_root):
+    """extra_allowed_dirs 预授权目录：命令涉及该目录不再逐次确认。"""
+    monkeypatch.setenv("AGENT_API_KEY", "k1")
+    policy_file = Path(project_root) / ".agent_policy.json"
+    monkeypatch.setattr(service, "_POLICY", None)
+    outside_parent = tmp_path / "pol_parent"
+    outside_parent.mkdir(exist_ok=True)
+    policy_file.write_text(json.dumps(
+        {"workspace_boundary": {"extra_allowed_dirs": [str(outside_parent)]}}),
+        encoding="utf-8")
+    with client.websocket_connect("/agent/terminal?api_key=k1") as ws:
+        ws.receive_json()
+        ws.send_json({"type": "run", "cmd": f"dir {outside_parent}"})
+        msgs = []
+        while True:
+            m = ws.receive_json()
+            msgs.append(m)
+            if m["type"] == "done":
+                break
+        assert not any(m["type"] == "confirm" for m in msgs)
+
+
+def test_policy_granularity_in_confirm_frame(client, monkeypatch):
+    """confirm 帧携带策略 granularity（per_action 默认）。"""
+    monkeypatch.setenv("AGENT_API_KEY", "k1")
+    with client.websocket_connect("/agent/terminal?api_key=k1") as ws:
+        ws.receive_json()
+        ws.send_json({"type": "run", "cmd": "cd .."})
+        confirm = None
+        while True:
+            m = ws.receive_json()
+            if m["type"] == "confirm":
+                confirm = m
+            if m["type"] == "done":
+                break
+        assert confirm and confirm["granularity"] == "per_action"
+
+
+def test_policy_file_corruption_falls_back(client, monkeypatch, project_root):
+    """策略文件损坏 → 静默回退默认（边界保持 enforce）。"""
+    policy_file = Path(project_root) / ".agent_policy.json"
+    monkeypatch.setattr(service, "_POLICY", None)
+    policy_file.parent.mkdir(parents=True, exist_ok=True)
+    policy_file.write_text("{ 不是 JSON", encoding="utf-8")
+    policy = service._load_policy()
+    assert policy["workspace_boundary"]["enforce"] is True
