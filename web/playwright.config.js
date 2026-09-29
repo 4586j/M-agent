@@ -4,6 +4,7 @@ import { defineConfig } from '@playwright/test';
 // 依赖 agent_core.service 提供 /panel 与 WebSocket 端点（webServer 自动拉起）。
 export default defineConfig({
   testDir: './e2e',
+  testMatch: 'panel.spec.js',  // Agent 面板专用（编排面板在 orchestrh.config）
   timeout: 30_000,
   fullyParallel: false,
   workers: 1,
