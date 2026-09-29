@@ -305,6 +305,39 @@ def resolve_persona(name: str) -> Persona:
     return persona
 
 
+_POLICY: dict | None = None
+_POLICY_DEFAULT: dict = {
+    "workspace_boundary": {
+        "enforce": True,                 # 总开关：false 则终端/任务不再拦截越界
+        "scan_command_paths": True,      # 扫描命令中的绝对路径（cd 检查不受此项控制）
+        "confirm_granularity": "per_action",  # per_action（逐次确认）| per_session（前端默认发会话授权）
+        "extra_allowed_dirs": [],        # 预授权目录（命中前缀即放行，不再逐次确认）
+    },
+}
+
+
+def _load_policy() -> dict:
+    """加载工作区边界策略：<project_root>/.agent_policy.json（缺省用内置默认）。
+
+    文件缺失/字段缺失/JSON 损坏均静默回退默认——策略是增强，不是依赖。
+    """
+    global _POLICY
+    if _POLICY is not None:
+        return _POLICY
+    merged = json.loads(json.dumps(_POLICY_DEFAULT))  # 深拷贝内置默认
+    try:
+        pf = Path(get_config().project_root or os.getcwd()) / ".agent_policy.json"
+        if pf.exists():
+            user = json.loads(pf.read_text(encoding="utf-8"))
+            wb = user.get("workspace_boundary", {})
+            merged["workspace_boundary"].update(
+                {k: v for k, v in wb.items() if k in merged["workspace_boundary"]})
+    except Exception:  # noqa: BLE001 - 策略文件损坏回退默认
+        pass
+    _POLICY = merged
+    return merged
+
+
 def _workspace_path() -> Path:
     """当前工作区（agent 默认只能在此范围内操作）。
 
@@ -335,9 +368,12 @@ def _scan_outside_paths(text: str, root: Path | None = None) -> list[str]:
     """扫描文本中的绝对路径，返回越出工作区的前缀（去重，最多 3 个）。
 
     用于终端命令/参数的工作区边界检查：宁可多问一次，不放过越界写入。
-    识别 Windows 盘符路径（C:\\x、C:/x）与类 Unix 绝对路径（/x）。
+    识别 Windows 盘符路径与类 Unix 绝对路径；策略 extra_allowed_dirs
+    中的预授权目录不算越界。
     """
     root = root or _workspace_path()
+    extra_dirs = [Path(d) for d in (_load_policy()["workspace_boundary"]
+                                    .get("extra_allowed_dirs") or [])]
     hits: list[str] = []
     pattern = r'[A-Za-z]:[\\/][^\s"\'|&;<>)]*|(?<![\w.\\/-])/[^\s"\'|&;<>)]+'
     for m in re.finditer(pattern, text):
@@ -351,6 +387,8 @@ def _scan_outside_paths(text: str, root: Path | None = None) -> list[str]:
             continue
         if _in_workspace(p, root):
             continue
+        if any(p == d or d in p.parents for d in extra_dirs if d.exists()):
+            continue  # 预授权目录命中，放行
         prefix = str(p if p.is_dir() else p.parent)
         if prefix not in hits:
             hits.append(prefix)
@@ -968,7 +1006,11 @@ def create_terminal_router() -> APIRouter:
             if not raw:
                 await ws.send_json({"type": "done", "code": 0, "cwd": session["cwd"]})
                 return
-            allowed = allow_once or session.get("outside_allowed")
+            policy = _load_policy()["workspace_boundary"]
+            enforce = policy.get("enforce", True)
+            granularity = policy.get("confirm_granularity", "per_action")
+            allowed = (allow_once or session.get("outside_allowed")
+                       or not enforce)
             # cd 特判优先（含越界确认），支持 cd /d 跨盘、~、相对路径、引号
             m = re.match(r'^(cd|chdir|set-location)\s*(.*)$', raw, re.I)
             if m:
@@ -983,11 +1025,15 @@ def create_terminal_router() -> APIRouter:
                     p = p.resolve()
                 except OSError:
                     p = None
+                extra_dirs = [Path(d) for d in (policy.get("extra_allowed_dirs") or [])]
                 if p is not None and p.is_dir():
-                    if not allowed and not _in_workspace(p, ws_root):
+                    if (not allowed and not _in_workspace(p, ws_root)
+                            and not any(p == d or d in p.parents
+                                        for d in extra_dirs if d.exists())):
                         await ws.send_json({
                             "type": "confirm", "kind": "cd", "cmd": raw,
                             "paths": [str(p)], "workspace": str(ws_root),
+                            "granularity": granularity,
                             "message": "目标目录在工作区之外，是否允许进入？"})
                         await ws.send_json({"type": "done", "code": 1,
                                             "cwd": session["cwd"]})
@@ -1006,6 +1052,7 @@ def create_terminal_router() -> APIRouter:
                     await ws.send_json({
                         "type": "confirm", "kind": "path", "cmd": raw,
                         "paths": outside, "workspace": str(ws_root),
+                        "granularity": granularity,
                         "message": "该命令涉及工作区外的路径，是否允许访问？"})
                     await ws.send_json({"type": "done", "code": 1,
                                         "cwd": session["cwd"]})
@@ -1459,8 +1506,12 @@ def create_history_router() -> APIRouter:
         }
 
     @router.get("/agent/trace/{run_id}")
-    def agent_trace(run_id: str) -> dict:
+    def agent_trace(run_id: str, format: str = "json") -> Any:
         """查询单次执行的 trace 详情。
+
+        format=json（默认）返回内部 span 树；format=otlp 返回 OTLP/JSON
+        （resourceSpans）形状——可直接 POST 到 OTLP/HTTP collector
+        （Phoenix/Langfuse/Jaeger 均兼容），或存档后用标准工具回看。
 
         面板的 run_id（runs/<id>）与历史库 run_id 现已统一；仍兼容
         仅存在于历史库的旧记录（先查历史，miss 再回退读事件流末帧结果）。
@@ -1488,6 +1539,13 @@ def create_history_router() -> APIRouter:
                             "note": "该 run 未落 trace 树（流式路径），以上为终态统计"}
             return _error(404, "not_found", f"运行记录不存在: {run_id}")
         trace = record.get("trace")
+        if format == "otlp":
+            from agent_core.otlp_export import span_tree_to_otlp
+            return span_tree_to_otlp(
+                trace or {}, run_id=run_id,
+                attributes={"prompt_preview": (record.get("prompt_preview") or "")[:200],
+                            "persona": record.get("persona") or "",
+                            "model": record.get("model") or ""})
         if trace is None:
             return {"trace": None, "message": "该次执行未记录 trace"}
         return {"run_id": run_id, "trace": trace}
