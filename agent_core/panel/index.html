@@ -344,6 +344,10 @@
   /* 内嵌终端 */
   .term{flex:1;display:none;flex-direction:column;overflow:hidden;background:var(--bg-0)}
   .term.show{display:flex}
+  #term-xterm{flex:1;min-height:0;padding:8px 10px}
+  .term.xterm-on #term-out{display:none}
+  .term.xterm-on #term-xterm{display:block}
+  #term-xterm.fallback{display:none}
   .term-out{flex:1;overflow-y:auto;padding:12px 16px;font:400 12.5px/1.65 var(--mono);
     color:var(--fg-2);white-space:pre-wrap;word-break:break-all}
   .term-out .cmd{color:var(--ac);font-weight:600}
@@ -431,6 +435,7 @@
       </div>
     </div>
     <div class="term" id="term-view">
+      <div id="term-xterm"></div>
       <div class="term-out" id="term-out"></div>
       <div class="term-bar">
         <span class="term-cwd" id="term-cwd">未连接</span>
@@ -683,6 +688,9 @@ function handleEvent(ev, data){
       pre.textContent = typeof content === 'string' ? content.slice(0, 2200) : JSON.stringify(content).slice(0, 2200);
       if(data && data.is_error) pre.classList.add('err');
       sect.style.display = 'block';
+      if(termX) termWrite('
+[工具结果已写入上方卡片]
+', 'info');
     }
     return;
   }
@@ -972,16 +980,70 @@ function editWorkspace(){
 
 /* ================= 内嵌终端（WebSocket 直连，持久 cwd 会话） ================= */
 let termWS = null, termBusy = false, termHistory = [], termHistIdx = 0;
+let termX = null;  // xterm 实例（CDN 加载成功后启用；失败降级 DOM 输出）
 const TERM_HIST_KEY = 'agent_panel_term_history';
+
+function loadScriptOnce(src) {
+  return new Promise((resolve, reject) => {
+    if (document.querySelector(`script[src="${src}"]`)) return resolve();
+    const s = document.createElement('script');
+    s.src = src; s.onload = resolve; s.onerror = () => reject(new Error('load ' + src));
+    document.head.appendChild(s);
+  });
+}
+
+async function ensureXterm(){
+  if (termX) return true;
+  if (window.__xtermFailed) return false;
+  try{
+    await loadScriptOnce('https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.min.js');
+    await loadScriptOnce('https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.min.js');
+    if (!window.Terminal) throw new Error('no Terminal');
+    termX = new window.Terminal({
+      convertEol: true, fontSize: 12.5,
+      fontFamily: "'JetBrains Mono','Cascadia Code',monospace",
+      theme: { background: '#080a0f', foreground: '#c9d4e3',
+               cursor: '#3ddc84', selectionBackground: 'rgba(61,220,132,.28)',
+               black: '#0d1017', brightBlack: '#71809a' },
+      scrollback: 5000, disableStdin: true,
+    });
+    const fit = new window.FitAddon.FitAddon();
+    termX.loadAddon(fit);
+    termX.open($('term-xterm'));
+    fit.fit();
+    $('term-view').classList.add('xterm-on');
+    window.addEventListener('resize', () => { try{ fit.fit(); }catch(e){} });
+    termX.writeln('\x1b[90m[终端就绪 · 输入命令直接执行]\x1b[0m');
+    return true;
+  }catch(e){
+    window.__xtermFailed = true;
+    $('term-xterm').classList.add('fallback');
+    termPrint('[xterm 不可用，降级纯文本输出]\n', 'info');
+    return false;
+  }
+}
+function termWrite(text, cls){
+  if (termX){
+    const color = cls === 'cmd' ? '\x1b[1;32m' : cls === 'err' ? '\x1b[31m'
+                : cls === 'info' ? '\x1b[90m' : '';
+    termX.write(color + text + (color ? '\x1b[0m' : ''));
+  } else {
+    termPrint(text, cls);
+  }
+}
 
 function switchView(v){
   const isTerm = v === 'terminal';
   $('stream').style.display = isTerm ? 'none' : '';
   $('composer').style.display = isTerm ? 'none' : '';
   $('term-view').classList.toggle('show', isTerm);
+  $('term-view').classList.toggle('xterm-on', isTerm && !!termX);
   $('vt-stream').classList.toggle('active', !isTerm);
   $('vt-terminal').classList.toggle('active', isTerm);
-  if(isTerm){ termConnect(); $('term-in').focus(); }
+  if(isTerm){
+    termConnect();
+    ensureXterm().then(() => { if(!termX) $('term-out').classList.remove('fallback'); $('term-in').focus(); });
+  }
 }
 
 function termConnect(){
@@ -1016,12 +1078,17 @@ function termConnect(){
 }
 
 function termPrint(text, cls){
+  if (termX){ termWrite(text, cls); return; }
   const out = $('term-out');
   const span = document.createElement('span');
   if(cls) span.className = cls;
   span.textContent = text;
   out.appendChild(span);
   out.scrollTop = out.scrollHeight;
+}
+function termClear(){
+  if (termX){ termX.clear(); return; }
+  $('term-out').innerHTML = '';
 }
 
 function termRun(){
