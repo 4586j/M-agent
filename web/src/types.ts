@@ -94,6 +94,9 @@ export interface TaskRecord {
   verdict?: SecurityVerdict
   trace_id?: string | null  // 链路追踪 ID（brain 派发时生成，旧任务为 null）
   meta?: TaskMeta  // 执行元数据（worker 回传 / 审批详情）
+  retry_count?: number  // 已重试次数（retry_manager 自愈递增）
+  max_retries?: number  // 重试上限（超过即 failed 终态，进入待办中心可重派）
+  last_retry_at?: string  // 最近一次重试时间（epoch 秒字符串）
 }
 
 /** meta.approval：安全拦截后挂起任务的审批详情 */
@@ -354,6 +357,7 @@ export interface ScheduleRecord {
   last_run: string
   next_run: string
   created_at: string
+  provider?: string | null  // 运行时 Provider（动态化后由该 Provider 执行）
 }
 
 export interface ScheduleBody {

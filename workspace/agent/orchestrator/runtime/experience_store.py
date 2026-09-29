@@ -5,6 +5,8 @@
 可选接入 EmbeddingModel 实现语义检索。
 """
 import json
+import threading
+import os
 import re
 import time
 from collections import Counter
@@ -14,6 +16,9 @@ from typing import Any
 
 from embedding_model import EmbeddingModel, cosine_similarity_vec
 from safe_id import validate_id
+
+# 同进程多实例写锁（脑+面板共享目录）；跨进程靠 os.replace 原子替换
+_WRITE_LOCK = threading.Lock()
 
 
 @dataclass
@@ -185,13 +190,14 @@ class ExperienceStore:
             return ExperienceRecord(**json.load(f))
 
     def delete(self, exp_id: str) -> bool:
-        p = self._path(exp_id)
-        if p.exists():
-            # 先丢弃该记录待刷盘的命中，避免 _invalidate 的 flush 把已删文件又写回
-            self._pending_dump.pop(exp_id, None)
-            p.unlink()
-            self._invalidate()
-            return True
+        with _WRITE_LOCK:
+            p = self._path(exp_id)
+            if p.exists():
+                # 先丢弃该记录待刷盘的命中，避免 _invalidate 的 flush 把已删文件又写回
+                self._pending_dump.pop(exp_id, None)
+                p.unlink()
+                self._invalidate()
+                return True
         return False
 
     def list_all(self) -> list[ExperienceRecord]:
