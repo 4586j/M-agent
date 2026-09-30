@@ -360,3 +360,48 @@ def test_reindex_without_model_is_noop(tmp_path):
                                  prompt="x", output_summary="", success=True))
     assert store.reindex() == 0
     assert store.get("exp-2").embedding is None
+
+
+# ---- 淘汰归档（eviction 前备份） ----
+
+def test_eviction_archives_instead_of_deleting(tmp_path):
+    """容量淘汰的记录移动到 archive/ 子目录，不再不可逆消失。"""
+    store = ExperienceStore(str(tmp_path), max_count=2)
+    for i in range(4):
+        store.write(make_exp(exp_id=f"exp-{i}", prompt=f"p{i}",
+                             output="out", success=True))
+    assert len(store.list_all()) == 2  # 容量收敛
+    archived = sorted(p.name for p in (tmp_path / "archive").glob("*.json"))
+    assert len(archived) == 2
+    # 被淘汰的记录（命中少/最旧）必须在 archive 里
+    names = {r.exp_id + ".json" for r in store.list_all()}
+    for name in archived:
+        assert name not in names
+        assert name.startswith("exp-")
+
+
+def test_ttl_expiry_archives(tmp_path):
+    import json as _json
+    import time as _time
+    store = ExperienceStore(str(tmp_path), ttl_days=1)
+    # created_at 用当前时间（make_exp 默认 "t0" 解析为 0 会立即过期）
+    rec = make_exp(exp_id="exp-old")
+    rec.created_at = str(int(_time.time()))
+    store.write(rec)
+    # 把 created_at 改成 3 天前
+    p = tmp_path / "exp-old.json"
+    d = _json.loads(p.read_text(encoding="utf-8"))
+    d["created_at"] = str(_time.time() - 3 * 86400)
+    p.write_text(_json.dumps(d, ensure_ascii=False), encoding="utf-8")
+    store._invalidate()
+    store.write(make_exp(exp_id="exp-new", output="out2"))  # 触发 _enforce_limits
+    assert store.get("exp-old") is None
+    assert (tmp_path / "archive" / "exp-old.json").exists()
+
+
+def test_user_delete_still_hard_deletes(tmp_path):
+    """用户显式删除仍是真删除（不入 archive）。"""
+    store = ExperienceStore(str(tmp_path))
+    store.write(make_exp())
+    assert store.delete("exp-1")
+    assert not (tmp_path / "archive" / "exp-1.json").exists()

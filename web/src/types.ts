@@ -417,3 +417,25 @@ export interface BrainSessionTurn {
 export interface BrainSessionDetail extends Omit<BrainSession, 'turn_count'> {
   turns: BrainSessionTurn[]
 }
+
+/** 文档知识库（人工上传的参考资料层；派发时自动检索注入） */
+export interface KnowledgeDoc {
+  doc_id: string
+  title: string
+  chunk_count: number
+  content_chars: number
+  created_at: number | null
+  updated_at: number | null
+}
+
+export interface KnowledgeDocFull extends KnowledgeDoc {
+  content: string
+  chunks: string[]
+}
+
+export interface KnowledgeSnippet {
+  doc_id: string
+  title: string
+  snippet: string
+  score: number
+}

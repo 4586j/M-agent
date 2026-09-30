@@ -8,16 +8,17 @@ import { POLL } from '../polling'
 import { timeAgo } from '../utils'
 import StatusBadge from '../components/StatusBadge'
 
-type Tab = 'core' | 'context' | 'experience' | 'proposal'
+type Tab = 'core' | 'context' | 'experience' | 'proposal' | 'knowledge'
 
 const TABS: { key: Tab; label: string }[] = [
   { key: 'core', label: '核心记忆' },
   { key: 'context', label: '任务上下文' },
   { key: 'experience', label: '经验库' },
   { key: 'proposal', label: '演化提案' },
+  { key: 'knowledge', label: '知识库' },
 ]
 
-/** 记忆系统四层资产库（docs/客户端界面设计.md §3.5） */
+/** 记忆系统四层资产库 + 知识库（docs/客户端界面设计.md §3.5） */
 export default function Memory() {
   const [tab, setTab] = useState<Tab>('core')
   return (
@@ -42,6 +43,153 @@ export default function Memory() {
       {tab === 'context' && <ContextTab />}
       {tab === 'experience' && <ExperienceTab />}
       {tab === 'proposal' && <ProposalTab />}
+      {tab === 'knowledge' && <KnowledgeTab />}
+    </div>
+  )
+}
+
+/* ---------------- Tab 5 知识库 ---------------- */
+
+function KnowledgeTab() {
+  const { data, refresh, error } = usePolling(() => api.knowledge(), POLL.services)
+  const docs = data?.docs ?? []
+  const [title, setTitle] = useState('')
+  const [content, setContent] = useState('')
+  const [msg, setMsg] = useState<string | null>(null)
+  const [busy, setBusy] = useState(false)
+  const [query, setQuery] = useState('')
+  const [results, setResults] = useState<{ doc_id: string; title: string; snippet: string }[] | null>(null)
+  const [searching, setSearching] = useState(false)
+
+  const upload = async () => {
+    if (!content.trim()) return
+    setBusy(true)
+    setMsg(null)
+    try {
+      await api.addKnowledge({ title: title.trim() || '未命名文档', content })
+      setMsg('已上传：派发时会自动检索相关片段注入上下文')
+      setTitle('')
+      setContent('')
+      refresh()
+    } catch (e) {
+      setMsg(`上传失败: ${e instanceof Error ? e.message : String(e)}`)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const remove = async (id: string, name: string) => {
+    if (!window.confirm(`删除文档「${name}」？`)) return
+    try {
+      await api.deleteKnowledge(id)
+      refresh()
+    } catch (e) {
+      setMsg(`删除失败: ${e instanceof Error ? e.message : String(e)}`)
+    }
+  }
+
+  const search = async () => {
+    if (!query.trim()) return
+    setSearching(true)
+    try {
+      setResults((await api.searchKnowledge(query, 5)).results)
+    } catch {
+      setResults([])
+    } finally {
+      setSearching(false)
+    }
+  }
+
+  return (
+    <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+      <section className="bg-white rounded-lg shadow p-4">
+        <h3 className="text-base font-semibold mb-1">上传文档</h3>
+        <p className="text-xs text-slate-400 mb-3">
+          项目规范 / API 文档 / 运维手册等确定性资料。派发时自动检索相关片段注入任务上下文（空库零影响）。
+        </p>
+        <input
+          value={title}
+          onChange={(e) => setTitle(e.target.value)}
+          placeholder="文档标题"
+          className="w-full px-2 py-1 text-sm border border-slate-300 rounded mb-2"
+        />
+        <textarea
+          value={content}
+          onChange={(e) => setContent(e.target.value)}
+          rows={8}
+          placeholder="粘贴文档正文（Markdown/纯文本均可，按段落自动切块）"
+          className="w-full px-2 py-1 text-sm border border-slate-300 rounded font-mono"
+        />
+        <div className="flex items-center gap-2 mt-2">
+          <button
+            onClick={upload}
+            disabled={busy || !content.trim()}
+            className="px-4 py-1.5 text-sm rounded-lg bg-mint-600 text-white hover:bg-mint-500 font-semibold disabled:opacity-40"
+          >
+            {busy ? '上传中…' : '上传文档'}
+          </button>
+          {msg && <span className="text-xs text-slate-500">{msg}</span>}
+        </div>
+      </section>
+
+      <section className="bg-white rounded-lg shadow p-4">
+        <h3 className="text-base font-semibold mb-3">文档（{docs.length}）与检索预览</h3>
+        <div className="flex items-center gap-1.5 mb-3">
+          <input
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            placeholder="输入查询，预览将被注入的片段…"
+            className="flex-1 px-2 py-1 text-sm border border-slate-300 rounded"
+          />
+          <button
+            onClick={search}
+            disabled={searching || !query.trim()}
+            className="px-3 py-1 text-xs rounded bg-sky-600 text-white hover:bg-sky-700 disabled:opacity-40"
+          >
+            {searching ? '检索中…' : '检索'}
+          </button>
+        </div>
+        {results && (
+          <div className="space-y-1.5 mb-3 max-h-52 overflow-y-auto">
+            {results.length === 0 && (
+              <div className="text-xs text-slate-400">没有命中片段</div>
+            )}
+            {results.map((r, i) => (
+              <div key={`${r.doc_id}-${i}`} className="border border-mint-100 rounded-lg px-2 py-1.5 bg-mint-50/40">
+                <div className="text-xs font-medium text-mint-700">{r.title}</div>
+                <div className="text-xs text-slate-600 line-clamp-3">{r.snippet}</div>
+              </div>
+            ))}
+          </div>
+        )}
+        {error && (
+          <div className="text-xs text-rose-600 bg-rose-50 border border-rose-200 rounded p-2 mb-2">
+            加载失败：{error}
+          </div>
+        )}
+        {docs.length === 0 && !error ? (
+          <div className="text-slate-400 text-sm">知识库为空——上传第一份文档</div>
+        ) : (
+          <div className="space-y-1.5">
+            {docs.map((d) => (
+              <div key={d.doc_id} className="flex items-center gap-2 border border-slate-100 rounded p-2">
+                <div className="min-w-0 flex-1">
+                  <div className="text-sm text-slate-700 truncate">{d.title}</div>
+                  <div className="text-xs text-slate-400">
+                    {d.chunk_count} 块 · {d.content_chars} 字 · 更新于 {timeAgo(d.updated_at)}
+                  </div>
+                </div>
+                <button
+                  onClick={() => { if (window.confirm(`删除文档「${d.title}」？`)) remove(d.doc_id, d.title) }}
+                  className="px-2 py-1 text-xs text-slate-400 hover:text-rose-600"
+                >
+                  删除
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
+      </section>
     </div>
   )
 }

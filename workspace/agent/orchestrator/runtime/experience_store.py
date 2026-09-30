@@ -5,6 +5,7 @@
 可选接入 EmbeddingModel 实现语义检索。
 """
 import json
+import logging
 import threading
 import os
 import re
@@ -16,6 +17,8 @@ from typing import Any
 
 from embedding_model import EmbeddingModel, cosine_similarity_vec
 from safe_id import validate_id
+
+log = logging.getLogger(__name__)
 
 # 同进程多实例写锁（脑+面板共享目录）；跨进程靠 os.replace 原子替换
 _WRITE_LOCK = threading.Lock()
@@ -134,6 +137,7 @@ class ExperienceStore:
 
         策略：先清 TTL 过期（ttl_days>0），再在超容量时按
         「失败经验最旧先出 → 成功经验按命中少、created_at 旧先出」淘汰。
+        淘汰记录先归档到 archive/ 子目录（不可逆删除前的兜底备份）。
         """
         removed = 0
         recs = self.list_all()
@@ -141,7 +145,7 @@ class ExperienceStore:
             cutoff = time.time() - self.ttl_days * 86400
             expired = [r for r in recs if _parse_ts(r.created_at) < cutoff]
             for r in expired:
-                self.delete(r.exp_id)
+                self._archive(r.exp_id)
             removed += len(expired)
             recs = [r for r in recs if r not in expired]
         if self.max_count > 0 and len(recs) > self.max_count:
@@ -152,9 +156,30 @@ class ExperienceStore:
                         _parse_ts(r.created_at))
             victims = sorted(recs, key=evict_key)[: len(recs) - self.max_count]
             for r in victims:
-                self.delete(r.exp_id)
+                self._archive(r.exp_id)
             removed += len(victims)
         return removed
+
+    def _archive(self, exp_id: str) -> bool:
+        """淘汰专用：把记录移动到 <store_dir>/archive/ 子目录（备份兜底）。
+
+        与用户显式 delete 不同——eviction 是系统自动行为，经验一旦丢失不可
+        再生，先归档再谈淘汰（archive/ 不参与 list_all 的 *.json glob）。
+        """
+        with _WRITE_LOCK:
+            p = self._path(exp_id)
+            if not p.exists():
+                return False
+            self._pending_dump.pop(exp_id, None)
+            archive_dir = self.store_dir / "archive"
+            try:
+                archive_dir.mkdir(parents=True, exist_ok=True)
+                p.replace(archive_dir / p.name)
+            except OSError as e:
+                log.warning("经验归档失败 exp=%s（降级为直接删除）: %s", exp_id, e)
+                p.unlink()
+            self._invalidate()
+            return True
 
     def get(self, exp_id: str) -> ExperienceRecord | None:
         rec = self._get_raw(exp_id)

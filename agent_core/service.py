@@ -39,6 +39,7 @@ AGENT_ALLOW_UNAUTHENTICATED=1 可显式恢复全开放（仅限开发/受控环�
 """
 import argparse
 import asyncio
+import base64
 import heapq
 import json
 import logging
@@ -133,6 +134,10 @@ class RunReq(BaseModel):
     session_id: str | None = Field(
         None, description="持久会话 id（POST /agent/session/persist 创建）："
                           "历史轮次注入上下文延续对话，本轮结果落盘会话文件")
+    images: list[str] | None = Field(
+        None, description="随任务附带的图片（data URL，image/png|jpeg|webp|gif）；"
+                          "落盘到任务工作目录 attachments/ 并在 prompt 中告知路径，"
+                          "由 agent 经 Read 工具查看（多模态 v1）")
 
 
 class SessionCreateReq(BaseModel):
@@ -533,6 +538,60 @@ def _session_history_block(rec: dict) -> str:
     return "【会话历史（此前轮次摘要，供延续对话用）】\n" + block
 
 
+# ---- 图片附件（多模态 v1）：data URL → 任务目录 attachments/ 落盘 ----
+
+_IMAGE_MEDIA_TYPES = {"image/png", "image/jpeg", "image/webp", "image/gif"}
+_IMAGE_MAX_BYTES = 5 * 1024 * 1024   # 单张 5MB
+_IMAGE_MAX_COUNT = 5                 # 单任务最多 5 张
+
+
+def _save_run_attachments(cwd: str, images: list[str] | None) -> list[str]:
+    """把请求里的 data URL 图片落盘到 cwd/attachments/，返回相对路径列表。
+
+    校验：仅支持 png/jpeg/webp/gif；单张 ≤5MB、最多 5 张；非法/超限直接
+    400（不做静默截断——任务带着"部分图片"执行比明确失败更误导）。
+    """
+    if not images:
+        return []
+    if len(images) > _IMAGE_MAX_COUNT:
+        raise HTTPException(status_code=400,
+                            detail=f"图片数量超限（最多 {_IMAGE_MAX_COUNT} 张）")
+    att_dir = Path(cwd) / "attachments"
+    att_dir.mkdir(parents=True, exist_ok=True)
+    saved: list[str] = []
+    ext_by_mt = {"image/png": "png", "image/jpeg": "jpg",
+                 "image/webp": "webp", "image/gif": "gif"}
+    for i, data_url in enumerate(images):
+        m = re.match(r"^data:(image/(?:png|jpeg|webp|gif));base64,([A-Za-z0-9+/=]+)$",
+                     (data_url or "").strip())
+        if not m:
+            raise HTTPException(status_code=400,
+                                detail=f"第 {i + 1} 张图片不是合法的 data URL"
+                                       "（支持 png/jpeg/webp/gif）")
+        media_type, b64 = m.group(1), m.group(2)
+        try:
+            raw = base64.b64decode(b64, validate=True)
+        except Exception:  # noqa: BLE001 - binascii.Error 等
+            raise HTTPException(status_code=400,
+                                detail=f"第 {i + 1} 张图片 base64 解码失败")
+        if len(raw) > _IMAGE_MAX_BYTES:
+            raise HTTPException(status_code=400,
+                                detail=f"第 {i + 1} 张图片超过 5MB 限制")
+        name = f"attach-{int(time.time())}-{i}.{ext_by_mt[media_type]}"
+        (att_dir / name).write_bytes(raw)
+        saved.append(f"attachments/{name}")
+    return saved
+
+
+def _augment_prompt_with_images(prompt: str, image_paths: list[str]) -> str:
+    """prompt 前置图片说明：告知 agent 附件路径（经 Read 工具查看）。"""
+    if not image_paths:
+        return prompt
+    listing = "\n".join(f"- {p}" for p in image_paths)
+    return (f"[用户随任务附带 {len(image_paths)} 张图片，已保存到当前工作目录，"
+            f"请用 Read 工具查看后再执行任务：\n{listing}]\n\n{prompt}")
+
+
 async def _run_session_turn(session: Any, prompt: str,
                             timeout: float | None = None) -> dict:
     """消费一轮会话事件，聚合为可 JSON 化的结果 dict。
@@ -893,9 +952,12 @@ def create_runs_router() -> APIRouter:
         persona = resolve_persona(req.persona or _DEFAULT_PERSONA)
         cwd = _prepare_cwd(req.cwd, tag="run")
         kernel = get_kernel()
+        # 图片附件：落盘任务目录并在 prompt 中告知路径（多模态 v1）
+        prompt_text = _augment_prompt_with_images(
+            req.prompt, _save_run_attachments(cwd, req.images))
         # run_oneshot 是同步阻塞（内部自起事件循环），放线程池避免卡住服务 loop
         result = await asyncio.to_thread(
-            kernel.run_oneshot, req.prompt, persona, cwd, req.context_memory or ""
+            kernel.run_oneshot, prompt_text, persona, cwd, req.context_memory or ""
         )
         d = asdict(result)
         _accumulate_oneshot(d, prompt=req.prompt, persona=persona.name)
@@ -919,6 +981,9 @@ def create_runs_router() -> APIRouter:
         if req.session_id:
             session_rec = _load_session(req.session_id)
             history_ctx = _session_history_block(session_rec)
+        # 图片附件：落盘任务目录并在 prompt 中告知路径（多模态 v1）
+        image_paths = _save_run_attachments(cwd, req.images)
+        prompt_text = _augment_prompt_with_images(req.prompt, image_paths)
         run_id = f"run-{uuid.uuid4().hex[:12]}"
         _write_run_meta(run_id, cwd=cwd,
                         prompt=req.prompt[:2000], persona=persona.name,
@@ -927,7 +992,7 @@ def create_runs_router() -> APIRouter:
                         started_at=round(time.time(), 3))
         sink = _make_event_sink(run_id)
         ctx = "\n\n".join(x for x in (history_ctx, req.context_memory or "") if x)
-        events = kernel.stream(req.prompt, persona, cwd, ctx,
+        events = kernel.stream(prompt_text, persona, cwd, ctx,
                                run_id=run_id, event_sink=sink)
 
         async def _events_with_bookkeeping():
@@ -1000,6 +1065,9 @@ def create_runs_router() -> APIRouter:
         else:
             kernel = get_kernel()
         run_id = uuid.uuid4().hex[:12]
+        # 图片附件：落盘任务目录并在 prompt 中告知路径（多模态 v1）
+        image_paths = _save_run_attachments(cwd, req.images)
+        prompt_text = _augment_prompt_with_images(req.prompt, image_paths)
         cancel_event = threading.Event()
         entry: dict = {
             "run_id": run_id, "status": "running", "prompt": req.prompt,
@@ -1017,7 +1085,7 @@ def create_runs_router() -> APIRouter:
         async def _worker():
             try:
                 result = await asyncio.to_thread(
-                    kernel.run_oneshot, req.prompt, persona, cwd,
+                    kernel.run_oneshot, prompt_text, persona, cwd,
                     req.context_memory or "", cancel_event,
                     run_id=run_id, event_sink=sink)
                 d = asdict(result)

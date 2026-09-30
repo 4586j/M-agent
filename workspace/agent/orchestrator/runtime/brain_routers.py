@@ -190,6 +190,7 @@ class BrainDeps:
     resolve_provider_name: Callable[[str | None], dict | None] | None = None
     budget_store: BudgetStore | None = None
     session_store: SessionStore | None = None
+    knowledge_store: Any = None  # KnowledgeStore（runtime/knowledge_store.py；可 None）
     webhook: Any = None  # WebhookNotifier（runtime/webhook.py；None=未配置外发）
 
 
@@ -428,6 +429,11 @@ def _preflight(deps: BrainDeps, req: DispatchReq, request: Request) -> _Prefligh
             req.session_id, task_lookup=deps.task_store.get)
         if session_ctx:
             context = f"{session_ctx}\n\n{context}" if context else session_ctx
+    # 知识库：自动检索与 prompt 相关片段（空库/无命中零注入，行为不变）
+    if deps.knowledge_store is not None and deps.cfg.knowledge_inject_enabled:
+        kb_block = deps.knowledge_store.context_block(req.prompt)
+        if kb_block:
+            context = f"{context}\n\n{kb_block}" if context else kb_block
     context = clamp_context(context, deps.cfg.context_memory_max_chars)
     model = _route_model(deps, req)
     # 运行时 Provider：名 → 三元组（密钥不落盘）；显式名/默认名不可用 → 400
@@ -1096,6 +1102,65 @@ def create_sessions_router(deps: BrainDeps) -> APIRouter:
         if not deps.session_store.delete(session_id):
             raise HTTPException(status_code=404, detail="session not found")
         return {"status": "deleted", "session_id": session_id}
+
+    return router
+
+
+class _KnowledgePutReq(BaseModel):
+    title: str | None = None
+    content: str | None = None
+
+
+def create_knowledge_router(deps: BrainDeps) -> APIRouter:
+    """文档知识库（人工上传的确定性资料层；派发时自动检索注入）。"""
+    router = APIRouter()
+
+    @router.post("/knowledge")
+    def add_knowledge(req: _KnowledgePutReq):
+        if deps.knowledge_store is None:
+            raise HTTPException(status_code=400, detail="knowledge_store 未配置")
+        if not (req.content or "").strip():
+            raise HTTPException(status_code=400, detail="content 不能为空")
+        return deps.knowledge_store.add(req.title or "", req.content)
+
+    @router.get("/knowledge")
+    def list_knowledge():
+        if deps.knowledge_store is None:
+            raise HTTPException(status_code=400, detail="knowledge_store 未配置")
+        return {"docs": deps.knowledge_store.list_all()}
+
+    @router.get("/knowledge/{doc_id}")
+    def get_knowledge(doc_id: str):
+        if deps.knowledge_store is None:
+            raise HTTPException(status_code=400, detail="knowledge_store 未配置")
+        doc = deps.knowledge_store.get(doc_id, full=True)
+        if doc is None:
+            raise HTTPException(status_code=404, detail="doc not found")
+        return doc
+
+    @router.put("/knowledge/{doc_id}")
+    def update_knowledge(doc_id: str, req: _KnowledgePutReq):
+        if deps.knowledge_store is None:
+            raise HTTPException(status_code=400, detail="knowledge_store 未配置")
+        try:
+            return deps.knowledge_store.update(doc_id, title=req.title,
+                                               content=req.content)
+        except KeyError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+
+    @router.delete("/knowledge/{doc_id}")
+    def delete_knowledge(doc_id: str):
+        if deps.knowledge_store is None:
+            raise HTTPException(status_code=400, detail="knowledge_store 未配置")
+        if not deps.knowledge_store.delete(doc_id):
+            raise HTTPException(status_code=404, detail="doc not found")
+        return {"status": "deleted", "doc_id": doc_id}
+
+    @router.post("/knowledge/search")
+    def search_knowledge(req: ExperienceSearchReq):
+        if deps.knowledge_store is None:
+            raise HTTPException(status_code=400, detail="knowledge_store 未配置")
+        return {"results": deps.knowledge_store.search(req.query, top_k=req.limit)}
 
     return router
 

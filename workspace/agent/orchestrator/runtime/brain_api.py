@@ -43,6 +43,7 @@ from event_bus import TaskEventBus
 from budget_store import BudgetStore
 from session_store import SessionStore
 from webhook import WebhookNotifier, DEFAULT_WEBHOOK_EVENTS
+from knowledge_store import KnowledgeStore
 
 from brain_routers import (
     BrainDeps,
@@ -75,6 +76,7 @@ from brain_routers import (
     create_proxy_router,
     create_budget_router,
     create_sessions_router,
+    create_knowledge_router,
 )
 
 
@@ -163,7 +165,8 @@ def create_brain_app(registry: WorkerRegistry, task_store: TaskStore, cfg: Confi
                      provider_store: ProviderStore | None = None,
                      budget_store: BudgetStore | None = None,
                      session_store: SessionStore | None = None,
-                     webhook: WebhookNotifier | None = None) -> FastAPI:
+                     webhook: WebhookNotifier | None = None,
+                     knowledge_store: KnowledgeStore | None = None) -> FastAPI:
     """dispatcher 可选：remote 模式传入 RemoteDispatcher，使派发与注册状态同进程。
 
     所有路由端点按资源拆在 brain_routers 的 router 工厂里；本函数只负责
@@ -217,6 +220,9 @@ def create_brain_app(registry: WorkerRegistry, task_store: TaskStore, cfg: Confi
     # 持久会话（派发链路连续对话）：缺省按 cfg 目录自建，传入时（_build_app）共享
     if session_store is None:
         session_store = SessionStore(cfg.sessions_dir)
+    # 文档知识库：与经验库共享同一 embedding 模型实例（brain 启动时已创建）
+    if knowledge_store is None:
+        knowledge_store = KnowledgeStore(cfg.knowledge_dir, embedding_model=None)
 
     deps = BrainDeps(
         cfg=cfg, registry=registry, task_store=task_store, bus=bus,
@@ -229,6 +235,7 @@ def create_brain_app(registry: WorkerRegistry, task_store: TaskStore, cfg: Confi
         resolve_provider_name=resolve_provider_name,
         budget_store=budget_store,
         session_store=session_store,
+        knowledge_store=knowledge_store,
         webhook=webhook,
     )
     for make_router in (
@@ -237,7 +244,7 @@ def create_brain_app(registry: WorkerRegistry, task_store: TaskStore, cfg: Confi
         create_sse_router, create_stats_router, create_memory_router,
         create_procedural_router, create_experiences_router,
         create_schedules_router, create_proxy_router, create_budget_router,
-        create_sessions_router,
+        create_sessions_router, create_knowledge_router,
     ):
         app.include_router(make_router(deps))
 
@@ -466,7 +473,9 @@ def _build_app() -> FastAPI:
                             advisor=advisor, translator=translator,
                             provider_store=provider_store,
                             budget_store=budget_store,
-                            webhook=webhook)
+                            webhook=webhook,
+                            knowledge_store=KnowledgeStore(
+                                cfg.knowledge_dir, embedding_model=emb_model))
 
 
 if __name__ == "__main__":

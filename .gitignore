@@ -58,6 +58,7 @@ workspace/agent/skillhub_runtime/
 workspace/agent/orchestrator/runtime/providers.json
 workspace/agent/orchestrator/runtime/budgets.json
 workspace/agent/orchestrator/runtime/.sessions/
+workspace/agent/orchestrator/runtime/.knowledge/
 .agent_policy.json
 web/test-results/
 web/playwright-report/

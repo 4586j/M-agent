@@ -4,7 +4,7 @@ import type {
   MemoryCoreItem, ContextNotesResponse, ExperienceRecord, ExperienceSearchBody,
   ProposalRecord, ReflectionReport, ScheduleRecord, ScheduleBody, AuditEntry,
   NodeStatus, ProviderList, ProviderPutBody, BudgetSnapshot,
-  BrainSession, BrainSessionDetail,
+  BrainSession, BrainSessionDetail, KnowledgeDoc, KnowledgeDocFull, KnowledgeSnippet,
 } from '../types'
 import { getActiveConnection } from './connections'
 
@@ -24,6 +24,17 @@ export function getApiKey(): string {
   }
 }
 
+// 操作者名称（连接管理器中设置）：随写操作以 X-Operator 头发送，
+// brain 侧审计流水/审批记录据此落操作者归属。配置了 ORCH_API_KEY 的部署中
+// 该头才真正可信（未鉴权部署任何客户端都可伪造，仅作来源参考）
+export function getOperator(): string {
+  try {
+    return localStorage.getItem('orch_operator') || ''
+  } catch {
+    return ''
+  }
+}
+
 function pref(path: string): string {
   const base = getActiveConnection().baseUrl
   return base ? base + path : path
@@ -33,6 +44,8 @@ async function request<T>(url: string, init?: RequestInit): Promise<T> {
   const headers: Record<string, string> = { 'Content-Type': 'application/json' }
   const key = getApiKey()
   if (key) headers['X-API-Key'] = key
+  const operator = getOperator()
+  if (operator) headers['X-Operator'] = operator
   const r = await fetch(pref(url), {
     ...init,
     headers,
@@ -190,6 +203,20 @@ export const api = {
     request<BrainSessionDetail>(`/sessions/${encodeURIComponent(id)}`),
   deleteSession: (id: string) =>
     request<{ status: string }>(`/sessions/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+
+  // ---- 文档知识库（人工上传参考资料；派发时自动检索注入上下文） ----
+
+  knowledge: () => request<{ docs: KnowledgeDoc[] }>('/knowledge'),
+  knowledgeDoc: (id: string) =>
+    request<KnowledgeDocFull>(`/knowledge/${encodeURIComponent(id)}`),
+  addKnowledge: (body: { title: string; content: string }) =>
+    request<KnowledgeDoc>('/knowledge', { method: 'POST', body: JSON.stringify(body) }),
+  deleteKnowledge: (id: string) =>
+    request<{ status: string }>(`/knowledge/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+  searchKnowledge: (query: string, limit = 5) =>
+    request<{ results: KnowledgeSnippet[] }>('/knowledge/search', {
+      method: 'POST', body: JSON.stringify({ query, limit }),
+    }),
 
   // ---- 运行时 Provider 池（模型/端点/密钥；密钥只写 brain providers.json） ----
 

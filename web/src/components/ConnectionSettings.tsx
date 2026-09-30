@@ -9,6 +9,38 @@ import {
   deleteConnection,
   testConnection,
 } from '../api/connections'
+import { getOperator } from '../api/client'
+
+const LS_OPERATOR = 'orch_operator'
+
+/** 操作者名称输入：随写操作以 X-Operator 头发送，审计/审批记录落操作者归属 */
+function OperatorField() {
+  const [name, setName] = useState(getOperator())
+  const [saved, setSaved] = useState(false)
+  const save = () => {
+    try {
+      const v = name.trim()
+      if (v) localStorage.setItem(LS_OPERATOR, v)
+      else localStorage.removeItem(LS_OPERATOR)
+      setSaved(true)
+      window.setTimeout(() => setSaved(false), 1500)
+    } catch { /* 隐私模式等存储不可用：静默 */ }
+  }
+  return (
+    <div className="border-t border-slate-100 mt-2 pt-2">
+      <div className="flex items-center gap-1.5">
+        <input
+          value={name}
+          onChange={(e) => setName(e.target.value)}
+          onBlur={save}
+          placeholder="操作者（审计/审批归属，如 zhang）"
+          className="flex-1 min-w-0 px-2 py-1 text-sm border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-mint-400"
+        />
+        {saved && <span className="text-xs text-mint-600 shrink-0">已保存</span>}
+      </div>
+    </div>
+  )
+}
 
 /**
  * 连接管理器（顶栏下拉）：保存多个 brain 连接（名称 + 地址 + API Key），
@@ -126,6 +158,10 @@ export default function ConnectionSettings() {
               ＋ 新增连接
             </button>
           )}
+
+          {/* 操作者名称：全局设置（非每连接），随写操作以 X-Operator 头发送，
+              brain 审计流水/审批记录据此落操作者归属 */}
+          <OperatorField />
 
           {draft && (
             <div className="border-t border-slate-100 mt-2 pt-2 space-y-1.5">

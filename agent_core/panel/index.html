@@ -260,6 +260,17 @@
     border:1px solid var(--bd);border-radius:999px;padding:1px 8px}
   .turn-hist pre{margin-top:8px}
 
+  /* 图片附件条（粘贴/多模态 v1） */
+  .attach-strip{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:6px}
+  .attach-strip:empty{display:none}
+  .attach-chip{position:relative;display:inline-flex;width:52px;height:52px;
+    border:1px solid var(--bd);border-radius:8px;overflow:hidden}
+  .attach-chip img{width:100%;height:100%;object-fit:cover}
+  .attach-chip button{position:absolute;top:0;right:0;width:16px;height:16px;
+    border:none;border-radius:0 0 0 6px;background:rgba(0,0,0,.55);color:#fff;
+    font-size:11px;line-height:16px;padding:0;cursor:pointer}
+  .attach-chip button:hover{background:rgba(220,60,60,.8)}
+
   /* ================= 右栏 ================= */
   .rightbar{width:294px;flex-shrink:0;background:var(--bg-0);min-width:0;
     overflow-y:auto;padding:14px}
@@ -462,7 +473,8 @@
     </div>
     <div class="composer" id="composer">
       <div class="card">
-        <textarea id="prompt" placeholder="给 Agent 下发任务…（Ctrl + Enter 派发）"></textarea>
+        <div id="attach-strip" class="attach-strip"></div>
+        <textarea id="prompt" placeholder="给 Agent 下发任务…（Ctrl + Enter 派发，可直接粘贴截图）"></textarea>
         <div class="row">
           <label class="field">会话
             <select id="session-sel" onchange="onSessionChange(this.value)">
@@ -601,7 +613,7 @@ function loadSessionHistory(sid){
 
 function dispatch(){
   const prompt = $('prompt').value.trim();
-  if(!prompt) return;
+  if(!prompt && !pendingImages.length) return;
   const model = $('model').value.trim();
   const planning = $('plan-cb').checked;
   planSteps = null; lastSeq = 0; currentRunId = null; live = true;
@@ -610,11 +622,57 @@ function dispatch(){
   $('btn-dispatch').disabled = true; $('btn-dispatch').textContent = '执行中…';
   setConn('busy', '执行中');
   showRunbar('', planning ? '规划引擎 · 分步执行' : '流式执行');
-  const body = { prompt, planning_enabled: planning };
+  const body = { prompt: prompt || '（请查看附带的图片）', planning_enabled: planning };
   if(model) body.model = model;
   if(sessionId) body.session_id = sessionId;
+  if(pendingImages.length){ body.images = pendingImages; clearAttachments(); }
   if(planning) return dispatchAsync(body);
   dispatchStream(body);
+}
+
+/* ================= 图片附件（多模态 v1：粘贴/选择图片 → agent 经 Read 查看） ================= */
+let pendingImages = [];
+
+function clearAttachments(){
+  pendingImages = [];
+  $('attach-strip').innerHTML = '';
+}
+
+function removeAttachment(i){
+  pendingImages.splice(i, 1);
+  renderAttachments();
+}
+
+function renderAttachments(){
+  $('attach-strip').innerHTML = pendingImages.map((src, i) =>
+    `<span class="attach-chip"><img src="${src}" alt="附件${i + 1}"/>` +
+    `<button onclick="removeAttachment(${i})" title="移除">×</button></span>`).join('');
+}
+
+function addImageFromDataUrl(dataUrl){
+  if(pendingImages.length >= 5){
+    appendError('图片附件最多 5 张'); return;
+  }
+  // 缩略图本地预览用 data URL 原样即可（浏览器渲染缩放）
+  pendingImages.push(dataUrl);
+  renderAttachments();
+}
+
+function handlePasteImages(e){
+  const items = (e.clipboardData || {}).items;
+  if(!items) return false;
+  let found = false;
+  for(const item of items){
+    if(item.type && item.type.startsWith('image/')){
+      found = true;
+      const file = item.getAsFile();
+      if(!file) continue;
+      const reader = new FileReader();
+      reader.onload = () => addImageFromDataUrl(reader.result);
+      reader.readAsDataURL(file);
+    }
+  }
+  return found;
 }
 
 function dispatchAsync(body){
@@ -1238,6 +1296,9 @@ try{
 /* ================= 初始化 ================= */
 $('prompt').addEventListener('keydown', e => {
   if((e.ctrlKey || e.metaKey) && e.key === 'Enter') dispatch();
+});
+$('prompt').addEventListener('paste', e => {
+  if(handlePasteImages(e)) e.preventDefault();
 });
 loadRuns();
 loadWorkspace();

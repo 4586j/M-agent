@@ -1,4 +1,5 @@
 """Agent 面板与运行事件持久化测试。"""
+import base64
 import json
 import sys
 from pathlib import Path
@@ -505,3 +506,63 @@ def test_run_stream_missing_session_404(client):
     """session_id 不存在 → 早失败 404，不产生 run。"""
     r = client.post("/agent/run/stream", json={"prompt": "x", "session_id": "deadbeefdead"})
     assert r.status_code == 404
+
+
+# ---- 图片附件（多模态 v1） ----
+
+_PNG_B64 = base64.b64encode(b"\x89PNG\r\n\x1a\n" + b"0" * 64).decode()
+
+
+def test_save_run_attachments_ok(tmp_path):
+    import pytest as _pytest
+    cwd = tmp_path / "run-cwd"
+    cwd.mkdir()
+    paths = service._save_run_attachments(
+        str(cwd), [f"data:image/png;base64,{_PNG_B64}",
+                   f"data:image/jpeg;base64,{base64.b64encode(b'jpeg-data').decode()}"])
+    assert paths[0].startswith("attachments/attach-") and paths[0].endswith(".png")
+    assert paths[1].endswith(".jpg")
+    assert (cwd / paths[0]).exists()
+    assert (cwd / paths[1]).exists()
+
+
+def test_save_run_attachments_rejects_bad_input(tmp_path):
+    import pytest as _pytest
+    from fastapi import HTTPException
+    cwd = tmp_path / "run-cwd2"
+    cwd.mkdir()
+    with _pytest.raises(HTTPException) as ei:  # 非 data URL
+        service._save_run_attachments(str(cwd), ["http://x/a.png"])
+    assert ei.value.status_code == 400
+    with _pytest.raises(HTTPException) as ei:  # 非图片 mime
+        service._save_run_attachments(str(cwd), ["data:text/plain;base64,AAAA"])
+    assert ei.value.status_code == 400
+    with _pytest.raises(HTTPException) as ei:  # 超过 5 张
+        service._save_run_attachments(
+            str(cwd), [f"data:image/png;base64,{_PNG_B64}"] * 6)
+    assert ei.value.status_code == 400
+
+
+def test_run_stream_with_images_saves_and_mentions(client, monkeypatch):
+    """带图片的流式 run：附件落盘 run cwd，内核收到的 prompt 含路径说明。"""
+    seen = {}
+    kernel = client.kernel
+    original_stream = kernel.stream
+
+    def spy_stream(prompt, persona, cwd, context_memory="", run_id=None,
+                   event_sink=None):
+        seen["prompt"] = prompt
+        seen["cwd"] = cwd
+        return original_stream(prompt, persona, cwd, context_memory,
+                               run_id=run_id, event_sink=event_sink)
+
+    monkeypatch.setattr(kernel, "stream", spy_stream)
+    with client.stream("POST", "/agent/run/stream",
+                       json={"prompt": "看看这个设计稿",
+                             "images": [f"data:image/png;base64,{_PNG_B64}"]}) as resp:
+        "".join(resp.iter_text())
+    assert "附带 1 张图片" in seen["prompt"]
+    assert "attachments/attach-" in seen["prompt"]
+    assert seen["cwd"]
+    saved = list((Path(seen["cwd"]) / "attachments").glob("attach-*.png"))
+    assert len(saved) == 1
