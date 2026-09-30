@@ -41,6 +41,9 @@ def client(monkeypatch, tmp_path, project_root):
                         {"runs": 0, "errors": 0, "total_cost_usd": 0.0,
                          "total_turns": 0})
     monkeypatch.setattr(service, "_HEALTH_CHECKS", None)
+    # 限流表是模块级全局：重置避免本文件请求量污染后续测试文件（429）
+    monkeypatch.setattr(service, "_RATE_LIMIT_STORE", {})
+    monkeypatch.setattr(service, "_RATE_LIMIT_CALLS", 0, raising=False)
     # 工作区隔离到 tmp（模块级全局，测试间必须重置）
     ws_dir = tmp_path / "ws"
     ws_dir.mkdir(parents=True, exist_ok=True)
@@ -324,12 +327,26 @@ def test_prepare_cwd_rejects_outside():
 
 # ---- 策略配置化（.agent_policy.json） ----
 
-def test_policy_enforce_false_disables_boundary(client, monkeypatch, tmp_path, project_root):
+@pytest.fixture()
+def restore_policy_file(project_root):
+    """策略文件读写守卫：测试改完自动还原原内容（否则会把损坏/测试态
+    内容永久写回仓库文件——历史上真实的损坏源头）。"""
+    policy_file = Path(project_root) / ".agent_policy.json"
+    original = policy_file.read_text(encoding="utf-8") if policy_file.exists() else None
+    yield policy_file
+    if original is None:
+        if policy_file.exists():
+            policy_file.unlink()
+    else:
+        policy_file.write_text(original, encoding="utf-8")
+
+
+def test_policy_enforce_false_disables_boundary(client, monkeypatch, tmp_path,
+                                                restore_policy_file):
     """enforce=false 时终端越界直接放行（总开关生效）。"""
     monkeypatch.setenv("AGENT_API_KEY", "k1")
-    policy_file = Path(project_root) / ".agent_policy.json"
     monkeypatch.setattr(service, "_POLICY", None)  # 重置缓存
-    policy_file.write_text(json.dumps(
+    restore_policy_file.write_text(json.dumps(
         {"workspace_boundary": {"enforce": False}}), encoding="utf-8")
     outside = tmp_path / "pol_outside"
     outside.mkdir(exist_ok=True)
@@ -346,14 +363,14 @@ def test_policy_enforce_false_disables_boundary(client, monkeypatch, tmp_path, p
         assert msgs[-1]["code"] == 0
 
 
-def test_policy_extra_allowed_dirs_passthrough(client, monkeypatch, tmp_path, project_root):
+def test_policy_extra_allowed_dirs_passthrough(client, monkeypatch, tmp_path,
+                                               restore_policy_file):
     """extra_allowed_dirs 预授权目录：命令涉及该目录不再逐次确认。"""
     monkeypatch.setenv("AGENT_API_KEY", "k1")
-    policy_file = Path(project_root) / ".agent_policy.json"
     monkeypatch.setattr(service, "_POLICY", None)
     outside_parent = tmp_path / "pol_parent"
     outside_parent.mkdir(exist_ok=True)
-    policy_file.write_text(json.dumps(
+    restore_policy_file.write_text(json.dumps(
         {"workspace_boundary": {"extra_allowed_dirs": [str(outside_parent)]}}),
         encoding="utf-8")
     with client.websocket_connect("/agent/terminal?api_key=k1") as ws:
@@ -384,11 +401,107 @@ def test_policy_granularity_in_confirm_frame(client, monkeypatch):
         assert confirm and confirm["granularity"] == "per_action"
 
 
-def test_policy_file_corruption_falls_back(client, monkeypatch, project_root):
-    """策略文件损坏 → 静默回退默认（边界保持 enforce）。"""
-    policy_file = Path(project_root) / ".agent_policy.json"
+def test_policy_file_corruption_warns_and_falls_back(client, monkeypatch,
+                                                     restore_policy_file, caplog):
+    """策略文件损坏 → 回退默认（边界保持 enforce），并发出 warning（不再静默）。"""
     monkeypatch.setattr(service, "_POLICY", None)
-    policy_file.parent.mkdir(parents=True, exist_ok=True)
-    policy_file.write_text("{ 不是 JSON", encoding="utf-8")
-    policy = service._load_policy()
+    restore_policy_file.parent.mkdir(parents=True, exist_ok=True)
+    restore_policy_file.write_text("{ 不是 JSON", encoding="utf-8")
+    import logging as _logging
+    with caplog.at_level(_logging.WARNING, logger="agent_core.service"):
+        policy = service._load_policy()
     assert policy["workspace_boundary"]["enforce"] is True
+    assert any("解析失败" in r.message for r in caplog.records)
+
+
+# ---- 持久会话（连续对话：落盘 + 历史注入） ----
+
+def test_persisted_session_endpoints(client):
+    """创建 → 列表 → 详情（空轮次）→ 删除 → 404。"""
+    r = client.post("/agent/session/persist")
+    assert r.status_code == 200
+    sid = r.json()["session_id"]
+    assert len(sid) == 12
+    lst = client.get("/agent/persisted-sessions").json()
+    assert [s["session_id"] for s in lst["sessions"]] == [sid]
+    detail = client.get(f"/agent/persisted-sessions/{sid}").json()
+    assert detail["turns"] == []
+    assert client.delete(f"/agent/persisted-sessions/{sid}").json()["status"] == "deleted"
+    assert client.get(f"/agent/persisted-sessions/{sid}").status_code == 404
+
+
+def test_persisted_session_rejects_bad_sid(client):
+    assert client.get("/agent/persisted-sessions/../evil").status_code in (400, 404)
+    assert client.get("/agent/persisted-sessions/ZZZ").status_code in (400, 404)
+
+
+def test_run_stream_with_session_persists_turn(client, monkeypatch):
+    """带 session_id 的流式轮：结束后 prompt/output 落盘会话文件。"""
+    r = client.post("/agent/session/persist")
+    sid = r.json()["session_id"]
+    with client.stream("POST", "/agent/run/stream",
+                       json={"prompt": "第一问", "session_id": sid}) as resp:
+        "".join(resp.iter_text())
+    detail = client.get(f"/agent/persisted-sessions/{sid}").json()
+    assert len(detail["turns"]) == 1
+    turn = detail["turns"][0]
+    assert turn["prompt"] == "第一问"
+    assert turn["status"] == "completed"
+    assert "完成" in str(turn["output"])  # FakeKernel result 输出
+    assert detail["title"] == "第一问"
+    # run meta 也带 session_id（回放端定位）
+    runs = client.get("/agent/runs").json()["runs"]
+    assert any(r.get("session_id") == sid for r in runs)
+
+
+def test_run_stream_session_history_injected(client, monkeypatch):
+    """第二次带同 session_id 的轮：内核收到的 context_memory 携带历史块。"""
+    r = client.post("/agent/session/persist")
+    sid = r.json()["session_id"]
+    with client.stream("POST", "/agent/run/stream",
+                       json={"prompt": "第一问", "session_id": sid}) as resp:
+        "".join(resp.iter_text())
+
+    seen = {}
+    kernel = client.kernel
+
+    original_stream = kernel.stream
+
+    def spy_stream(prompt, persona, cwd, context_memory="", run_id=None,
+                   event_sink=None):
+        seen["context"] = context_memory
+        return original_stream(prompt, persona, cwd, context_memory,
+                               run_id=run_id, event_sink=event_sink)
+
+    monkeypatch.setattr(kernel, "stream", spy_stream)
+    with client.stream("POST", "/agent/run/stream",
+                       json={"prompt": "第二问", "session_id": sid}) as resp:
+        "".join(resp.iter_text())
+    assert "会话历史" in seen["context"]
+    assert "第一问" in seen["context"]
+    assert "完成" in seen["context"]  # 上一轮输出注入
+
+
+def test_run_stream_without_session_no_history(client, monkeypatch):
+    """不带 session_id：context_memory 原样透传（无历史块），行为不变。"""
+    seen = {}
+    kernel = client.kernel
+    original_stream = kernel.stream
+
+    def spy_stream(prompt, persona, cwd, context_memory="", run_id=None,
+                   event_sink=None):
+        seen["context"] = context_memory
+        return original_stream(prompt, persona, cwd, context_memory,
+                               run_id=run_id, event_sink=event_sink)
+
+    monkeypatch.setattr(kernel, "stream", spy_stream)
+    with client.stream("POST", "/agent/run/stream",
+                       json={"prompt": "独立任务", "context_memory": "参考资料"}) as resp:
+        "".join(resp.iter_text())
+    assert seen["context"] == "参考资料"
+
+
+def test_run_stream_missing_session_404(client):
+    """session_id 不存在 → 早失败 404，不产生 run。"""
+    r = client.post("/agent/run/stream", json={"prompt": "x", "session_id": "deadbeefdead"})
+    assert r.status_code == 404

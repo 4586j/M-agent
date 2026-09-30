@@ -1,12 +1,14 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useLocation } from 'react-router-dom'
 import { api } from '../api/client'
-import type { ApprovalMeta, DispatchAsyncResponse, DispatchResult, ExperienceRecord, ProviderList, TaskRecord, RecommendResponse, TranslateResponse, WorkerInfo } from '../types'
+import type { ApprovalMeta, DispatchAsyncResponse, DispatchResult, ExperienceRecord, ProviderList, TaskRecord, RecommendResponse, TranslateResponse, WorkerInfo, BrainSession } from '../types'
 import { TERMINAL_STATUSES } from '../types'
 import { usePolling } from '../hooks/usePolling'
 import { POLL } from '../polling'
 import { fmtUsd, formatTime, timeAgo } from '../utils'
 import StatusBadge from '../components/StatusBadge'
+
+const SESSION_LS_KEY = 'orch_dispatch_session_id'
 
 export default function Command() {
   const [prompt, setPrompt] = useState('')
@@ -57,6 +59,28 @@ export default function Command() {
   const [approvalMsg, setApprovalMsg] = useState('')
   const [approving, setApproving] = useState(false)
 
+  // 持久会话（连续对话）：历史轮次自动注入上下文；id 存 localStorage 跨刷新续聊
+  const [sessionId, setSessionId] = useState<string>(
+    () => localStorage.getItem(SESSION_LS_KEY) || '')
+  const { data: sessionList, refresh: refreshSessions } = usePolling<{ sessions: BrainSession[] }>(
+    () => api.sessions(), POLL.services)
+
+  const pickSession = (id: string) => {
+    setSessionId(id)
+    try {
+      if (id) localStorage.setItem(SESSION_LS_KEY, id)
+      else localStorage.removeItem(SESSION_LS_KEY)
+    } catch { /* 隐私模式等存储不可用：仅内存态 */ }
+  }
+
+  const newSession = async () => {
+    try {
+      const r = await api.createSession()
+      pickSession(r.session_id)
+      refreshSessions()
+    } catch { /* 创建失败保持当前会话不变 */ }
+  }
+
   // 历史命令从后端 /tasks 取（持久化，含发布时间/节点/结果）；5s 轮询
   const { data: tasks, refresh } = usePolling<TaskRecord[]>(() => api.tasks(), POLL.tasks)
 
@@ -76,6 +100,7 @@ export default function Command() {
         enable_subagents: enableSubagents,
         context_task_ids: ctxTaskIds.length > 0 ? ctxTaskIds : undefined,
         worker_id: workerId || null,
+        session_id: sessionId || null,
       }
       if (mode === 'async') {
         const res = await api.dispatchAsync(body)
@@ -221,6 +246,23 @@ export default function Command() {
           placeholder="例如：分析 workspace/test.csv 并报告行数"
         />
         <div className="grid grid-cols-2 md:grid-cols-4 gap-2 mt-2">
+          <label className="text-xs text-slate-500">
+            会话（连续对话）
+            <div className="mt-1 flex gap-1">
+              <select value={sessionId} onChange={(e) => pickSession(e.target.value)}
+                className="flex-1 min-w-0 px-2 py-1 text-sm border border-slate-300 rounded bg-white"
+                title="选中会话后派发自动携带历史轮次；新会话请点右侧 ＋">
+                <option value="">单发（不记忆）</option>
+                {(sessionList?.sessions ?? []).map((s) => (
+                  <option key={s.session_id} value={s.session_id}>
+                    {(s.title || s.session_id).slice(0, 24)}（{s.turn_count}轮）
+                  </option>
+                ))}
+              </select>
+              <button onClick={newSession} title="创建新会话"
+                className="px-2 py-1 text-sm rounded bg-mint-50 text-mint-700 hover:bg-mint-100 border border-mint-200">＋</button>
+            </div>
+          </label>
           <label className="text-xs text-slate-500">
             role
             <input value={role} disabled={!!workerId} onChange={(e) => setRole(e.target.value)}

@@ -179,6 +179,8 @@ export interface DispatchBody {
   context_task_ids?: string[]
   // 运行时 Provider：只传 provider 名（密钥不入请求体）；省略=用 brain 当前默认
   provider?: string | null
+  // 持久会话 id：历史轮次注入上下文延续对话，本轮记入会话；null=单发独立任务
+  session_id?: string | null
 }
 
 /** Provider（brain providers.json 遮蔽视图）：密钥已打码 */
@@ -375,9 +377,43 @@ export interface AuditEntry {
   timestamp: string
   task_id: string | null
   stage: 'dispatch' | 'product_check' | 'approve'
-  decision: 'block' | 'warn' | 'pass' | 'force' | 'approve' | 'reject'
+  decision: 'block' | 'warn' | 'pass' | 'force' | 'approve' | 'reject' | 'budget_exceeded'
   matched_rules: string[]
   operator: string | null
   llm_enhanced: boolean
   reason?: string
+}
+
+/** 全局/每日预算快照（GET/PUT /budgets；null 上限 = 不限制） */
+export interface BudgetSnapshot {
+  global_limit_usd: number | null
+  daily_limit_usd: number | null
+  spent_total_usd: number
+  spent_today_usd: number
+  global_remaining_usd: number | null
+  daily_remaining_usd: number | null
+  updated_at: number
+}
+
+/** 持久会话（派发链路连续对话，GET /sessions 列表项） */
+export interface BrainSession {
+  session_id: string
+  title: string
+  created_at: number | null
+  updated_at: number | null
+  turn_count: number
+}
+
+/** 会话轮次（GET /sessions/{id}：prompt 本地落盘，status/output 按 task_id 联表任务库） */
+export interface BrainSessionTurn {
+  at: number
+  prompt: string
+  task_id: string
+  status?: string
+  error?: string | null
+  output?: string
+}
+
+export interface BrainSessionDetail extends Omit<BrainSession, 'turn_count'> {
+  turns: BrainSessionTurn[]
 }

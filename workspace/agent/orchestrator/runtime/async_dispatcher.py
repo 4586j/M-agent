@@ -48,6 +48,7 @@ class AsyncRemoteDispatcher:
         poll_max: int = 600,
         brain_url: str = "http://127.0.0.1:7000",
         event_bus: TaskEventBus | None = None,
+        on_spend: Callable[[float], None] | None = None,
     ):
         self.task_store = task_store
         self.registry = registry
@@ -63,6 +64,7 @@ class AsyncRemoteDispatcher:
         self.poll_max = poll_max
         self.brain_url = brain_url
         self.event_bus = event_bus
+        self.on_spend = on_spend  # 预算记账钩子：终态时上报 cost_usd（可 None）
         self._tasks: dict[str, asyncio.Task] = {}
         # 后台轮询并发限流：避免海量异步任务同时轮询打满连接/线程资源
         max_concurrent = int(os.environ.get("ORCH_ASYNC_MAX_CONCURRENT", "20"))
@@ -238,6 +240,7 @@ class AsyncRemoteDispatcher:
             task_id, status=st, output=out,
             artifacts=arts, error=err, verdict=verdict, meta=meta,
         )
+        self._report_spend(meta)
         log.info("[trace=%s] task=%s terminal status=%s", rec.trace_id, task_id, st)
         publish_task_event(self.event_bus, task_id, event="done", state=st,
                            trace_id=rec.trace_id,
@@ -250,6 +253,18 @@ class AsyncRemoteDispatcher:
             )
         write_result_note(self.memory_store, task_id, st, out, err)
         self._tasks.pop(task_id, None)
+
+    def _report_spend(self, meta: dict) -> None:
+        """把回传 meta 里的 cost_usd 上报预算账本；失败只记日志不阻断收尾。"""
+        if self.on_spend is None or not isinstance(meta, dict):
+            return
+        cost = meta.get("cost_usd")
+        if not isinstance(cost, (int, float)) or isinstance(cost, bool) or cost <= 0:
+            return
+        try:
+            self.on_spend(float(cost))
+        except Exception:  # noqa: BLE001 - 记账失败不影响任务结果
+            log.warning("预算记账失败 cost=%s: %r", cost, exc_info=True)
 
     def _worker_base(self, worker_id: str) -> str:
         w = self.registry.get_worker(worker_id)

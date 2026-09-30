@@ -340,8 +340,14 @@ def build_memory_tools(config: "AgentConfig") -> list:
     for spec in _TOOL_SPECS:
         if sdk_tool is not None:
             # 用闭包绑定当前 spec，避免 late-binding 拿到循环末尾的值
-            def _handler(args, _spec=spec):
-                return _run_tool(backend, _spec, args)
+            if config.tool_guard_enabled:
+                # 守卫开启：经 guarded_tool_call 执行（输入预检/超时/缓存/
+                # 记忆工具重试/响应校验），让 config.tool_guard_* 真实生效
+                def _handler(args, _spec=spec, _backend=backend):
+                    return _guarded_run(config, _spec, _backend, args)
+            else:
+                def _handler(args, _spec=spec):
+                    return _run_tool(backend, _spec, args)
             tools.append(sdk_tool(spec["name"], spec["description"],
                                   spec["schema"])(_handler))
         else:
@@ -362,6 +368,38 @@ async def _run_tool(backend: dict, spec: dict, args: dict) -> dict:
     except Exception as e:  # 后端错误（如 runtime 不可达）以工具错误返回
         return {"content": [{"type": "text", "text": f"{spec['name']} 失败：{e}"}],
                 "is_error": True}
+
+
+async def _guarded_run(config: "AgentConfig", spec: dict,
+                       backend: dict, args: dict) -> dict:
+    """经 tool_guard.guarded_tool_call 执行记忆工具。
+
+    与 _run_tool 的裸调用相比：输入预检、超时控制、读缓存、失败自动重试
+    （记忆工具 1 次）、响应结构校验全部生效；写工具成功后失效读缓存，
+    避免后续读到陈旧快照。
+    """
+    from agent_core.tool_guard import guarded_tool_call, invalidate_tool_cache
+
+    async def _invoke(a):
+        # 成功结果包成 MCP 文本格式（与 _run_tool 一致），守卫的错误路径
+        # 自产 is_error dict；异常上抛交给守卫重试/转换
+        return _text_result(await spec["call"](backend, a))
+
+    result, record = await guarded_tool_call(
+        spec["name"], _invoke, args or {},
+        schema=spec["schema"],
+        timeout=config.tool_guard_timeout,
+        cache_ttl=config.tool_guard_cache_ttl,
+        guard_enabled=True,
+        response_validation=config.tool_response_validation_enabled,
+    )
+    if not record.is_error and spec["name"].startswith(("write_", "delete_")):
+        invalidate_tool_cache()
+    if record.is_error:
+        log.warning("记忆工具 %s 守卫记录：%s", spec["name"], record.to_dict())
+    else:
+        log.debug("记忆工具 %s 守卫记录：%s", spec["name"], record.to_dict())
+    return result
 
 
 def build_memory_mcp_server(config: "AgentConfig"):

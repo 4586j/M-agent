@@ -61,6 +61,12 @@ class Config:
     # provider 池（runtime/providers.json，gitignore）+ 默认 provider 热切起点
     providers_file: str = str(_default_runtime_dir() / "providers.json")
     default_provider: str = ""  # ORCH_DEFAULT_PROVIDER：起始默认，面板/API 可热切
+    # 全局/每日预算闸门（runtime/budgets.json 账本；0=不限制，PUT /budgets 可热调）
+    budgets_file: str = str(_default_runtime_dir() / "budgets.json")
+    budget_global_usd: float = 0.0
+    budget_daily_usd: float = 0.0
+    # 持久会话（派发链路连续对话；每会话一个 JSON 文件）
+    sessions_dir: str = str(_default_runtime_dir() / ".sessions")
 
 
 def load_config() -> Config:
@@ -97,4 +103,12 @@ def load_config() -> Config:
             "ORCH_PROVIDERS_FILE",
             str(_default_runtime_dir() / "providers.json")),
         default_provider=os.environ.get("ORCH_DEFAULT_PROVIDER", ""),
+        budgets_file=os.environ.get(
+            "ORCH_BUDGETS_FILE",
+            str(_default_runtime_dir() / "budgets.json")),
+        budget_global_usd=float(os.environ.get("ORCH_BUDGET_GLOBAL_USD", "0") or 0),
+        budget_daily_usd=float(os.environ.get("ORCH_BUDGET_DAILY_USD", "0") or 0),
+        sessions_dir=os.environ.get(
+            "ORCH_SESSIONS_DIR",
+            str(_default_runtime_dir() / ".sessions")),
     )

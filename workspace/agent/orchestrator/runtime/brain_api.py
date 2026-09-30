@@ -37,6 +37,8 @@ from schedule_store import ScheduleStore
 from task_scheduler import TaskScheduler
 from auth import add_auth_middleware
 from event_bus import TaskEventBus
+from budget_store import BudgetStore
+from session_store import SessionStore
 
 from brain_routers import (
     BrainDeps,
@@ -67,6 +69,8 @@ from brain_routers import (
     create_experiences_router,
     create_schedules_router,
     create_proxy_router,
+    create_budget_router,
+    create_sessions_router,
 )
 
 
@@ -117,7 +121,9 @@ def create_brain_app(registry: WorkerRegistry, task_store: TaskStore, cfg: Confi
                      http_call=None,
                      advisor=None,
                      translator=None,
-                     provider_store: ProviderStore | None = None) -> FastAPI:
+                     provider_store: ProviderStore | None = None,
+                     budget_store: BudgetStore | None = None,
+                     session_store: SessionStore | None = None) -> FastAPI:
     """dispatcher 可选：remote 模式传入 RemoteDispatcher，使派发与注册状态同进程。
 
     所有路由端点按资源拆在 brain_routers 的 router 工厂里；本函数只负责
@@ -155,6 +161,18 @@ def create_brain_app(registry: WorkerRegistry, task_store: TaskStore, cfg: Confi
         cfg.providers_file)
     resolve_provider_name = _make_provider_resolver(provider_store, cfg.default_provider)
 
+    # 全局/每日预算账本：cfg 环境变量（>0 时）作为初始上限；为 0 不写——
+    # 保留账本里已持久化的用户设置（否则重启会把热调过的上限清回「不限制」）。
+    # 传入 budget_store 时（_build_app 装配）与派发器共用同一实例，记账/闸门一致。
+    if budget_store is None:
+        budget_store = BudgetStore(cfg.budgets_file)
+        if cfg.budget_global_usd > 0 or cfg.budget_daily_usd > 0:
+            budget_store.set_limits(global_limit_usd=cfg.budget_global_usd,
+                                    daily_limit_usd=cfg.budget_daily_usd)
+    # 持久会话（派发链路连续对话）：缺省按 cfg 目录自建，传入时（_build_app）共享
+    if session_store is None:
+        session_store = SessionStore(cfg.sessions_dir)
+
     deps = BrainDeps(
         cfg=cfg, registry=registry, task_store=task_store, bus=bus,
         http_call=http_call,
@@ -164,13 +182,16 @@ def create_brain_app(registry: WorkerRegistry, task_store: TaskStore, cfg: Confi
         schedule_store=schedule_store, task_scheduler=task_scheduler,
         advisor=advisor, translator=translator, provider_store=provider_store,
         resolve_provider_name=resolve_provider_name,
+        budget_store=budget_store,
+        session_store=session_store,
     )
     for make_router in (
         create_auth_router, create_providers_router, create_tasks_router,
         create_approval_router, create_dispatch_router, create_secretary_router,
         create_sse_router, create_stats_router, create_memory_router,
         create_procedural_router, create_experiences_router,
-        create_schedules_router, create_proxy_router,
+        create_schedules_router, create_proxy_router, create_budget_router,
+        create_sessions_router,
     ):
         app.include_router(make_router(deps))
 
@@ -291,6 +312,11 @@ def _build_app() -> FastAPI:
     # 全链路共享事件总线：dispatcher/async_dispatcher/retry/brain 同一实例，
     # 保证 SSE 订阅能收到派发、回调与终态事件
     bus = TaskEventBus()
+    # 全局/每日预算账本：派发器记账与 /dispatch 闸门、/budgets API 共用同一实例
+    budget_store = BudgetStore(cfg.budgets_file)
+    if cfg.budget_global_usd > 0 or cfg.budget_daily_usd > 0:
+        budget_store.set_limits(global_limit_usd=cfg.budget_global_usd,
+                                daily_limit_usd=cfg.budget_daily_usd)
     if cfg.mode == "remote":
         strategy = os.environ.get("ORCH_SELECT_STRATEGY", "round_robin")
         product_check = (lambda c: security_check(c, use_llm=cfg.security_llm))
@@ -303,7 +329,8 @@ def _build_app() -> FastAPI:
                                       memory_store=mem_store,
                                       max_retries=cfg.max_retries,
                                       check_max_chars=cfg.security_check_max_chars,
-                                      event_bus=bus)
+                                      event_bus=bus,
+                                      on_spend=budget_store.record_spend)
         async_disp = AsyncRemoteDispatcher(
             task_store=store, registry=registry,
             async_http=async_http_call, select_strategy=strategy,
@@ -315,6 +342,7 @@ def _build_app() -> FastAPI:
             poll_max=cfg.async_poll_max,
             brain_url=cfg.brain_url,
             event_bus=bus,
+            on_spend=budget_store.record_spend,
         )
         retry_mgr = RetryManager(
             task_store=store, registry=registry, dispatcher=dispatcher,
@@ -342,6 +370,7 @@ def _build_app() -> FastAPI:
             memory_store=mem_store,
             product_check=product_check,
             event_bus=bus,
+            on_spend=budget_store.record_spend,
         )
     # AI 推荐/解释顾问：自建独立上下文，local/remote 两种模式均可用（与派发器无耦合）。
     # 构建失败不拖垮 brain 启动（降级为 /recommend 返回未配置）。
@@ -366,7 +395,8 @@ def _build_app() -> FastAPI:
                             schedule_store=sched_store, task_scheduler=scheduler,
                             async_dispatcher=async_disp, event_bus=bus,
                             advisor=advisor, translator=translator,
-                            provider_store=provider_store)
+                            provider_store=provider_store,
+                            budget_store=budget_store)
 
 
 if __name__ == "__main__":

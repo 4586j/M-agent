@@ -130,6 +130,9 @@ class RunReq(BaseModel):
     cwd: str | None = Field(None, description="任务工作目录（绝对路径）；缺省在 work_dir 下自动创建")
     model: str | None = Field(None, description="模型覆盖（如 qwen3.8-flash）；缺省用 persona/配置默认")
     planning_enabled: bool | None = Field(None, description="true 时用 Plan-Execute 引擎（异步路径）；计划步骤实时产出 plan_update 事件")
+    session_id: str | None = Field(
+        None, description="持久会话 id（POST /agent/session/persist 创建）："
+                          "历史轮次注入上下文延续对话，本轮结果落盘会话文件")
 
 
 class SessionCreateReq(BaseModel):
@@ -319,21 +322,23 @@ _POLICY_DEFAULT: dict = {
 def _load_policy() -> dict:
     """加载工作区边界策略：<project_root>/.agent_policy.json（缺省用内置默认）。
 
-    文件缺失/字段缺失/JSON 损坏均静默回退默认——策略是增强，不是依赖。
+    文件缺失/字段缺失回退默认——策略是增强，不是依赖；
+    但 JSON 损坏必须告警（策略从未生效却无感知是最危险的静默失败）。
     """
     global _POLICY
     if _POLICY is not None:
         return _POLICY
     merged = json.loads(json.dumps(_POLICY_DEFAULT))  # 深拷贝内置默认
-    try:
-        pf = Path(get_config().project_root or os.getcwd()) / ".agent_policy.json"
-        if pf.exists():
+    pf = Path(get_config().project_root or os.getcwd()) / ".agent_policy.json"
+    if pf.exists():
+        try:
             user = json.loads(pf.read_text(encoding="utf-8"))
             wb = user.get("workspace_boundary", {})
             merged["workspace_boundary"].update(
                 {k: v for k, v in wb.items() if k in merged["workspace_boundary"]})
-    except Exception:  # noqa: BLE001 - 策略文件损坏回退默认
-        pass
+        except (json.JSONDecodeError, UnicodeDecodeError, OSError) as e:
+            logger.warning("策略文件 %s 解析失败（%s），已回退内置默认策略——"
+                           "请修复该文件后重启服务", pf, e)
     _POLICY = merged
     return merged
 
@@ -460,6 +465,72 @@ def _make_event_sink(run_id: str):
             f.write(json.dumps(event, ensure_ascii=False, default=str) + "\n")
 
     return sink
+
+
+# ---- 持久会话（Agent 面板连续对话：<work_dir>/sessions/<sid>.json） ----
+#
+# 与 _SESSIONS（进程内 SDK 会话，真上下文但随进程消失）互补：持久会话把
+# 每轮 prompt/output 落盘，重启后可回看；续聊时把历史轮次作为 context_memory
+# 注入（复用内核既有通道），刷新/重启后对话不丢。
+
+_SESSIONS_DIR_LOCK = threading.Lock()
+_SID_RE = re.compile(r"[0-9a-f]{12}")
+# 注入上下文的历史轮次预算：最近 8 轮，每轮输出截 1500 字符，总块 6000 字符
+_SESSION_HISTORY_TURNS = 8
+_SESSION_TURN_OUTPUT_CHARS = 1500
+_SESSION_HISTORY_CHARS = 6000
+
+
+def _sessions_dir() -> Path:
+    d = _runs_dir().parent / "sessions"
+    with _SESSIONS_DIR_LOCK:
+        d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _session_path(sid: str) -> Path:
+    """会话文件路径；sid 非法直接 400（防路径穿越）。"""
+    if not _SID_RE.fullmatch(sid):
+        raise HTTPException(status_code=400, detail="session_id 非法（须为 12 位 hex）")
+    return _sessions_dir() / f"{sid}.json"
+
+
+def _load_session(sid: str) -> dict:
+    p = _session_path(sid)
+    if not p.exists():
+        raise HTTPException(status_code=404, detail="session not found")
+    try:
+        rec = json.loads(p.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError, OSError) as e:
+        raise HTTPException(status_code=500, detail=f"会话文件损坏：{e}")
+    if not isinstance(rec, dict) or "turns" not in rec:
+        raise HTTPException(status_code=500, detail="会话文件结构异常")
+    return rec
+
+
+def _save_session(rec: dict) -> None:
+    p = _session_path(rec["session_id"])
+    tmp = p.with_suffix(".tmp")
+    tmp.write_text(json.dumps(rec, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(tmp, p)
+
+
+def _session_history_block(rec: dict) -> str:
+    """把会话历史轮次收敛为注入上下文的文本块（最近 N 轮，逐轮截断）。"""
+    turns = rec.get("turns") or []
+    recent = turns[-_SESSION_HISTORY_TURNS:]
+    if not recent:
+        return ""
+    lines: list[str] = []
+    for t in recent:
+        out = str(t.get("output") or "（无输出）")
+        if len(out) > _SESSION_TURN_OUTPUT_CHARS:
+            out = out[:_SESSION_TURN_OUTPUT_CHARS] + "…"
+        lines.append(f"用户：{t.get('prompt', '')}\n助手：{out}")
+    block = "\n\n".join(lines)
+    if len(block) > _SESSION_HISTORY_CHARS:
+        block = block[-_SESSION_HISTORY_CHARS:]
+    return "【会话历史（此前轮次摘要，供延续对话用）】\n" + block
 
 
 async def _run_session_turn(session: Any, prompt: str,
@@ -836,17 +907,27 @@ def create_runs_router() -> APIRouter:
         """单发流式执行（SSE）。事件名：thinking/thinking_delta/text_delta/
         tool_use/tool_result/plan_update/budget_warning/result/error；
         data 为 JSON，payload 超长截断（2000 字符）。
-        全量事件落 <work_dir>/runs/<run_id>.jsonl 供面板回放；结束后写历史。"""
+        全量事件落 <work_dir>/runs/<run_id>.jsonl 供面板回放；结束后写历史。
+        带 session_id 时：历史轮次注入 context_memory（连续对话），本轮
+        prompt/output 落盘会话文件（重启后可回看续聊）。"""
         persona = resolve_persona(req.persona or _DEFAULT_PERSONA)
         cwd = _prepare_cwd(req.cwd, tag="run")
         kernel = get_kernel()
+        # 持久会话：先校验/加载（404 早失败），历史并入上下文
+        session_rec: dict | None = None
+        history_ctx = ""
+        if req.session_id:
+            session_rec = _load_session(req.session_id)
+            history_ctx = _session_history_block(session_rec)
         run_id = f"run-{uuid.uuid4().hex[:12]}"
         _write_run_meta(run_id, cwd=cwd,
                         prompt=req.prompt[:2000], persona=persona.name,
                         model=req.model or "", status="running",
+                        session_id=req.session_id or "",
                         started_at=round(time.time(), 3))
         sink = _make_event_sink(run_id)
-        events = kernel.stream(req.prompt, persona, cwd, req.context_memory or "",
+        ctx = "\n\n".join(x for x in (history_ctx, req.context_memory or "") if x)
+        events = kernel.stream(req.prompt, persona, cwd, ctx,
                                run_id=run_id, event_sink=sink)
 
         async def _events_with_bookkeeping():
@@ -879,6 +960,26 @@ def create_runs_router() -> APIRouter:
                                         persona=persona.name, run_id=run_id)
                 else:
                     _write_run_meta(run_id, status="interrupted")
+                # 持久会话收尾：本轮 prompt/output 落盘（含失败/中断——真实过程
+                # 回放需要；输出缺失时如实标注）
+                if session_rec is not None:
+                    output = str(final.get("result")) if final else ""
+                    status = "completed" if final and not final.get("is_error") \
+                        else ("failed" if final else "interrupted")
+                    session_rec.setdefault("turns", []).append({
+                        "at": round(time.time(), 3),
+                        "prompt": req.prompt,
+                        "output": output,
+                        "status": status,
+                        "run_id": run_id,
+                    })
+                    session_rec["updated_at"] = round(time.time(), 3)
+                    if not session_rec.get("title"):
+                        session_rec["title"] = req.prompt[:40]
+                    try:
+                        _save_session(session_rec)
+                    except HTTPException:
+                        pass  # sid 合法性已在入口校验；落盘失败不影响本轮结果
 
         return _streaming_response(_events_with_bookkeeping())
 
@@ -1333,6 +1434,52 @@ def create_sessions_router() -> APIRouter:
         except Exception:  # noqa: BLE001 - 关闭失败不影响移除
             pass
         return {"status": "closed", "session_id": session_id}
+
+    # ---- 持久会话（连续对话落盘：重启后可回看/续聊；/agent/run/stream 消费） ----
+
+    @router.post("/agent/session/persist")
+    def agent_session_persist_create() -> dict:
+        """创建持久会话（空轮次），返回 session_id；首条消息后写 title。"""
+        sid = uuid.uuid4().hex[:12]
+        now = round(time.time(), 3)
+        _save_session({"session_id": sid, "title": "", "created_at": now,
+                       "updated_at": now, "turns": []})
+        return {"session_id": sid}
+
+    @router.get("/agent/persisted-sessions")
+    def agent_persisted_sessions_list() -> dict:
+        """列出持久会话（按最近更新倒序，供面板会话选择器）。"""
+        out = []
+        for p in sorted(_sessions_dir().glob("*.json"),
+                        key=lambda p: p.stat().st_mtime, reverse=True):
+            try:
+                rec = json.loads(p.read_text(encoding="utf-8"))
+            except Exception:  # noqa: BLE001 - 损坏文件跳过不拖垮列表
+                continue
+            if not isinstance(rec, dict):
+                continue
+            out.append({
+                "session_id": rec.get("session_id") or p.stem,
+                "title": rec.get("title") or "",
+                "created_at": rec.get("created_at"),
+                "updated_at": rec.get("updated_at"),
+                "turn_count": len(rec.get("turns") or []),
+            })
+        return {"sessions": out, "count": len(out)}
+
+    @router.get("/agent/persisted-sessions/{session_id}")
+    def agent_persisted_session_get(session_id: str) -> dict:
+        """读取持久会话全量轮次（面板刷新/重启后回放）。"""
+        return _load_session(session_id)
+
+    @router.delete("/agent/persisted-sessions/{session_id}")
+    def agent_persisted_session_delete(session_id: str) -> dict:
+        """删除持久会话文件。"""
+        p = _session_path(session_id)
+        if not p.exists():
+            raise HTTPException(status_code=404, detail="session not found")
+        p.unlink()
+        return {"status": "deleted", "session_id": session_id}
 
     return router
 

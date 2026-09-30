@@ -3,7 +3,8 @@ import type {
   RecommendBody, RecommendResponse, TranslateBody, TranslateResponse,
   MemoryCoreItem, ContextNotesResponse, ExperienceRecord, ExperienceSearchBody,
   ProposalRecord, ReflectionReport, ScheduleRecord, ScheduleBody, AuditEntry,
-  NodeStatus, ProviderList, ProviderPutBody,
+  NodeStatus, ProviderList, ProviderPutBody, BudgetSnapshot,
+  BrainSession, BrainSessionDetail,
 } from '../types'
 import { getActiveConnection } from './connections'
 
@@ -175,10 +176,24 @@ export const api = {
       `/proxy/artifact?worker_id=${encodeURIComponent(workerId)}&task_id=${encodeURIComponent(taskId)}&path=${encodeURIComponent(path)}`,
     ),
 
+  // ---- 全局/每日预算（GET 快照 / PUT 热调上限；null=不限制） ----
+
+  budgets: () => request<BudgetSnapshot>('/budgets'),
+  putBudgets: (body: { global_limit_usd: number | null; daily_limit_usd: number | null }) =>
+    request<BudgetSnapshot>('/budgets', { method: 'PUT', body: JSON.stringify(body) }),
+
+  // ---- 持久会话（派发链路连续对话：历史轮次注入上下文） ----
+
+  createSession: () => request<{ session_id: string }>('/sessions', { method: 'POST' }),
+  sessions: () => request<{ sessions: BrainSession[] }>('/sessions'),
+  session: (id: string) =>
+    request<BrainSessionDetail>(`/sessions/${encodeURIComponent(id)}`),
+  deleteSession: (id: string) =>
+    request<{ status: string }>(`/sessions/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+
   // ---- 运行时 Provider 池（模型/端点/密钥；密钥只写 brain providers.json） ----
 
-  providers: () => request<ProviderList>('/providers'),
-  putProvider: (body: ProviderPutBody) =>
+  providers: () => request<ProviderList>('/providers'),  putProvider: (body: ProviderPutBody) =>
     request<{ status: string; name: string }>('/providers', {
       method: 'PUT', body: JSON.stringify(body),
     }),

@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react'
-import type { TaskRecord, TaskStatus } from '../types'
+import type { TaskRecord, TaskStatus, BudgetSnapshot } from '../types'
 import { usePolling } from '../hooks/usePolling'
 import { POLL } from '../polling'
 import { useActiveConnectionId } from '../api/connections'
@@ -8,6 +8,7 @@ import { fmtUsd, timeAgo } from '../utils'
 import { statusDot } from '../types'
 import StatusBadge from '../components/StatusBadge'
 import TaskDetailDrawer from '../components/TaskDetailDrawer'
+import BudgetBar from '../components/BudgetBar'
 
 const STATUSES: (TaskStatus | 'all')[] = [
   'all', 'running', 'awaiting_approval', 'pending', 'done', 'failed', 'lost', 'cancelled',
@@ -16,6 +17,8 @@ const STATUSES: (TaskStatus | 'all')[] = [
 /** 任务全集：多维筛选 + 实时详情抽屉（SSE） */
 export default function Tasks() {
   const { data: tasks, error, refresh } = usePolling<TaskRecord[]>(() => api.tasks(), POLL.tasks)
+  const { data: budget, refresh: refreshBudget } = usePolling<BudgetSnapshot>(
+    () => api.budgets(), POLL.stats)
   const [status, setStatus] = useState<TaskStatus | 'all'>('all')
   const [role, setRole] = useState('all')
   const [worker, setWorker] = useState('all')
@@ -62,6 +65,9 @@ export default function Tasks() {
 
   return (
     <div>
+      {/* 预算总闸：全局/当日已用 + 热调上限 */}
+      <BudgetBar budget={budget} onChange={refreshBudget} />
+
       {/* 筛选栏 */}
       <div className="bg-white rounded-2xl border border-mint-100 shadow-mint-sm p-4 mb-5 flex flex-wrap items-center gap-2 text-xs">
         <div className="flex flex-wrap gap-1">

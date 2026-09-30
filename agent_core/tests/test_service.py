@@ -133,6 +133,10 @@ def client(monkeypatch, cfg):
                         {"runs": 0, "errors": 0, "total_cost_usd": 0.0,
                          "total_turns": 0})
     monkeypatch.setattr(service, "_HEALTH_CHECKS", None)
+    # 限流表是模块级全局：不重置则前序测试文件的请求量会把本文件的
+    # 非流式请求顶到 429（rate_limit_per_minute）
+    monkeypatch.setattr(service, "_RATE_LIMIT_STORE", {})
+    monkeypatch.setattr(service, "_RATE_LIMIT_CALLS", 0, raising=False)
     from agent_core.service import create_app
     with TestClient(create_app("executor")) as c:
         c.kernel = kernel

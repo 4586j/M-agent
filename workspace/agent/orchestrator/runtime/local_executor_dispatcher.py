@@ -78,7 +78,8 @@ class LocalExecutorDispatcher(Dispatcher):
                  now_fn: Callable[[], str] | None = None,
                  check_max_chars: int = 6000,
                  event_bus: TaskEventBus | None = None,
-                 journal: RunStore | None = None):
+                 journal: RunStore | None = None,
+                 on_spend: Callable[[float], None] | None = None):
         self.task_store = task_store
         self.config = config or load_agent_config()
         self.experience_store = experience_store
@@ -88,6 +89,7 @@ class LocalExecutorDispatcher(Dispatcher):
         self._now = now_fn or (lambda: str(int(time.time())))
         self.check_max_chars = check_max_chars
         self.event_bus = event_bus
+        self.on_spend = on_spend  # 预算记账钩子：任务终态时上报 cost_usd（可 None）
         self._kernel = AgentKernel(self.config)
         self._persona_cache: dict[str, Persona] = {}
         # 在飞任务的协作式取消事件（P0：本地取消须真正停掉本地执行）。
@@ -322,6 +324,15 @@ class LocalExecutorDispatcher(Dispatcher):
         meta["use_experience"] = bool(use_experience)
         put_provider_name(meta, provider)
         meta.update(_kernel_meta(result))
+        # 预算记账：内核真实花费（含被取消任务的已消耗部分）上报账本
+        if self.on_spend is not None:
+            cost = meta.get("cost_usd")
+            if isinstance(cost, (int, float)) and not isinstance(cost, bool) \
+                    and cost > 0:
+                try:
+                    self.on_spend(float(cost))
+                except Exception:  # noqa: BLE001 - 记账失败不影响收尾
+                    log.warning("预算记账失败 cost=%s: %r", cost, exc_info=True)
         # 取消不可覆盖（P0）：仅当任务仍处运行态才写入终态；若 cancel 端点
         # 已置 cancelled（终态、不可变），迟到的收尾写入不得覆盖它。
         final = self.task_store.finalize_if(

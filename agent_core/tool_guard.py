@@ -158,7 +158,8 @@ async def guarded_tool_call(tool_name: str, handler, args: dict | None,
                             schema: dict | None = None,
                             timeout: int = 30,
                             cache_ttl: int = 300,
-                            guard_enabled: bool = True
+                            guard_enabled: bool = True,
+                            response_validation: bool = True
                             ) -> tuple[dict, ToolCallRecord]:
     """带守卫的工具调用包装器。
 
@@ -171,6 +172,7 @@ async def guarded_tool_call(tool_name: str, handler, args: dict | None,
     3. 执行（asyncio.wait_for 超时控制）
     4. 失败重试（记忆工具 1 次，其他不重试）
     5. 写缓存 + 记录
+    6. 工具响应结构校验（guard_enabled 且 response_validation 时，仅告警不阻断）
     """
     args = args or {}
     input_hash = _hash_input(tool_name, args)
@@ -246,7 +248,8 @@ async def guarded_tool_call(tool_name: str, handler, args: dict | None,
         _tool_cache.put(cache_key, result, ttl=cache_ttl)
 
     # 6. 工具响应验证（仅记录警告，不阻断）
-    if guard_enabled and not record.is_error and isinstance(result, dict):
+    if guard_enabled and response_validation and not record.is_error \
+            and isinstance(result, dict):
         try:
             rv = validate_tool_response(tool_name, result)
             if rv.warnings:

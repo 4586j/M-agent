@@ -126,7 +126,8 @@ class RemoteDispatcher(Dispatcher):
                  memory_store: MemoryStore | None = None,
                  max_retries: int = 0,
                  check_max_chars: int = 6000,
-                 event_bus: TaskEventBus | None = None):
+                 event_bus: TaskEventBus | None = None,
+                 on_spend: Callable[[float], None] | None = None):
         self.task_store = task_store
         self.registry = registry
         self.http_call = http_call  # (method, url, **kwargs) -> {"status_code", "json"}
@@ -138,6 +139,19 @@ class RemoteDispatcher(Dispatcher):
         self.max_retries = max_retries
         self.check_max_chars = check_max_chars
         self.event_bus = event_bus
+        self.on_spend = on_spend  # 预算记账钩子：任务终态时上报 cost_usd（可 None）
+
+    def _report_spend(self, meta: dict) -> None:
+        """把回传 meta 里的 cost_usd 上报预算账本；失败只记日志不阻断收尾。"""
+        if self.on_spend is None or not isinstance(meta, dict):
+            return
+        cost = meta.get("cost_usd")
+        if not isinstance(cost, (int, float)) or isinstance(cost, bool) or cost <= 0:
+            return
+        try:
+            self.on_spend(float(cost))
+        except Exception:  # noqa: BLE001 - 记账失败不影响任务结果
+            log.warning("预算记账失败 cost=%s: %r", cost, exc_info=True)
 
     def dispatch(self, role: str, prompt: str,
                  context_memory: str | None = None, model: str | None = None,
@@ -226,6 +240,7 @@ class RemoteDispatcher(Dispatcher):
                     artifacts=arts, error=data.get("error"), verdict=verdict,
                     meta=meta,
                 )
+                self._report_spend(meta)
                 log.info("[trace=%s] task=%s terminal status=%s", trace_id, task_id, st)
                 publish_task_event(self.event_bus, task_id, event="done", state=st,
                                    trace_id=trace_id,

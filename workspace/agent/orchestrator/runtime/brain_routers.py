@@ -5,6 +5,7 @@
 安全前置关卡 /dispatch 与 /dispatch/async 共用 _preflight，杜绝判定逻辑分叉。
 """
 import asyncio
+import logging
 import os
 import time
 import uuid
@@ -33,6 +34,10 @@ from safe_id import validate_id, validate_host
 from dispatch_common import (USAGE_KEYS, clamp_context, assemble_context)
 from audit_log import record_security_event
 from event_bus import TaskEvent, TaskEventBus, TERMINAL_STATUSES, publish_task_event
+from budget_store import BudgetStore
+from session_store import SessionStore
+
+log = logging.getLogger(__name__)
 
 
 # ---- 请求体模型（原 brain_api 顶层；brain_api 再导出以兼容既有 import）----
@@ -75,6 +80,9 @@ class DispatchReq(BaseModel):
     # 运行时 Provider：只传 provider 名（密钥不入请求体/审计/审批缓存）。
     # 未指定 → 用 brain 当前默认 provider；都没有 → worker 走自身配置/进程 env。
     provider: str | None = None
+    # 持久会话 id（POST /sessions 创建）：历史轮次注入 context_memory 延续对话，
+    # 本轮 prompt+task_id 落盘会话文件；缺省 None = 单发独立任务（行为不变）。
+    session_id: str | None = None
 
 
 class AdvisorReq(BaseModel):
@@ -180,6 +188,8 @@ class BrainDeps:
     translator: Any = None
     provider_store: ProviderStore | None = None
     resolve_provider_name: Callable[[str | None], dict | None] | None = None
+    budget_store: BudgetStore | None = None
+    session_store: SessionStore | None = None
 
 
 # ---- 共享 helper（原 create_brain_app 内层闭包，提为依赖显式传入的纯函数）----
@@ -357,12 +367,22 @@ class _PreflightOk:
 def _preflight(deps: BrainDeps, req: DispatchReq, request: Request) -> _PreflightOk:
     """/dispatch 与 /dispatch/async 共用前置安全管线。
 
-    校验 worker_id →（非 force）security-guard + 全量审计 → block 转 _await_approval
-    → force 分支审计 → 装配上下文（引用任务并入 + clamp）→ 启发式模型路由 →
-    provider 名解析。返回派发所需上下文；approval 非 None 时调用方直接返回它。
+    预算总闸 → 校验 worker_id →（非 force）security-guard + 全量审计 →
+    block 转 _await_approval → force 分支审计 → 装配上下文（引用任务并入 +
+    clamp）→ 启发式模型路由 → provider 名解析。返回派发所需上下文；
+    approval 非 None 时调用方直接返回它。预算超限与审批语义不同：直接 429
+    阻断（新任务无 task_id，不存在转待审批的载体），并落审计流水。
     security_check 可能含 LLM 调用：sync /dispatch 直接调用本函数，async 由
     调用方以 asyncio.to_thread 包裹，避免阻塞 brain 事件循环。
     """
+    # 预算总闸：全局/当日超限直接阻断新派发（进行中任务不受影响）
+    if deps.budget_store is not None:
+        allowed, reason = deps.budget_store.check()
+        if not allowed:
+            record_security_event(
+                task_id=None, stage="dispatch", decision="budget_exceeded",
+                operator=_request_operator(request), reason=reason)
+            raise HTTPException(status_code=429, detail=reason)
     if req.worker_id:
         validate_id(req.worker_id, "worker_id")
     if not req.force:
@@ -389,6 +409,12 @@ def _preflight(deps: BrainDeps, req: DispatchReq, request: Request) -> _Prefligh
     context = req.context_memory
     if deps.memory_store is not None and req.context_task_ids:
         context = assemble_context(deps.memory_store, context, req.context_task_ids)
+    # 持久会话：历史轮次注入上下文（连续对话），先会话块再用户自带上下文
+    if req.session_id and deps.session_store is not None:
+        session_ctx = deps.session_store.history_block(
+            req.session_id, task_lookup=deps.task_store.get)
+        if session_ctx:
+            context = f"{session_ctx}\n\n{context}" if context else session_ctx
     context = clamp_context(context, deps.cfg.context_memory_max_chars)
     model = _route_model(deps, req)
     # 运行时 Provider：名 → 三元组（密钥不落盘）；显式名/默认名不可用 → 400
@@ -780,6 +806,7 @@ def create_dispatch_router(deps: BrainDeps) -> APIRouter:
                 worker_id=req.worker_id, provider=pf.provider)
         except RuntimeError as e:
             return {"status": "failed", "error": str(e)}
+        _record_session_turn(deps, req, res.task_id)
         return {
             "task_id": res.task_id, "status": res.status,
             "output": res.output, "artifacts": res.artifacts, "error": res.error,
@@ -806,10 +833,23 @@ def create_dispatch_router(deps: BrainDeps) -> APIRouter:
             )
         except RuntimeError as e:
             return {"status": "failed", "error": str(e)}
+        _record_session_turn(deps, req, task_id)
         return {"status": "accepted", "task_id": task_id, "model": pf.model,
                 "provider": pf.provider["name"] if pf.provider else None}
 
     return router
+
+
+def _record_session_turn(deps: BrainDeps, req: DispatchReq, task_id: str) -> None:
+    """派发成功后把本轮 prompt+task_id 记入持久会话（失败/缺省零影响）。"""
+    if not req.session_id or deps.session_store is None:
+        return
+    try:
+        deps.session_store.append_turn(req.session_id, req.prompt, task_id)
+    except KeyError as e:
+        log.warning("会话轮次记录被跳过：%s", e)
+    except Exception as e:  # noqa: BLE001 - 会话记录失败不拖垮派发
+        log.warning("会话轮次记录失败 session=%s: %r", req.session_id, e)
 
 
 def create_secretary_router(deps: BrainDeps) -> APIRouter:
@@ -957,6 +997,92 @@ def create_stats_router(deps: BrainDeps) -> APIRouter:
             "cost": _aggregate_costs(tasks),
             "quality": _aggregate_quality(tasks),
         }
+
+    return router
+
+
+class _BudgetPutReq(BaseModel):
+    """PUT /budgets 请求体：None/0 均视为不限制。"""
+    global_limit_usd: float | None = None
+    daily_limit_usd: float | None = None
+
+
+def create_budget_router(deps: BrainDeps) -> APIRouter:
+    """全局/每日预算：查看快照 + 热调上限（账本 budgets.json 持久化）。"""
+    router = APIRouter()
+
+    @router.get("/budgets")
+    def get_budgets():
+        if deps.budget_store is None:
+            raise HTTPException(status_code=400, detail="budget_store 未配置")
+        return deps.budget_store.snapshot()
+
+    @router.put("/budgets")
+    def put_budgets(req: _BudgetPutReq):
+        if deps.budget_store is None:
+            raise HTTPException(status_code=400, detail="budget_store 未配置")
+        return deps.budget_store.set_limits(
+            global_limit_usd=req.global_limit_usd,
+            daily_limit_usd=req.daily_limit_usd)
+
+    return router
+
+
+def _session_detail(deps: BrainDeps, rec: dict, max_output: int = 3000) -> dict:
+    """会话详情：轮次联表 TaskRecord，补 status/output/error（读取时联表，
+    单一事实源是任务库，无需在终态回写会话）。"""
+    turns = []
+    for t in rec.get("turns") or []:
+        item = dict(t)
+        task = None
+        try:
+            task = deps.task_store.get(t.get("task_id") or "")
+        except Exception:  # noqa: BLE001 - 联表失败降级展示
+            task = None
+        if task is not None:
+            item["status"] = task.status
+            item["error"] = task.error
+            out = str(task.output) if task.output is not None else ""
+            item["output"] = out[:max_output]
+        else:
+            item["status"] = "lost"
+        turns.append(item)
+    return {**rec, "turns": turns}
+
+
+def create_sessions_router(deps: BrainDeps) -> APIRouter:
+    """持久会话（派发链路连续对话）：创建/列表/详情（轮次联表任务输出）/删除。"""
+    router = APIRouter()
+
+    @router.post("/sessions")
+    def create_session():
+        if deps.session_store is None:
+            raise HTTPException(status_code=400, detail="session_store 未配置")
+        rec = deps.session_store.create()
+        return {"session_id": rec["session_id"]}
+
+    @router.get("/sessions")
+    def list_sessions():
+        if deps.session_store is None:
+            raise HTTPException(status_code=400, detail="session_store 未配置")
+        return {"sessions": deps.session_store.list_all()}
+
+    @router.get("/sessions/{session_id}")
+    def get_session(session_id: str):
+        if deps.session_store is None:
+            raise HTTPException(status_code=400, detail="session_store 未配置")
+        rec = deps.session_store.get(session_id)
+        if rec is None:
+            raise HTTPException(status_code=404, detail="session not found")
+        return _session_detail(deps, rec)
+
+    @router.delete("/sessions/{session_id}")
+    def delete_session(session_id: str):
+        if deps.session_store is None:
+            raise HTTPException(status_code=400, detail="session_store 未配置")
+        if not deps.session_store.delete(session_id):
+            raise HTTPException(status_code=404, detail="session not found")
+        return {"status": "deleted", "session_id": session_id}
 
     return router
 
