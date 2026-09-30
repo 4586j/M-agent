@@ -106,6 +106,27 @@ class LocalExecutorDispatcher(Dispatcher):
                       or (self.config.project_root or ".") + "/.agent_work"),
             json_import_dir=getattr(task_store, "store_dir", None))
 
+    def recover_orphans(self) -> int:
+        """启动恢复：把上次进程遗留的 running/pending/dispatching 任务标记 failed。
+
+        本地执行体与 brain 同进程，brain 重启即执行体消亡——遗留的「进行中」
+        任务永远不会有结果，挂着比失败更误导。标记为 failed（error 注明原因），
+        可经重派端点重新执行。返回受影响任务数。仅在 brain 装配（_build_app）
+        时、开始服务之前调用，不会误标本进程新派发的任务。
+        """
+        affected = 0
+        for rec in self.task_store.list_all():
+            if rec.status not in ("running", "pending", "dispatching"):
+                continue
+            original = rec.status  # update 会原地改 rec.status，先留档供日志
+            self.task_store.update(
+                rec.task_id, status="failed",
+                error="brain 重启：本地执行进程中断，任务未完成（可重派）")
+            affected += 1
+            log.warning("[trace=%s] 启动恢复：孤儿任务 task=%s（原状态 %s）标记 failed",
+                        rec.trace_id, rec.task_id, original)
+        return affected
+
     def cancel(self, task_id: str) -> bool:
         """信号本地执行协作式取消：置位在飞任务的 cancel_event。
 

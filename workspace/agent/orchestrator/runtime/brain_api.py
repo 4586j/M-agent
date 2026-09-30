@@ -10,6 +10,7 @@ DispatchReq` 兼容旧引用）。
 GET /stats 附带 cost 成本聚合（按日近 7 天 / 按 role / 按 model，源自 TaskRecord.meta）
 与 quality 输出质量聚合（按 model 统计退化任务数与比率）。
 """
+import logging
 import os
 import sys
 from pathlib import Path
@@ -20,6 +21,8 @@ import requests
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
+
+log = logging.getLogger(__name__)
 
 from task_store import TaskStore
 from worker_registry import WorkerRegistry
@@ -39,6 +42,7 @@ from auth import add_auth_middleware
 from event_bus import TaskEventBus
 from budget_store import BudgetStore
 from session_store import SessionStore
+from webhook import WebhookNotifier, DEFAULT_WEBHOOK_EVENTS
 
 from brain_routers import (
     BrainDeps,
@@ -108,6 +112,41 @@ def _make_provider_resolver(provider_store: ProviderStore,
     return resolve_name
 
 
+def _make_webhook_notifier(cfg: Config) -> WebhookNotifier | None:
+    """按 cfg 构造 webhook 外发器；URL 未配置返回 None（功能关闭）。"""
+    if not cfg.webhook_url:
+        return None
+    events = ({e.strip() for e in cfg.webhook_events.split(",") if e.strip()}
+              if cfg.webhook_events else None)
+    notifier = WebhookNotifier(url=cfg.webhook_url, secret=cfg.webhook_secret,
+                               events=events, timeout=cfg.webhook_timeout,
+                               max_retries=cfg.webhook_max_retries)
+    log.info("webhook 外发已启用 url=%s events=%s",
+             cfg.webhook_url, sorted(notifier._events))
+    return notifier
+
+
+def _make_task_terminal_forwarder(notifier: WebhookNotifier | None):
+    """总线事件 → webhook 事件名的转发器（只转发终态 done 事件）。
+
+    返回 None 当 notifier 未配置：TaskEventBus(on_publish=None) 零开销旁路。
+    """
+    if notifier is None:
+        return None
+
+    def forward(payload: dict) -> None:
+        if payload.get("event") == "done":
+            summary = payload.get("summary")
+            notifier.submit("task_terminal", {
+                "task_id": payload.get("task_id"),
+                "state": payload.get("state"),
+                "trace_id": payload.get("trace_id"),
+                "summary": (summary if isinstance(summary, str) else None),
+            })
+
+    return forward
+
+
 def create_brain_app(registry: WorkerRegistry, task_store: TaskStore, cfg: Config,
                      dispatcher: Dispatcher | None = None,
                      experience_store: ExperienceStore | None = None,
@@ -123,7 +162,8 @@ def create_brain_app(registry: WorkerRegistry, task_store: TaskStore, cfg: Confi
                      translator=None,
                      provider_store: ProviderStore | None = None,
                      budget_store: BudgetStore | None = None,
-                     session_store: SessionStore | None = None) -> FastAPI:
+                     session_store: SessionStore | None = None,
+                     webhook: WebhookNotifier | None = None) -> FastAPI:
     """dispatcher 可选：remote 模式传入 RemoteDispatcher，使派发与注册状态同进程。
 
     所有路由端点按资源拆在 brain_routers 的 router 工厂里；本函数只负责
@@ -132,7 +172,12 @@ def create_brain_app(registry: WorkerRegistry, task_store: TaskStore, cfg: Confi
     AdvisorService（独立上下文推荐/解释）；translator 可选：TranslatorService。
     """
     app = FastAPI()
-    bus = event_bus or TaskEventBus()
+    # 全链路共享事件总线：dispatcher/async_dispatcher/retry/brain 同一实例；
+    # 配置 webhook 时总线事件经旁路回调外发（只转发终态 done 事件）
+    if event_bus is None:
+        bus = TaskEventBus(on_publish=_make_task_terminal_forwarder(webhook))
+    else:
+        bus = event_bus
     if http_call is None:
         http_call = _make_http_call(cfg.api_key)
 
@@ -184,6 +229,7 @@ def create_brain_app(registry: WorkerRegistry, task_store: TaskStore, cfg: Confi
         resolve_provider_name=resolve_provider_name,
         budget_store=budget_store,
         session_store=session_store,
+        webhook=webhook,
     )
     for make_router in (
         create_auth_router, create_providers_router, create_tasks_router,
@@ -309,14 +355,28 @@ def _build_app() -> FastAPI:
     async_disp = None
     sched_store = ScheduleStore(cfg.schedule_store_dir)
     scheduler = None
+    # 关键事件外发（webhook）：URL 未配置时 notifier=None（功能关闭）
+    webhook = _make_webhook_notifier(cfg)
     # 全链路共享事件总线：dispatcher/async_dispatcher/retry/brain 同一实例，
-    # 保证 SSE 订阅能收到派发、回调与终态事件
-    bus = TaskEventBus()
+    # 保证 SSE 订阅能收到派发、回调与终态事件；终态事件经旁路转发 webhook
+    bus = TaskEventBus(on_publish=_make_task_terminal_forwarder(webhook))
     # 全局/每日预算账本：派发器记账与 /dispatch 闸门、/budgets API 共用同一实例
     budget_store = BudgetStore(cfg.budgets_file)
     if cfg.budget_global_usd > 0 or cfg.budget_daily_usd > 0:
         budget_store.set_limits(global_limit_usd=cfg.budget_global_usd,
                                 daily_limit_usd=cfg.budget_daily_usd)
+    # per-worker 熔断板：节点连续失败达阈值即熔断，派发自动跳过（开沿外发事件）
+    breaker_board = None
+    if cfg.circuit_breaker_enabled:
+        from dispatch_breaker import BreakerBoard
+        breaker_board = BreakerBoard(
+            failure_threshold=cfg.circuit_breaker_failure_threshold,
+            recovery_timeout=cfg.circuit_breaker_recovery_timeout,
+            enabled=True,
+            on_open=(lambda wid, failures: webhook.submit(
+                "breaker_open", {"worker_id": wid, "failure_threshold": failures}))
+            if webhook is not None else None,
+        )
     if cfg.mode == "remote":
         strategy = os.environ.get("ORCH_SELECT_STRATEGY", "round_robin")
         product_check = (lambda c: security_check(c, use_llm=cfg.security_llm))
@@ -330,7 +390,8 @@ def _build_app() -> FastAPI:
                                       max_retries=cfg.max_retries,
                                       check_max_chars=cfg.security_check_max_chars,
                                       event_bus=bus,
-                                      on_spend=budget_store.record_spend)
+                                      on_spend=budget_store.record_spend,
+                                      breaker_board=breaker_board)
         async_disp = AsyncRemoteDispatcher(
             task_store=store, registry=registry,
             async_http=async_http_call, select_strategy=strategy,
@@ -343,6 +404,7 @@ def _build_app() -> FastAPI:
             brain_url=cfg.brain_url,
             event_bus=bus,
             on_spend=budget_store.record_spend,
+            breaker_board=breaker_board,
         )
         retry_mgr = RetryManager(
             task_store=store, registry=registry, dispatcher=dispatcher,
@@ -372,6 +434,13 @@ def _build_app() -> FastAPI:
             event_bus=bus,
             on_spend=budget_store.record_spend,
         )
+        # checkpoint 恢复（P1）：本地执行随 brain 进程消亡——上次进程遗留的
+        # running/pending/dispatching 任务已无主，启动时标记 failed 供重派，
+        # 不标记则永远挂在「进行中」（journal 模式另有 RunStore 级对账）
+        recovered = dispatcher.recover_orphans()
+        if recovered:
+            log.warning("启动恢复：%d 个上次进程遗留的未完成任务已标记 failed（可重派）",
+                        recovered)
     # AI 推荐/解释顾问：自建独立上下文，local/remote 两种模式均可用（与派发器无耦合）。
     # 构建失败不拖垮 brain 启动（降级为 /recommend 返回未配置）。
     advisor = None
@@ -396,7 +465,8 @@ def _build_app() -> FastAPI:
                             async_dispatcher=async_disp, event_bus=bus,
                             advisor=advisor, translator=translator,
                             provider_store=provider_store,
-                            budget_store=budget_store)
+                            budget_store=budget_store,
+                            webhook=webhook)
 
 
 if __name__ == "__main__":

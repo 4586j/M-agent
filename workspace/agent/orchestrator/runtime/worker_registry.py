@@ -74,9 +74,14 @@ class WorkerRegistry:
             return self._workers.get(worker_id)
 
     def select_worker(self, role: str = "executor",
-                      strategy: str = "round_robin") -> WorkerInfo | None:
-        """选择 worker。strategy: round_robin（默认，兼容）| least_load（按 load 升序）。"""
-        alive = [w for w in self._alive() if w.role == role]
+                      strategy: str = "round_robin",
+                      exclude: set[str] | None = None) -> WorkerInfo | None:
+        """选择 worker。strategy: round_robin（默认，兼容）| least_load（按 load 升序）。
+
+        exclude：跳过的 worker_id 集合（派发层用于跳过熔断中的节点）。
+        """
+        alive = [w for w in self._alive()
+                 if w.role == role and w.worker_id not in (exclude or set())]
         if not alive:
             return None
         if strategy == "least_load":
@@ -94,7 +99,8 @@ class WorkerRegistry:
 
     def resolve_worker(self, role: str = "executor",
                        strategy: str = "round_robin",
-                       worker_id: str | None = None) -> WorkerInfo:
+                       worker_id: str | None = None,
+                       exclude: set[str] | None = None) -> WorkerInfo:
         """定点解析：worker_id 非空时按 ID 定点，否则按 role+strategy 选择。
 
         定点失败（从未注册 / 注册过但心跳超时）抛 RuntimeError，不静默回退。
@@ -114,7 +120,7 @@ class WorkerRegistry:
                 raise RuntimeError(
                     f"节点心跳超时: {worker_id}；当前活跃节点: [{detail or '无'}]")
             return w
-        w = self.select_worker(role, strategy=strategy)
+        w = self.select_worker(role, strategy=strategy, exclude=exclude)
         if w is None:
             raise RuntimeError(f"无可用 {role} worker")
         return w

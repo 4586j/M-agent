@@ -1,16 +1,15 @@
-# NOTE: 预留模块（仅被 agent_core/tests 引用，无生产代码引用）。
-# 未接入内核的执行路径；若未来启用需接线到 kernel/worker，且删除时
-# 仅删本文件与对应测试。是否有必要保留由项目组评估。
-
 """熔断器（Circuit Breaker）。
 
-防止 LLM API 连续失败时无效调用烧钱。状态机：
+防止 LLM API / 节点连续失败时无效调用烧钱。状态机：
 - CLOSED（正常）：调用通过，失败计数+1
 - OPEN（熔断）：直接拒绝，返回 CircuitBreakerOpenError
 - HALF_OPEN（试探）：允许少量调用试探恢复
 
 连续失败 N 次 → OPEN；等待 recovery_timeout 后 → HALF_OPEN；
 试探成功 M 次 → CLOSED；试探失败 → OPEN。
+
+接线点：runtime/dispatch_breaker.BreakerBoard 按 worker_id 持有独立实例，
+派发层自动跳过熔断中的节点（P1 运维可靠性批次）。
 """
 import enum
 import threading
@@ -77,6 +76,15 @@ class CircuitBreaker:
         with self._lock:
             return self._failure_count
 
+    @property
+    def retry_after(self) -> float:
+        """OPEN 状态下还需等待多久进入 HALF_OPEN（秒，非负；非 OPEN 为 0）。"""
+        with self._lock:
+            if self._state is not State.OPEN:
+                return 0.0
+            return max(0.0, self._recovery_timeout
+                       - (time.monotonic() - self._last_failure_time))
+
     def call(self, func: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
         """通过熔断器调用函数。
 
@@ -136,6 +144,20 @@ class CircuitBreaker:
             self._failure_count = 0
             self._success_count = 0
             self._last_failure_time = 0.0
+
+    def allow(self) -> bool:
+        """是否放行一次调用（OPEN 拒绝；OPEN 超时自动转 HALF_OPEN 放行试探）。"""
+        return self.state is not State.OPEN
+
+    def record_success(self) -> None:
+        """外部调用成功后上报（HALF_OPEN 试探计数 / CLOSED 重置失败连击）。"""
+        self._on_success()
+
+    def record_failure(self) -> bool:
+        """外部调用失败后上报。返回是否本次触发了熔断（CLOSED→OPEN 边沿）。"""
+        was_open = self.state is State.OPEN
+        self._on_failure()
+        return not was_open and self.state is State.OPEN
 
     def get_status(self) -> dict:
         """获取熔断器状态信息。"""

@@ -190,6 +190,7 @@ class BrainDeps:
     resolve_provider_name: Callable[[str | None], dict | None] | None = None
     budget_store: BudgetStore | None = None
     session_store: SessionStore | None = None
+    webhook: Any = None  # WebhookNotifier（runtime/webhook.py；None=未配置外发）
 
 
 # ---- 共享 helper（原 create_brain_app 内层闭包，提为依赖显式传入的纯函数）----
@@ -351,6 +352,14 @@ def _await_approval(deps: BrainDeps, req: DispatchReq, verdict: dict,
     publish_task_event(deps.bus, task_id, event="status", state="awaiting_approval",
                        trace_id=trace_id,
                        summary=str(verdict.get("reason") or "指令被安全关卡拦截，待人工审批"))
+    # 关键事件外发：待审批需要人工介入，操作者可能不在面板前（失败不阻断）
+    if deps.webhook is not None:
+        deps.webhook.submit("awaiting_approval", {
+            "task_id": task_id, "role": req.role, "trace_id": trace_id,
+            "reason": str(verdict.get("reason") or ""),
+            "matched_rules": verdict.get("matched_rules") or [],
+            "operator": _request_operator(request),
+        })
     return {"status": "awaiting_approval", "task_id": task_id,
             "verdict": verdict, "output": None, "artifacts": [], "error": None}
 
@@ -382,6 +391,10 @@ def _preflight(deps: BrainDeps, req: DispatchReq, request: Request) -> _Prefligh
             record_security_event(
                 task_id=None, stage="dispatch", decision="budget_exceeded",
                 operator=_request_operator(request), reason=reason)
+            if deps.webhook is not None:
+                deps.webhook.submit("budget_exceeded",
+                                    {"reason": reason,
+                                     "snapshot": deps.budget_store.snapshot()})
             raise HTTPException(status_code=429, detail=reason)
     if req.worker_id:
         validate_id(req.worker_id, "worker_id")

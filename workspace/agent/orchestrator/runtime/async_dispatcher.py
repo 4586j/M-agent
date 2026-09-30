@@ -49,6 +49,7 @@ class AsyncRemoteDispatcher:
         brain_url: str = "http://127.0.0.1:7000",
         event_bus: TaskEventBus | None = None,
         on_spend: Callable[[float], None] | None = None,
+        breaker_board=None,
     ):
         self.task_store = task_store
         self.registry = registry
@@ -65,6 +66,7 @@ class AsyncRemoteDispatcher:
         self.brain_url = brain_url
         self.event_bus = event_bus
         self.on_spend = on_spend  # 预算记账钩子：终态时上报 cost_usd（可 None）
+        self.breaker_board = breaker_board  # per-worker 熔断板（可 None=不启用）
         self._tasks: dict[str, asyncio.Task] = {}
         # 后台轮询并发限流：避免海量异步任务同时轮询打满连接/线程资源
         max_concurrent = int(os.environ.get("ORCH_ASYNC_MAX_CONCURRENT", "20"))
@@ -88,9 +90,37 @@ class AsyncRemoteDispatcher:
         enable_subagents：远程异步模式下每次请求覆盖暂不转发到 worker，
         worker 侧统一受全局 AGENT_/ORCH_SUBAGENTS_ENABLED 闸（kernel._build_options）控制。
         worker_id 非空时定点派发到该节点（resolve_worker 抛错则零任务落库）。
+        熔断：非定点时最多尝试 4 个不同节点，跳过熔断中的；定点节点熔断中
+        直接 RuntimeError（明确指定不给换，与同步 RemoteDispatcher 同语义）。
         """
-        worker = self.registry.resolve_worker(
-            role, strategy=self.select_strategy, worker_id=worker_id)
+        if worker_id is not None:
+            worker = self.registry.resolve_worker(
+                role, strategy=self.select_strategy, worker_id=worker_id)
+            if self.breaker_board is not None:
+                allowed, retry_after = self.breaker_board.allow(worker.worker_id)
+                if not allowed:
+                    raise RuntimeError(
+                        f"节点 {worker.worker_id} 熔断中（约 {retry_after:.0f}s 后自动试探恢复）")
+        else:
+            tried: set[str] = set()
+            worker = None
+            for _ in range(4):
+                try:
+                    w = self.registry.resolve_worker(
+                        role, strategy=self.select_strategy, exclude=tried)
+                except RuntimeError as e:
+                    if tried:
+                        raise RuntimeError(
+                            f"无可用 {role} worker（未重试节点均在熔断中: {sorted(tried)}）") from e
+                    raise
+                if self.breaker_board is None or \
+                        self.breaker_board.allow(w.worker_id)[0]:
+                    worker = w
+                    break
+                tried.add(w.worker_id)
+            if worker is None:
+                raise RuntimeError(
+                    f"无可用 {role} worker（连续 {len(tried)} 个候选节点均在熔断中: {sorted(tried)}）")
         # 定点时以节点真实 role 为准（同同步 RemoteDispatcher，保下游数据真实）
         pinned = worker_id is not None
         if pinned:
@@ -132,6 +162,7 @@ class AsyncRemoteDispatcher:
         resp = await self.async_http("POST", f"{base}/task", json=body)
         if resp.get("status_code") != 200:
             log.warning("[trace=%s] task=%s post failed: %s", trace_id, task_id, resp)
+            self._record_breaker(worker.worker_id, ok=False)
             self.task_store.update(task_id, status="failed",
                                    error=f"post failed: {resp}")
             publish_task_event(self.event_bus, task_id, event="done",
@@ -241,6 +272,7 @@ class AsyncRemoteDispatcher:
             artifacts=arts, error=err, verdict=verdict, meta=meta,
         )
         self._report_spend(meta)
+        self._record_breaker(worker_id, ok=(st == "done"))
         log.info("[trace=%s] task=%s terminal status=%s", rec.trace_id, task_id, st)
         publish_task_event(self.event_bus, task_id, event="done", state=st,
                            trace_id=rec.trace_id,
@@ -253,6 +285,15 @@ class AsyncRemoteDispatcher:
             )
         write_result_note(self.memory_store, task_id, st, out, err)
         self._tasks.pop(task_id, None)
+
+    def _record_breaker(self, worker_id: str | None, ok: bool) -> None:
+        """节点健康记账：done → success，failed/派发失败 → failure。"""
+        if self.breaker_board is None or not worker_id:
+            return
+        if ok:
+            self.breaker_board.record_success(worker_id)
+        else:
+            self.breaker_board.record_failure(worker_id)
 
     def _report_spend(self, meta: dict) -> None:
         """把回传 meta 里的 cost_usd 上报预算账本；失败只记日志不阻断收尾。"""

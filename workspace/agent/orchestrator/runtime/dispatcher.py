@@ -127,7 +127,8 @@ class RemoteDispatcher(Dispatcher):
                  max_retries: int = 0,
                  check_max_chars: int = 6000,
                  event_bus: TaskEventBus | None = None,
-                 on_spend: Callable[[float], None] | None = None):
+                 on_spend: Callable[[float], None] | None = None,
+                 breaker_board=None):
         self.task_store = task_store
         self.registry = registry
         self.http_call = http_call  # (method, url, **kwargs) -> {"status_code", "json"}
@@ -140,6 +141,52 @@ class RemoteDispatcher(Dispatcher):
         self.check_max_chars = check_max_chars
         self.event_bus = event_bus
         self.on_spend = on_spend  # 预算记账钩子：任务终态时上报 cost_usd（可 None）
+        self.breaker_board = breaker_board  # per-worker 熔断板（可 None=不启用）
+
+    def _resolve_with_breaker(self, role: str, worker_id: str | None):
+        """节点解析 + 熔断规避。
+
+        定点派发：节点熔断中直接报错（明确指定不给换，由人工处置）。
+        自动选节点：最多尝试 4 个不同节点，跳过熔断中的；全部熔断则报错。
+        """
+        if worker_id is not None:
+            w = self.registry.resolve_worker(role, strategy=self.select_strategy,
+                                             worker_id=worker_id)
+            if self.breaker_board is not None:
+                allowed, retry_after = self.breaker_board.allow(w.worker_id)
+                if not allowed:
+                    raise RuntimeError(
+                        f"节点 {w.worker_id} 熔断中（约 {retry_after:.0f}s 后自动试探恢复）；"
+                        "如确认节点正常，可重启 brain 或设 ORCH_CIRCUIT_BREAKER_ENABLED=0")
+            return w
+        tried: set[str] = set()
+        for _ in range(4):
+            try:
+                w = self.registry.resolve_worker(role, strategy=self.select_strategy,
+                                                 exclude=tried)
+            except RuntimeError as e:
+                if tried:  # 剩余候选全在熔断中，消息要能指导运维
+                    raise RuntimeError(
+                        f"无可用 {role} worker（未重试节点均在熔断中: {sorted(tried)}）") from e
+                raise
+            if self.breaker_board is None:
+                return w
+            allowed, _retry = self.breaker_board.allow(w.worker_id)
+            if allowed:
+                return w
+            tried.add(w.worker_id)
+            log.warning("节点熔断中，换节点重试 worker=%s tried=%s", w.worker_id, sorted(tried))
+        raise RuntimeError(
+            f"无可用 {role} worker（连续 {len(tried)} 个候选节点均在熔断中: {sorted(tried)}）")
+
+    def _record_breaker(self, worker_id: str | None, ok: bool) -> None:
+        """节点健康记账：done → success，failed/派发失败 → failure。"""
+        if self.breaker_board is None or not worker_id:
+            return
+        if ok:
+            self.breaker_board.record_success(worker_id)
+        else:
+            self.breaker_board.record_failure(worker_id)
 
     def _report_spend(self, meta: dict) -> None:
         """把回传 meta 里的 cost_usd 上报预算账本；失败只记日志不阻断收尾。"""
@@ -162,9 +209,8 @@ class RemoteDispatcher(Dispatcher):
         # enable_subagents：远程模式下每次请求覆盖暂不转发到 worker，
         # worker 侧统一受全局 AGENT_/ORCH_SUBAGENTS_ENABLED 闸（kernel._build_options）控制。
         # worker_id 定点：resolve_worker 会抛 RuntimeError（从未注册/心跳超时），
-        # 在落库之前，保证失败零任务产生。
-        worker = self.registry.resolve_worker(role, strategy=self.select_strategy,
-                                              worker_id=worker_id)
+        # 在落库之前，保证失败零任务产生。熔断中的节点会被跳过（定点则报错）。
+        worker = self._resolve_with_breaker(role, worker_id)
         # 定点时以节点的真实 role 为准（覆盖请求 role）：下游经验库/成本聚合/
         # _route_model 按 TaskRecord.role 消费，写错会污染数据。
         pinned = worker_id is not None
@@ -204,6 +250,7 @@ class RemoteDispatcher(Dispatcher):
         resp = self.http_call("POST", f"{base}/task", json=body)
         if resp.get("status_code") != 200:
             log.warning("[trace=%s] task=%s post failed: %s", trace_id, task_id, resp)
+            self._record_breaker(worker.worker_id, ok=False)
             self.task_store.update(task_id, status="failed", error=f"post failed: {resp}")
             publish_task_event(self.event_bus, task_id, event="done",
                                state="failed", trace_id=trace_id,
@@ -241,6 +288,9 @@ class RemoteDispatcher(Dispatcher):
                     meta=meta,
                 )
                 self._report_spend(meta)
+                # 节点健康记账：failed 计入连击（含任务级失败——保守口径），
+                # done 重置；重试链路的最终成败经此自然反馈给熔断器
+                self._record_breaker(worker.worker_id, ok=(st == "done"))
                 log.info("[trace=%s] task=%s terminal status=%s", trace_id, task_id, st)
                 publish_task_event(self.event_bus, task_id, event="done", state=st,
                                    trace_id=trace_id,

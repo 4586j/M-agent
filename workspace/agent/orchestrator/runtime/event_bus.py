@@ -15,6 +15,7 @@ import logging
 import threading
 import time
 from dataclasses import dataclass, field
+from typing import Callable
 
 log = logging.getLogger(__name__)
 
@@ -50,12 +51,17 @@ class _Sub:
 
 
 class TaskEventBus:
-    """内存事件总线。subscribe 须在事件循环内调用；publish 任意线程可调。"""
+    """内存事件总线。subscribe 须在事件循环内调用；publish 任意线程可调。
 
-    def __init__(self):
+    on_publish：可选旁路回调（如 webhook 外发）。publish 时同步调用——
+    实现自身必须 fire-and-forget/线程安全，且异常被吞掉（绝不影响 SSE 主路）。
+    """
+
+    def __init__(self, on_publish: Callable[[dict], None] | None = None):
         self._lock = threading.Lock()
         self._subs: dict[int, _Sub] = {}
         self._ids = itertools.count(1)
+        self._on_publish = on_publish
 
     def subscribe(self, task_id: str | None = None) -> tuple[int, "asyncio.Queue[TaskEvent]"]:
         """注册订阅者，返回 (subscriber_id, 事件队列)。须在事件循环内调用。"""
@@ -84,6 +90,12 @@ class TaskEventBus:
         ev = TaskEvent(event=event, payload=payload)
         with self._lock:
             subs = list(self._subs.values())
+        if self._on_publish is not None:
+            try:
+                self._on_publish(dict(payload, event=event))
+            except Exception:  # noqa: BLE001 - 旁路回调绝不影响事件主路
+                log.warning("事件旁路回调失败 event=%s task=%s",
+                            event, task_id, exc_info=True)
         for s in subs:
             if s.task_id is not None and s.task_id != task_id:
                 continue

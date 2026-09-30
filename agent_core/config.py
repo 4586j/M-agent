@@ -145,13 +145,6 @@ class AgentConfig:
     # ---- 运行历史（run_history.py）----
     run_history_dir: str = ""                      # 历史记录存储目录（默认用 work_dir）
     run_history_max_records: int = 1000            # 历史记录上限
-    # ---- 重试策略（retry_policy.py）----
-    async_retry_max_retries: int = 2               # 异步任务重试次数
-    async_retry_backoff_seconds: float = 1.0       # 重试退避基数（秒）
-    # ---- 熔断器（circuit_breaker.py）----
-    circuit_breaker_enabled: bool = True           # 熔断器开关
-    circuit_breaker_failure_threshold: int = 5     # 连续失败触发熔断阈值
-    circuit_breaker_recovery_timeout: float = 60.0 # 熔断恢复等待时间（秒）
     # ---- 持久化执行日志（run_store.py，Slice 3 rollout）----
     # 显式 rollout 开关：默认关（完全走既有 JSON 权威路径，零行为变化）；开启后
     # 本地执行以 SQLite 日志作为持久恢复底座（准入/尝试/副作用/审批 + 启动对账），
@@ -415,16 +408,6 @@ def load_agent_config(**overrides) -> AgentConfig:
         # 运行历史
         run_history_dir=_env("", "AGENT_RUN_HISTORY_DIR"),
         run_history_max_records=int(_env("1000", "AGENT_RUN_HISTORY_MAX_RECORDS")),
-        # 重试策略
-        async_retry_max_retries=int(_env("2", "AGENT_ASYNC_RETRY_MAX_RETRIES")),
-        async_retry_backoff_seconds=float(_env("1.0", "AGENT_ASYNC_RETRY_BACKOFF_SECONDS")),
-        # 熔断器
-        circuit_breaker_enabled=_to_bool(
-            _env("1", "AGENT_CIRCUIT_BREAKER_ENABLED"), True),
-        circuit_breaker_failure_threshold=int(
-            _env("5", "AGENT_CIRCUIT_BREAKER_FAILURE_THRESHOLD")),
-        circuit_breaker_recovery_timeout=float(
-            _env("60.0", "AGENT_CIRCUIT_BREAKER_RECOVERY_TIMEOUT")),
         # 持久化执行日志（Slice 3 rollout：默认关，须显式开启）
         durable_journal_enabled=_to_bool(
             _env("", "AGENT_DURABLE_JOURNAL_ENABLED",

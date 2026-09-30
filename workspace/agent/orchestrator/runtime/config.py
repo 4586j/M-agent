@@ -67,6 +67,16 @@ class Config:
     budget_daily_usd: float = 0.0
     # 持久会话（派发链路连续对话；每会话一个 JSON 文件）
     sessions_dir: str = str(_default_runtime_dir() / ".sessions")
+    # 关键事件外发（webhook）：空 URL=关闭；事件名 CSV 过滤（空=默认全集）
+    webhook_url: str = ""
+    webhook_secret: str = ""
+    webhook_events: str = ""   # 如 "task_terminal,awaiting_approval,budget_exceeded"
+    webhook_timeout: float = 5.0
+    webhook_max_retries: int = 3
+    # worker 连续失败熔断（派发层跳过熔断中的节点，恢复期后半开试探）
+    circuit_breaker_enabled: bool = True
+    circuit_breaker_failure_threshold: int = 5
+    circuit_breaker_recovery_timeout: float = 60.0
 
 
 def load_config() -> Config:
@@ -111,4 +121,15 @@ def load_config() -> Config:
         sessions_dir=os.environ.get(
             "ORCH_SESSIONS_DIR",
             str(_default_runtime_dir() / ".sessions")),
+        webhook_url=os.environ.get("ORCH_WEBHOOK_URL", ""),
+        webhook_secret=os.environ.get("ORCH_WEBHOOK_SECRET", ""),
+        webhook_events=os.environ.get("ORCH_WEBHOOK_EVENTS", ""),
+        webhook_timeout=float(os.environ.get("ORCH_WEBHOOK_TIMEOUT", "5.0")),
+        webhook_max_retries=int(os.environ.get("ORCH_WEBHOOK_MAX_RETRIES", "3")),
+        circuit_breaker_enabled=os.environ.get("ORCH_CIRCUIT_BREAKER_ENABLED", "1")
+        not in ("0", "false", "False", "no", "off"),
+        circuit_breaker_failure_threshold=int(
+            os.environ.get("ORCH_CIRCUIT_BREAKER_THRESHOLD", "5")),
+        circuit_breaker_recovery_timeout=float(
+            os.environ.get("ORCH_CIRCUIT_BREAKER_RECOVERY", "60.0")),
     )
