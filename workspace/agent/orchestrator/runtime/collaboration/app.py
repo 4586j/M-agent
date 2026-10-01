@@ -20,6 +20,7 @@ from .auth import AuthService, Unauthorized, Forbidden, RateLimited
 from .database import Database
 from .instances import InstanceService
 from .models import Conflict, InvalidState, NotFound, ValidationError
+from .requirements import RequirementService
 
 
 PREFIX = "/collab/v1"
@@ -161,6 +162,28 @@ class MachineClaim(Input):
     policy: MachinePolicy
 
 
+class RequirementCreate(Input):
+    title: Name
+    content: Annotated[str, Field(max_length=8388608)] | None = None
+
+
+class RequirementMessageCreate(Input):
+    content: Annotated[str, Field(min_length=1, max_length=8192)]
+
+
+class RequirementRevisionCreate(Input):
+    content: Annotated[str, Field(min_length=1, max_length=8388608)]
+    expected_version: Version
+
+
+class RequirementReviewCreate(Input):
+    action: Literal["request", "approve", "reject"]
+    revision_id: Name
+    reviewer_user_id: Name | None = None
+    reason: Annotated[str, Field(max_length=2048)] = ""
+    expected_version: Version
+
+
 _ERRORS = {
     401: "Unauthorized", 403: "Forbidden", 404: "Not found", 405: "Method not allowed",
     409: "Conflict", 422: "Invalid request", 429: "Too many requests",
@@ -227,6 +250,7 @@ def create_app(config: AppConfig) -> FastAPI:
         database.initialize()
         app.state.auth = AuthService(database, session_ttl=config.session_ttl)
         app.state.instances = InstanceService(database)
+        app.state.requirements = RequirementService()
         yield
 
     app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None,
@@ -492,6 +516,93 @@ def create_app(config: AppConfig) -> FastAPI:
         instance, binding = app.state.instances.describe(request.headers.get("X-Instance-Token"))
         return {**asdict(instance), "project_id": binding.project_id,
                 "binding_version": binding.version}
+
+    @router.post("/projects/{pid}/requirements", status_code=201)
+    def create_requirement(pid: str, body: RequirementCreate, request: Request):
+        with _access(request, project_id=pid, write=True) as access:
+            return asdict(app.state.requirements.create_requirement(
+                access, project_id=pid, title=body.title, content=body.content))
+
+    @router.get("/projects/{pid}/requirements")
+    def list_requirements(pid: str, request: Request):
+        with _access(request, project_id=pid) as access:
+            return [asdict(requirement) for requirement
+                    in app.state.requirements.list_requirements(access, project_id=pid)]
+
+    @router.get("/projects/{pid}/requirements/{rid}")
+    def get_requirement(pid: str, rid: str, request: Request):
+        with _access(request, project_id=pid) as access:
+            return asdict(app.state.requirements.get_requirement(
+                access, project_id=pid, requirement_id=rid))
+
+    @router.post("/projects/{pid}/requirements/{rid}/messages", status_code=201)
+    def post_requirement_message(pid: str, rid: str, body: RequirementMessageCreate, request: Request):
+        with _access(request, project_id=pid, write=True) as access:
+            return [asdict(message) for message in app.state.requirements.post_message(
+                access, project_id=pid, requirement_id=rid, content=body.content)]
+
+    @router.get("/projects/{pid}/requirements/{rid}/messages")
+    def list_requirement_messages(pid: str, rid: str, request: Request):
+        with _access(request, project_id=pid) as access:
+            return [asdict(message) for message in app.state.requirements.list_messages(
+                access, project_id=pid, requirement_id=rid)]
+
+    @router.post("/projects/{pid}/requirements/{rid}/revisions", status_code=201)
+    def save_requirement_revision(pid: str, rid: str, body: RequirementRevisionCreate, request: Request):
+        with _access(request, project_id=pid, write=True) as access:
+            requirement, revision = app.state.requirements.save_revision(
+                access, project_id=pid, requirement_id=rid, content=body.content,
+                expected_version=body.expected_version)
+            return {"requirement": asdict(requirement), "revision": asdict(revision)}
+
+    @router.get("/projects/{pid}/requirements/{rid}/revisions")
+    def list_requirement_revisions(pid: str, rid: str, request: Request):
+        with _access(request, project_id=pid) as access:
+            return [asdict(revision) for revision in app.state.requirements.list_revisions(
+                access, project_id=pid, requirement_id=rid)]
+
+    @router.get("/projects/{pid}/requirements/{rid}/revisions/diff")
+    def requirement_revision_diff(pid: str, rid: str, request: Request,
+                                  from_revision_id: Annotated[str, Query(min_length=1, max_length=64)],
+                                  to_revision_id: Annotated[str, Query(min_length=1, max_length=64)]):
+        with _access(request, project_id=pid) as access:
+            return app.state.requirements.revision_diff(
+                access, project_id=pid, requirement_id=rid,
+                from_revision_id=from_revision_id, to_revision_id=to_revision_id)
+
+    @router.get("/projects/{pid}/requirements/{rid}/revisions/{revid}")
+    def read_requirement_revision(pid: str, rid: str, revid: str, request: Request):
+        with _access(request, project_id=pid) as access:
+            revision, content = app.state.requirements.read_revision(
+                access, project_id=pid, requirement_id=rid, revision_id=revid)
+            return {**asdict(revision), "content": content}
+
+    @router.post("/projects/{pid}/requirements/{rid}/reviews")
+    def review_requirement(pid: str, rid: str, body: RequirementReviewCreate, request: Request):
+        with _access(request, project_id=pid, write=True) as access:
+            if body.action == "request":
+                if body.reviewer_user_id is None:
+                    raise ValidationError("reviewer_user_id is required")
+                requirement, review = app.state.requirements.request_review(
+                    access, project_id=pid, requirement_id=rid, revision_id=body.revision_id,
+                    reviewer_user_id=body.reviewer_user_id, expected_version=body.expected_version)
+            else:
+                requirement, review = app.state.requirements.decide_review(
+                    access, project_id=pid, requirement_id=rid, revision_id=body.revision_id,
+                    decision="approved" if body.action == "approve" else "rejected",
+                    reason=body.reason, expected_version=body.expected_version)
+            return {"requirement": asdict(requirement), "review": asdict(review)}
+
+    @router.get("/projects/{pid}/requirements/{rid}/reviews")
+    def list_requirement_reviews(pid: str, rid: str, request: Request):
+        with _access(request, project_id=pid) as access:
+            return [asdict(review) for review in app.state.requirements.list_reviews(
+                access, project_id=pid, requirement_id=rid)]
+
+    @router.get("/inbox")
+    def inbox(request: Request):
+        with _access(request) as access:
+            return app.state.requirements.inbox(access)
 
     @router.get("/projects/{pid}/audit")
     def project_audit(pid: str, request: Request, limit: AuditLimit = 100):

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import sqlite3
@@ -10,7 +11,8 @@ from uuid import uuid4
 from .database import Database
 from .models import (
     Agent, AgentProjectBinding, Conflict, ExecutionInstance, ExecutionNode,
-    InvalidState, NotFound, Project, ProjectMember, User, ValidationError,
+    InvalidState, NotFound, Project, ProjectMember, Requirement, RequirementMessage,
+    RequirementReview, RequirementRevision, User, ValidationError,
 )
 
 
@@ -54,6 +56,11 @@ def _one(conn, cls, sql, params):
     return _record(cls, conn.execute(sql, params).fetchone())
 
 
+def _maybe(conn, cls, sql, params):
+    row = conn.execute(sql, params).fetchone()
+    return None if row is None else _record(cls, row)
+
+
 def _binding_fields(duty, persona_version, allowed_tools, workspace_ref, provider_ref):
     _text(duty, "duty", 8192)
     _text(persona_version, "persona_version")
@@ -75,6 +82,20 @@ _INSTANCE_COLUMNS = (
     "instance_id,binding_id,node_id,status,version,claim_expires_at,protocol_version,capacity,"
     "isolation_mode,isolation_attestation,isolation_verified,verified_at,workspace_ref,provider_ref,"
     "allowed_tools,env_allowlist,created_by,created_at,claimed_at,heartbeat_at"
+)
+_REQUIREMENT_COLUMNS = (
+    "requirement_id,project_id,title,requester_id,status,reviewer_id,current_revision_id,"
+    "review_revision_id,review_revision_hash,approved_revision_id,approved_revision_hash,"
+    "version,created_at,updated_at"
+)
+_REQUIREMENT_SELECT = ",".join(f"r.{name}" for name in _REQUIREMENT_COLUMNS.split(","))
+_REVISION_COLUMNS = (
+    "revision_id,project_id,requirement_id,number,content_hash,content_size,author_id,created_at"
+)
+_MESSAGE_COLUMNS = "message_id,project_id,requirement_id,role,content,author_id,created_at"
+_REVIEW_COLUMNS = (
+    "review_id,project_id,requirement_id,revision_id,revision_hash,target_version,reviewer_id,"
+    "decision,reason,created_at"
 )
 
 
@@ -495,3 +516,227 @@ class CollaborationStore:
                 "UPDATE execution_instances SET status='disabled',version=version+1 WHERE instance_id=?",
                 (instance_id,))
             return self._instance(conn, instance_id)
+
+    @staticmethod
+    def _requirement(conn, project_id, requirement_id):
+        return _one(conn, Requirement,
+                    f"SELECT {_REQUIREMENT_COLUMNS} FROM requirements "
+                    "WHERE project_id=? AND requirement_id=?",
+                    (project_id, requirement_id))
+
+    def create_requirement(self, project_id: str, title: str, requester_id: str,
+                           created_at: float) -> Requirement:
+        _text(title, "title")
+        requirement_id = uuid4().hex
+        with self._write() as conn:
+            self._active(self._project(conn, project_id))
+            self._active(self._user(conn, requester_id))
+            self._active(self._member(conn, project_id, requester_id))
+            conn.execute(
+                "INSERT INTO requirements(requirement_id,project_id,title,requester_id,created_at,"
+                "updated_at) VALUES(?,?,?,?,?,?)",
+                (requirement_id, project_id, title, requester_id, created_at, created_at))
+            return self._requirement(conn, project_id, requirement_id)
+
+    def get_requirement(self, project_id: str, requirement_id: str) -> Requirement:
+        with self._read() as conn:
+            return self._requirement(conn, project_id, requirement_id)
+
+    def list_requirements(self, project_id: str, user_id: str) -> list[Requirement]:
+        with self._read() as conn:
+            self._project(conn, project_id)
+            return [_record(Requirement, row) for row in conn.execute(
+                f"SELECT {_REQUIREMENT_COLUMNS} FROM requirements WHERE project_id=? AND "
+                "(status='approved' OR requester_id=? OR (status='in_review' AND reviewer_id=?)) "
+                "ORDER BY created_at,requirement_id",
+                (project_id, user_id, user_id))]
+
+    def add_revision(self, project_id: str, requirement_id: str, *, content: str, content_hash: str,
+                     content_size: int, author_id: str, expected_version: int,
+                     created_at: float) -> tuple[Requirement, RequirementRevision]:
+        with self._write() as conn:
+            requirement = self._requirement(conn, project_id, requirement_id)
+            _version(requirement.version, expected_version)
+            if requirement.status == "in_review":
+                raise InvalidState("Cannot change a revision under review")
+            self._active(self._member(conn, project_id, author_id))
+            number = conn.execute(
+                "SELECT COALESCE(MAX(number),0)+1 FROM requirement_revisions WHERE requirement_id=?",
+                (requirement_id,)).fetchone()[0]
+            revision_id = uuid4().hex
+            conn.execute(
+                "INSERT INTO requirement_revisions(revision_id,project_id,requirement_id,number,content,"
+                "content_hash,content_size,author_id,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                (revision_id, project_id, requirement_id, number, content, content_hash,
+                 content_size, author_id, created_at))
+            conn.execute(
+                "UPDATE requirements SET current_revision_id=?,status='draft',version=version+1,"
+                "updated_at=? WHERE requirement_id=?", (revision_id, created_at, requirement_id))
+            return (self._requirement(conn, project_id, requirement_id),
+                    self._revision(conn, project_id, requirement_id, revision_id))
+
+    @staticmethod
+    def _revision(conn, project_id, requirement_id, revision_id):
+        return _one(conn, RequirementRevision,
+                    f"SELECT {_REVISION_COLUMNS} FROM requirement_revisions WHERE project_id=? "
+                    "AND requirement_id=? AND revision_id=?",
+                    (project_id, requirement_id, revision_id))
+
+    def list_revisions(self, project_id: str, requirement_id: str) -> list[RequirementRevision]:
+        with self._read() as conn:
+            self._requirement(conn, project_id, requirement_id)
+            return [_record(RequirementRevision, row) for row in conn.execute(
+                f"SELECT {_REVISION_COLUMNS} FROM requirement_revisions WHERE project_id=? AND "
+                "requirement_id=? ORDER BY number", (project_id, requirement_id))]
+
+    def get_revision(self, project_id: str, requirement_id: str, revision_id: str) -> RequirementRevision:
+        with self._read() as conn:
+            self._requirement(conn, project_id, requirement_id)
+            return self._revision(conn, project_id, requirement_id, revision_id)
+
+    def get_revision_content(self, project_id: str, requirement_id: str, revision_id: str) -> str:
+        with self._read() as conn:
+            self._requirement(conn, project_id, requirement_id)
+            row = conn.execute(
+                "SELECT content FROM requirement_revisions WHERE project_id=? AND requirement_id=? "
+                "AND revision_id=?", (project_id, requirement_id, revision_id)).fetchone()
+            if row is None:
+                raise NotFound("Resource not found")
+            return row["content"]
+
+    def list_messages(self, project_id: str, requirement_id: str) -> list[RequirementMessage]:
+        with self._read() as conn:
+            self._requirement(conn, project_id, requirement_id)
+            return [_record(RequirementMessage, row) for row in conn.execute(
+                f"SELECT {_MESSAGE_COLUMNS} FROM requirement_messages WHERE project_id=? AND "
+                "requirement_id=? ORDER BY created_at,rowid", (project_id, requirement_id))]
+
+    def add_messages(self, project_id: str, requirement_id: str,
+                     messages: list[tuple[str, str | None, str]], *, created_at: float) -> list[RequirementMessage]:
+        with self._write() as conn:
+            requirement = self._requirement(conn, project_id, requirement_id)
+            if requirement.status != "draft":
+                raise InvalidState("Clarification is only available while drafting")
+            stored = []
+            for role, author_id, content in messages:
+                message_id = uuid4().hex
+                conn.execute(
+                    "INSERT INTO requirement_messages(message_id,project_id,requirement_id,role,content,"
+                    "author_id,created_at) VALUES(?,?,?,?,?,?,?)",
+                    (message_id, project_id, requirement_id, role, content, author_id, created_at))
+                stored.append(_one(conn, RequirementMessage,
+                                   f"SELECT {_MESSAGE_COLUMNS} FROM requirement_messages WHERE message_id=?",
+                                   (message_id,)))
+            return stored
+
+    def request_requirement_review(self, project_id: str, requirement_id: str, *, revision_id: str,
+                                   reviewer_id: str, expected_version: int,
+                                   created_at: float) -> tuple[Requirement, RequirementReview]:
+        with self._write() as conn:
+            requirement = self._requirement(conn, project_id, requirement_id)
+            _version(requirement.version, expected_version)
+            if requirement.status != "draft":
+                raise InvalidState("Requirement is not a draft")
+            if requirement.current_revision_id != revision_id:
+                raise InvalidState("Only the current revision can be reviewed")
+            row = conn.execute(
+                "SELECT content,content_hash FROM requirement_revisions WHERE project_id=? AND "
+                "requirement_id=? AND revision_id=?",
+                (project_id, requirement_id, revision_id)).fetchone()
+            if row is None:
+                raise NotFound("Resource not found")
+            if hashlib.sha256(row["content"].encode("utf-8")).hexdigest() != row["content_hash"]:
+                raise Conflict("Stored revision content does not match its digest")
+            self._active(self._user(conn, reviewer_id))
+            self._active(self._member(conn, project_id, reviewer_id))
+            version = requirement.version + 1
+            conn.execute(
+                "UPDATE requirements SET status='in_review',reviewer_id=?,review_revision_id=?,"
+                "review_revision_hash=?,version=?,updated_at=? WHERE requirement_id=?",
+                (reviewer_id, revision_id, row["content_hash"], version, created_at, requirement_id))
+            review_id = uuid4().hex
+            conn.execute(
+                "INSERT INTO requirement_reviews(review_id,project_id,requirement_id,revision_id,"
+                "revision_hash,target_version,reviewer_id,decision,reason,created_at) "
+                "VALUES(?,?,?,?,?,?,?,'requested','',?)",
+                (review_id, project_id, requirement_id, revision_id, row["content_hash"],
+                 version, reviewer_id, created_at))
+            return (self._requirement(conn, project_id, requirement_id),
+                    _one(conn, RequirementReview,
+                         f"SELECT {_REVIEW_COLUMNS} FROM requirement_reviews WHERE review_id=?",
+                         (review_id,)))
+
+    def decide_requirement_review(self, project_id: str, requirement_id: str, *, revision_id: str,
+                                  reviewer_id: str, decision: str, reason: str, expected_version: int,
+                                  created_at: float) -> tuple[Requirement, RequirementReview]:
+        with self._write() as conn:
+            requirement = self._requirement(conn, project_id, requirement_id)
+            _version(requirement.version, expected_version)
+            if requirement.status != "in_review":
+                raise InvalidState("Requirement is not under review")
+            if requirement.reviewer_id != reviewer_id:
+                raise InvalidState("Not the designated reviewer")
+            if requirement.review_revision_id != revision_id:
+                raise Conflict("Review is bound to a different revision")
+            row = conn.execute(
+                "SELECT content,content_hash FROM requirement_revisions WHERE project_id=? AND "
+                "requirement_id=? AND revision_id=?",
+                (project_id, requirement_id, revision_id)).fetchone()
+            if row is None:
+                raise NotFound("Resource not found")
+            if (hashlib.sha256(row["content"].encode("utf-8")).hexdigest() != row["content_hash"]
+                    or row["content_hash"] != requirement.review_revision_hash):
+                raise Conflict("Stored revision content does not match its digest")
+            version = requirement.version + 1
+            if decision == "approved":
+                conn.execute(
+                    "UPDATE requirements SET status='approved',approved_revision_id=?,"
+                    "approved_revision_hash=?,reviewer_id=NULL,review_revision_id=NULL,"
+                    "review_revision_hash=NULL,version=?,updated_at=? WHERE requirement_id=?",
+                    (revision_id, row["content_hash"], version, created_at, requirement_id))
+            elif decision == "rejected":
+                conn.execute(
+                    "UPDATE requirements SET status='draft',reviewer_id=NULL,review_revision_id=NULL,"
+                    "review_revision_hash=NULL,version=?,updated_at=? WHERE requirement_id=?",
+                    (version, created_at, requirement_id))
+            else:
+                raise ValidationError("Invalid review decision")
+            review_id = uuid4().hex
+            conn.execute(
+                "INSERT INTO requirement_reviews(review_id,project_id,requirement_id,revision_id,"
+                "revision_hash,target_version,reviewer_id,decision,reason,created_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (review_id, project_id, requirement_id, revision_id, row["content_hash"],
+                 version, reviewer_id, decision, reason, created_at))
+            return (self._requirement(conn, project_id, requirement_id),
+                    _one(conn, RequirementReview,
+                         f"SELECT {_REVIEW_COLUMNS} FROM requirement_reviews WHERE review_id=?",
+                         (review_id,)))
+
+    def last_review(self, project_id: str, requirement_id: str) -> RequirementReview | None:
+        with self._read() as conn:
+            return _maybe(conn, RequirementReview,
+                          f"SELECT {_REVIEW_COLUMNS} FROM requirement_reviews WHERE project_id=? AND "
+                          "requirement_id=? ORDER BY created_at DESC,rowid DESC LIMIT 1",
+                          (project_id, requirement_id))
+
+    def list_reviews(self, project_id: str, requirement_id: str) -> list[RequirementReview]:
+        with self._read() as conn:
+            self._requirement(conn, project_id, requirement_id)
+            return [_record(RequirementReview, row) for row in conn.execute(
+                f"SELECT {_REVIEW_COLUMNS} FROM requirement_reviews WHERE project_id=? AND "
+                "requirement_id=? ORDER BY created_at,rowid", (project_id, requirement_id))]
+
+    def inbox(self, user_id: str) -> list[tuple[str, Requirement]]:
+        with self._read() as conn:
+            base = (f"SELECT {_REQUIREMENT_SELECT} FROM requirements r JOIN project_members m "
+                    "ON m.project_id=r.project_id AND m.user_id=? AND m.status='active' ")
+            items = [("requirement_review", _record(Requirement, row)) for row in conn.execute(
+                base + "WHERE r.status='in_review' AND r.reviewer_id=? ", (user_id, user_id))]
+            returned = conn.execute(
+                base + "WHERE r.status='draft' AND r.requester_id=? AND ("
+                "SELECT decision FROM requirement_reviews v WHERE v.requirement_id=r.requirement_id "
+                "ORDER BY v.created_at DESC,v.rowid DESC LIMIT 1)='rejected' ", (user_id, user_id))
+            items += [("requirement_returned", _record(Requirement, row)) for row in returned]
+        items.sort(key=lambda item: (-item[1].updated_at, item[1].requirement_id))
+        return items

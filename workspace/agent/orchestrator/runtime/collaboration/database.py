@@ -8,7 +8,7 @@ from typing import Iterator
 from .models import SchemaVersionError
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 _SCHEMA_STATEMENTS = (
     """
@@ -244,6 +244,144 @@ _INSTANCE_SCHEMA = (
     "CREATE INDEX execution_instances_node ON execution_instances(node_id)",
 )
 
+# Revision binding columns (current/review/approved) use composite foreign keys, so a
+# requirement row can never point at a revision that belongs to another requirement.
+_REQUIREMENT_SCHEMA = (
+    """
+    CREATE TABLE requirements (
+        requirement_id TEXT NOT NULL PRIMARY KEY,
+        project_id TEXT NOT NULL REFERENCES projects(project_id),
+        title TEXT NOT NULL CHECK(length(trim(title))>0),
+        requester_id TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'draft' CHECK(status IN ('draft','in_review','approved')),
+        reviewer_id TEXT,
+        current_revision_id TEXT,
+        review_revision_id TEXT,
+        review_revision_hash TEXT CHECK(review_revision_hash IS NULL OR length(review_revision_hash)=64),
+        approved_revision_id TEXT,
+        approved_revision_hash TEXT CHECK(approved_revision_hash IS NULL OR length(approved_revision_hash)=64),
+        version INTEGER NOT NULL DEFAULT 1 CHECK(version>0),
+        created_at REAL NOT NULL,
+        updated_at REAL NOT NULL,
+        UNIQUE (requirement_id, project_id),
+        FOREIGN KEY (project_id, requester_id) REFERENCES project_members(project_id, user_id),
+        FOREIGN KEY (project_id, reviewer_id) REFERENCES project_members(project_id, user_id),
+        FOREIGN KEY (current_revision_id, requirement_id)
+            REFERENCES requirement_revisions(revision_id, requirement_id),
+        FOREIGN KEY (review_revision_id, requirement_id)
+            REFERENCES requirement_revisions(revision_id, requirement_id),
+        FOREIGN KEY (approved_revision_id, requirement_id)
+            REFERENCES requirement_revisions(revision_id, requirement_id),
+        CHECK(status='in_review' OR
+              (reviewer_id IS NULL AND review_revision_id IS NULL AND review_revision_hash IS NULL)),
+        CHECK(status!='in_review' OR
+              (reviewer_id IS NOT NULL AND review_revision_id IS NOT NULL
+               AND review_revision_hash IS NOT NULL)),
+        CHECK(status!='approved' OR
+              (approved_revision_id IS NOT NULL AND approved_revision_hash IS NOT NULL)),
+        CHECK((approved_revision_id IS NULL)=(approved_revision_hash IS NULL))
+    )
+    """,
+    """
+    CREATE TABLE requirement_revisions (
+        revision_id TEXT NOT NULL PRIMARY KEY,
+        project_id TEXT NOT NULL,
+        requirement_id TEXT NOT NULL,
+        number INTEGER NOT NULL CHECK(number>0),
+        content TEXT NOT NULL CHECK(length(trim(content))>0),
+        content_hash TEXT NOT NULL CHECK(length(content_hash)=64),
+        content_size INTEGER NOT NULL CHECK(content_size>0),
+        author_id TEXT NOT NULL,
+        created_at REAL NOT NULL,
+        UNIQUE (requirement_id, number),
+        UNIQUE (revision_id, requirement_id),
+        FOREIGN KEY (requirement_id, project_id) REFERENCES requirements(requirement_id, project_id),
+        FOREIGN KEY (project_id, author_id) REFERENCES project_members(project_id, user_id)
+    )
+    """,
+    """
+    CREATE TRIGGER requirement_revisions_no_replace
+    BEFORE INSERT ON requirement_revisions
+    WHEN EXISTS (
+        SELECT 1 FROM requirement_revisions
+        WHERE revision_id = NEW.revision_id OR (requirement_id = NEW.requirement_id AND number = NEW.number)
+    )
+    BEGIN
+        SELECT RAISE(ABORT, 'requirement revisions are immutable');
+    END
+    """,
+    """
+    CREATE TRIGGER requirement_revisions_no_update
+    BEFORE UPDATE ON requirement_revisions
+    BEGIN
+        SELECT RAISE(ABORT, 'requirement revisions are immutable');
+    END
+    """,
+    """
+    CREATE TRIGGER requirement_revisions_no_delete
+    BEFORE DELETE ON requirement_revisions
+    BEGIN
+        SELECT RAISE(ABORT, 'requirement revisions are immutable');
+    END
+    """,
+    """
+    CREATE TABLE requirement_messages (
+        message_id TEXT NOT NULL PRIMARY KEY,
+        project_id TEXT NOT NULL,
+        requirement_id TEXT NOT NULL,
+        role TEXT NOT NULL CHECK(role IN ('user','assistant')),
+        content TEXT NOT NULL CHECK(length(trim(content))>0),
+        author_id TEXT,
+        created_at REAL NOT NULL,
+        FOREIGN KEY (requirement_id, project_id) REFERENCES requirements(requirement_id, project_id),
+        FOREIGN KEY (project_id, author_id) REFERENCES project_members(project_id, user_id),
+        CHECK(role='user' OR author_id IS NULL),
+        CHECK(role='assistant' OR author_id IS NOT NULL)
+    )
+    """,
+    """
+    CREATE TABLE requirement_reviews (
+        review_id TEXT NOT NULL PRIMARY KEY,
+        project_id TEXT NOT NULL,
+        requirement_id TEXT NOT NULL,
+        revision_id TEXT NOT NULL,
+        revision_hash TEXT NOT NULL CHECK(length(revision_hash)=64),
+        target_version INTEGER NOT NULL CHECK(target_version>0),
+        reviewer_id TEXT NOT NULL,
+        decision TEXT NOT NULL CHECK(decision IN ('requested','approved','rejected')),
+        reason TEXT NOT NULL DEFAULT '',
+        created_at REAL NOT NULL,
+        FOREIGN KEY (requirement_id, project_id) REFERENCES requirements(requirement_id, project_id),
+        FOREIGN KEY (revision_id, requirement_id) REFERENCES requirement_revisions(revision_id, requirement_id),
+        FOREIGN KEY (project_id, reviewer_id) REFERENCES project_members(project_id, user_id)
+    )
+    """,
+    "CREATE INDEX requirement_reviews_chain ON requirement_reviews(requirement_id,created_at,review_id)",
+    "CREATE INDEX requirement_messages_stream ON requirement_messages(requirement_id,created_at,message_id)",
+    """
+    CREATE TRIGGER requirement_reviews_no_replace
+    BEFORE INSERT ON requirement_reviews
+    WHEN EXISTS (SELECT 1 FROM requirement_reviews WHERE review_id = NEW.review_id)
+    BEGIN
+        SELECT RAISE(ABORT, 'requirement reviews are immutable');
+    END
+    """,
+    """
+    CREATE TRIGGER requirement_reviews_no_update
+    BEFORE UPDATE ON requirement_reviews
+    BEGIN
+        SELECT RAISE(ABORT, 'requirement reviews are immutable');
+    END
+    """,
+    """
+    CREATE TRIGGER requirement_reviews_no_delete
+    BEFORE DELETE ON requirement_reviews
+    BEGIN
+        SELECT RAISE(ABORT, 'requirement reviews are immutable');
+    END
+    """,
+)
+
 
 def _check_schema_version(connection: sqlite3.Connection) -> None:
     version = connection.execute("PRAGMA user_version").fetchone()[0]
@@ -303,6 +441,11 @@ class Database:
                     for statement in _INSTANCE_SCHEMA:
                         connection.execute(statement)
                     version = 3
+                    migrated = True
+                if version == 3:
+                    for statement in _REQUIREMENT_SCHEMA:
+                        connection.execute(statement)
+                    version = 4
                     migrated = True
                 if migrated:
                     connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")

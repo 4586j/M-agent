@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from contextlib import closing
 from dataclasses import dataclass
+import hashlib
 import json
 from pathlib import Path
 import sqlite3
@@ -871,3 +872,179 @@ def test_machine_claim_failure_modes_do_not_leak_state(api, monkeypatch):
     monkeypatch.setattr(api.client.app.state.instances, "clock",
                         lambda: time.time() + 100 + 86401)
     checked(machine_claim(api, node_token, late["claim_token"]), 409)
+
+
+def create_requirement(api, project, actor="member", *, title="需求文档", content=None):
+    return checked(api.send(actor, "POST", f"/projects/{project['project_id']}/requirements",
+                            json={"title": title, "content": content}), 201)
+
+
+def reviews_path(project, requirement_id):
+    return f"/projects/{project['project_id']}/requirements/{requirement_id}/reviews"
+
+
+def test_requirement_draft_review_and_approval_over_http(api):
+    project = api.project()
+    pid = project["project_id"]
+    api.member(project)
+    api.member(project, "manager", "manager")
+    content = "# 需求文档\n第一版"
+    created = create_requirement(api, project, content=content)
+    assert created["status"] == "draft" and created["version"] == 2
+    requirement_id, revision_id = created["requirement_id"], created["current_revision_id"]
+    for actor in ("owner", "manager", "outsider"):
+        checked(api.send(actor, "GET", f"/projects/{pid}/requirements/{requirement_id}"), 404)
+    listing = checked(api.send("member", "GET", f"/projects/{pid}/requirements"))
+    assert [item["requirement_id"] for item in listing] == [requirement_id]
+    assert checked(api.send("manager", "GET", f"/projects/{pid}/requirements")) == []
+    messages_path = f"/projects/{pid}/requirements/{requirement_id}/messages"
+    checked(api.send("manager", "GET", messages_path), 404)
+    messages = checked(api.send("member", "POST", messages_path,
+                                json={"content": "请补充验收标准"}), 201)
+    assert [message["role"] for message in messages] == ["user"]
+    requested = checked(api.send("member", "POST", reviews_path(project, requirement_id),
+                                 json={"action": "request", "revision_id": revision_id,
+                                       "reviewer_user_id": api.identities["manager"]["user"]["user_id"],
+                                       "expected_version": 2}))
+    assert requested["requirement"]["status"] == "in_review"
+    assert requested["review"]["decision"] == "requested"
+    checked(api.send("member", "POST", reviews_path(project, requirement_id),
+                     json={"action": "approve", "revision_id": revision_id,
+                           "expected_version": 3}), 403)
+    inbox = checked(api.send("manager", "GET", "/inbox"))
+    assert [item["item_type"] for item in inbox] == ["requirement_review"]
+    assert checked(api.send("owner", "GET", "/inbox")) == []
+    revision = checked(api.send("manager", "GET",
+                                f"/projects/{pid}/requirements/{requirement_id}/revisions/{revision_id}"))
+    assert revision["content"] == content and revision["content_size"] == len(content.encode())
+    checked(api.send("manager", "GET", messages_path))
+    approved = checked(api.send("manager", "POST", reviews_path(project, requirement_id),
+                                json={"action": "approve", "revision_id": revision_id,
+                                      "expected_version": 3}))
+    assert approved["requirement"]["status"] == "approved"
+    assert approved["requirement"]["approved_revision_id"] == revision_id
+    assert checked(api.send("owner", "GET",
+                            f"/projects/{pid}/requirements/{requirement_id}"))["status"] == "approved"
+    for actor in ("owner", "manager"):
+        checked(api.send(actor, "GET", messages_path), 404)
+    checked(api.send("outsider", "GET", f"/projects/{pid}/requirements/{requirement_id}"), 404)
+    saved = checked(api.send("member", "POST",
+                             f"/projects/{pid}/requirements/{requirement_id}/revisions",
+                             json={"content": content + "\n第二版", "expected_version": 4}), 201)
+    assert saved["requirement"]["status"] == "draft"
+    checked(api.send("manager", "GET", f"/projects/{pid}/requirements/{requirement_id}"), 404)
+
+
+def test_requirement_approval_is_idempotent_and_audited_once(api):
+    project = api.project()
+    pid = project["project_id"]
+    api.member(project)
+    api.member(project, "manager", "manager")
+    created = create_requirement(api, project, content="唯一原文")
+    requirement_id, revision_id = created["requirement_id"], created["current_revision_id"]
+    checked(api.send("member", "POST", reviews_path(project, requirement_id),
+                     json={"action": "request", "revision_id": revision_id,
+                           "reviewer_user_id": api.identities["manager"]["user"]["user_id"],
+                           "expected_version": 2}))
+    first = checked(api.send("manager", "POST", reviews_path(project, requirement_id),
+                             json={"action": "approve", "revision_id": revision_id,
+                                   "expected_version": 3}))
+    replay = checked(api.send("manager", "POST", reviews_path(project, requirement_id),
+                              json={"action": "approve", "revision_id": revision_id,
+                                    "expected_version": 3}))
+    assert replay["review"]["review_id"] == first["review"]["review_id"]
+    assert replay["requirement"]["version"] == first["requirement"]["version"] == 4
+    events = checked(api.send("owner", "GET", f"/projects/{pid}/audit"))
+    approvals = [event for event in events if event["action"] == "requirement.review_approved"]
+    assert len(approvals) == 1
+    reviews = checked(api.send("manager", "GET", reviews_path(project, requirement_id)))
+    assert [item["decision"] for item in reviews] == ["requested", "approved"]
+
+
+def test_requirement_long_content_round_trips_and_lists_omit_text(api):
+    project = api.project()
+    pid = project["project_id"]
+    api.member(project)
+    api.member(project, "manager", "manager")
+    content = ("中文需求段落" * 60000) + "\n" + ("ascii-unit " * 20000) + "尾"
+    raw = content.encode("utf-8")
+    assert len(raw) > 1024 * 1024
+    created = create_requirement(api, project, content=content)
+    requirement_id, first_revision = created["requirement_id"], created["current_revision_id"]
+    revision = checked(api.send(
+        "member", "GET",
+        f"/projects/{pid}/requirements/{requirement_id}/revisions/{first_revision}"))
+    assert revision["content"].encode("utf-8") == raw
+    assert revision["content_hash"] == hashlib.sha256(raw).hexdigest()
+    assert revision["content_size"] == len(raw)
+    listing_response = api.send(
+        "member", "GET", f"/projects/{pid}/requirements/{requirement_id}/revisions")
+    listing = checked(listing_response)
+    assert all("content" not in item for item in listing)
+    assert "中文需求段落" not in listing_response.text
+    saved = checked(api.send(
+        "member", "POST", f"/projects/{pid}/requirements/{requirement_id}/revisions",
+        json={"content": content + "\n新增验收标准", "expected_version": 2}), 201)
+    diff = checked(api.send(
+        "member", "GET",
+        f"/projects/{pid}/requirements/{requirement_id}/revisions/diff",
+        params={"from_revision_id": first_revision,
+                "to_revision_id": saved["revision"]["revision_id"]}))
+    assert set(diff) == {"requirement_id", "from_revision_id", "to_revision_id", "diff"}
+    assert diff["diff"].startswith("--- ") and "+新增验收标准" in diff["diff"]
+
+
+def test_requirement_http_boundaries_and_validation(api):
+    project = api.project()
+    pid = project["project_id"]
+    api.member(project)
+    api.member(project, "manager", "manager")
+    created = create_requirement(api, project, content="原文")
+    requirement_id, revision_id = created["requirement_id"], created["current_revision_id"]
+    path = f"/projects/{pid}/requirements"
+    checked(api.send("member", "POST", path, json={"title": "无 CSRF"},
+                     headers={"X-CSRF-Token": None}), 403)
+    checked(api.send(None, "POST", path, json={"title": "无会话"}), 401)
+    checked(api.send("member", "POST", reviews_path(project, requirement_id),
+                     json={"action": "request", "revision_id": revision_id,
+                           "expected_version": 2}), 422)
+    checked(api.send("member", "POST", reviews_path(project, requirement_id),
+                     json={"action": "sign", "revision_id": revision_id,
+                           "expected_version": 2}), 422)
+    checked(api.send("member", "POST", f"{path}/{requirement_id}/revisions",
+                     json={"content": "x", "expected_version": 0}), 422)
+    checked(api.send("member", "POST", f"{path}/{requirement_id}/revisions",
+                     json={"content": "", "expected_version": 2}), 422)
+    checked(api.send("member", "POST", f"{path}/{requirement_id}/messages",
+                     json={"content": ""}), 422)
+    checked(api.send("outsider", "GET", path), 404)
+    checked(api.send("outsider", "POST", path, json={"title": "越权"}), 404)
+    checked(api.send("outsider", "GET", path,
+                     headers={"X-API-Key": "legacy-shared-secret"}), 404)
+
+
+def test_requirement_flow_creates_no_execution_rows_over_http(api):
+    project = api.project()
+    pid = project["project_id"]
+    api.member(project)
+    api.member(project, "manager", "manager")
+
+    def counts():
+        with api.database.read() as conn:
+            return {name: conn.execute(f"SELECT COUNT(*) FROM {name}").fetchone()[0]
+                    for name in ("nodes", "execution_instances", "agent_bindings",
+                                 "binding_revisions")}
+
+    before = counts()
+    created = create_requirement(api, project, content="零执行")
+    requirement_id, revision_id = created["requirement_id"], created["current_revision_id"]
+    assert counts() == before
+    checked(api.send("member", "POST", reviews_path(project, requirement_id),
+                     json={"action": "request", "revision_id": revision_id,
+                           "reviewer_user_id": api.identities["manager"]["user"]["user_id"],
+                           "expected_version": 2}))
+    assert counts() == before
+    checked(api.send("manager", "POST", reviews_path(project, requirement_id),
+                     json={"action": "approve", "revision_id": revision_id,
+                           "expected_version": 3}))
+    assert counts() == before

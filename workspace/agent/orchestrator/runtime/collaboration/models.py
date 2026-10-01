@@ -107,3 +107,58 @@ class ExecutionInstance:
     created_at: float = 0.0
     claimed_at: float | None = None
     heartbeat_at: float | None = None
+
+
+@dataclass(frozen=True)
+class Requirement:
+    requirement_id: str
+    project_id: str
+    title: str
+    requester_id: str
+    status: str = "draft"
+    reviewer_id: str | None = None
+    current_revision_id: str | None = None
+    review_revision_id: str | None = None
+    review_revision_hash: str | None = None
+    approved_revision_id: str | None = None
+    approved_revision_hash: str | None = None
+    version: int = 1
+    created_at: float = 0.0
+    updated_at: float = 0.0
+
+
+@dataclass(frozen=True)
+class RequirementRevision:
+    revision_id: str
+    project_id: str
+    requirement_id: str
+    number: int
+    content_hash: str
+    content_size: int
+    author_id: str
+    created_at: float = 0.0
+
+
+@dataclass(frozen=True)
+class RequirementMessage:
+    message_id: str
+    project_id: str
+    requirement_id: str
+    role: str
+    content: str
+    author_id: str | None = None
+    created_at: float = 0.0
+
+
+@dataclass(frozen=True)
+class RequirementReview:
+    review_id: str
+    project_id: str
+    requirement_id: str
+    revision_id: str
+    revision_hash: str
+    target_version: int
+    reviewer_id: str
+    decision: str
+    reason: str = ""
+    created_at: float = 0.0
