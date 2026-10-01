@@ -538,20 +538,21 @@ def test_review_lifecycle_creates_no_execution_artifacts(team):
         with team.database.read() as conn:
             counts = {name: conn.execute(f"SELECT COUNT(*) FROM {name}").fetchone()[0]
                       for name in ("nodes", "execution_instances", "agent_bindings",
-                                   "binding_revisions")}
-            tables = {row["name"] for row in conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table'")}
-        return counts, tables
+                                   "binding_revisions", "plans", "work_items")}
+        return counts
 
-    before, tables = snapshot()
+    before = snapshot()
     requirement = make_requirement(team, content="需求")
     requirement, _ = request_review(team, requirement)
     requirement, _ = decide(team, requirement, actor=team.carol, decision="approved")
-    after, _ = snapshot()
+    after = snapshot()
     assert before == after
-    suspicious = [name for name in tables
-                  if any(key in name.lower() for key in ("plan", "task", "outbox", "attempt"))]
-    assert suspicious == []
+    # Approval durably enqueues exactly one undelivered planning trigger; nothing
+    # executes until the scheduler delivers it.
+    with team.database.read() as conn:
+        pending = [(row["topic"], row["delivered_at"]) for row in
+                   conn.execute("SELECT topic,delivered_at FROM outbox_events")]
+    assert pending == [("requirement.approved", None)]
 
 
 def test_cross_project_access_and_revision_links_are_rejected(team):

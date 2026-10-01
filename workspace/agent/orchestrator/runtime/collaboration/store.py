@@ -10,10 +10,16 @@ from uuid import uuid4
 
 from .database import Database
 from .models import (
-    Agent, AgentProjectBinding, Conflict, ExecutionInstance, ExecutionNode,
-    InvalidState, NotFound, Project, ProjectMember, Requirement, RequirementMessage,
-    RequirementReview, RequirementRevision, User, ValidationError,
+    Agent, AgentProjectBinding, BudgetAccount, BudgetEntry, Conflict, ExecutionInstance,
+    ExecutionNode, InvalidState, NotFound, OutboxEvent, Plan, POST_APPROVAL_STATUSES, Project,
+    ProjectMember, Requirement, RequirementMessage, RequirementReview, RequirementRevision,
+    RevisionAcceptanceItem, User, ValidationError, WorkItem, WorkItemDependency,
 )
+
+
+REVISION_SAVE_STATUSES = ("draft", "approved", "planning_blocked")
+WORK_ITEM_QUEUE_STATUSES = ("pending_dependency", "ready", "waiting_agent")
+WORK_ITEM_ADVANCE_STATUSES = ("pending_dependency", "ready", "waiting_agent", "blocked")
 
 
 def _text(value: str, field: str, limit: int = 512) -> str:
@@ -97,6 +103,21 @@ _REVIEW_COLUMNS = (
     "review_id,project_id,requirement_id,revision_id,revision_hash,target_version,reviewer_id,"
     "decision,reason,created_at"
 )
+_ACCEPTANCE_COLUMNS = "revision_id,requirement_id,item_id,text,position"
+_PLAN_COLUMNS = (
+    "plan_id,project_id,requirement_id,revision_id,revision_hash,status,report,total_units,"
+    "created_by,created_at,published_at,version"
+)
+_WORK_ITEM_COLUMNS = (
+    "work_item_id,plan_id,project_id,key,title,objective,scope,non_goals,duty,"
+    "assignee_user_id,binding_id,status,estimated_units,version,created_at,updated_at"
+)
+_OUTBOX_COLUMNS = (
+    "event_id,project_id,topic,payload,created_at,next_attempt_at,attempts,"
+    "claim_expires_at,delivered_at,last_error"
+)
+_BUDGET_ACCOUNT_COLUMNS = "scope,ref_id,limit_units,version,updated_at"
+_BUDGET_ENTRY_COLUMNS = "entry_id,scope,ref_id,ref_type,ref_key,kind,delta_units,created_at"
 
 
 class CollaborationStore:
@@ -545,20 +566,24 @@ class CollaborationStore:
     def list_requirements(self, project_id: str, user_id: str) -> list[Requirement]:
         with self._read() as conn:
             self._project(conn, project_id)
+            visible = ",".join("?" * len(POST_APPROVAL_STATUSES))
             return [_record(Requirement, row) for row in conn.execute(
                 f"SELECT {_REQUIREMENT_COLUMNS} FROM requirements WHERE project_id=? AND "
-                "(status='approved' OR requester_id=? OR (status='in_review' AND reviewer_id=?)) "
+                f"(status IN ({visible}) OR requester_id=? "
+                "OR (status='in_review' AND reviewer_id=?)) "
                 "ORDER BY created_at,requirement_id",
-                (project_id, user_id, user_id))]
+                (project_id, *POST_APPROVAL_STATUSES, user_id, user_id))]
 
     def add_revision(self, project_id: str, requirement_id: str, *, content: str, content_hash: str,
                      content_size: int, author_id: str, expected_version: int,
-                     created_at: float) -> tuple[Requirement, RequirementRevision]:
+                     created_at: float,
+                     acceptance_items: tuple[tuple[str, str], ...] = ()) -> tuple[Requirement, RequirementRevision]:
+        acceptance = self._acceptance_items(acceptance_items)
         with self._write() as conn:
             requirement = self._requirement(conn, project_id, requirement_id)
             _version(requirement.version, expected_version)
-            if requirement.status == "in_review":
-                raise InvalidState("Cannot change a revision under review")
+            if requirement.status not in REVISION_SAVE_STATUSES:
+                raise InvalidState("Cannot change a revision in the current state")
             self._active(self._member(conn, project_id, author_id))
             number = conn.execute(
                 "SELECT COALESCE(MAX(number),0)+1 FROM requirement_revisions WHERE requirement_id=?",
@@ -569,11 +594,53 @@ class CollaborationStore:
                 "content_hash,content_size,author_id,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
                 (revision_id, project_id, requirement_id, number, content, content_hash,
                  content_size, author_id, created_at))
+            for position, (item_id, text) in enumerate(acceptance):
+                conn.execute(
+                    "INSERT INTO revision_acceptance_items(revision_id,requirement_id,item_id,text,"
+                    "position) VALUES(?,?,?,?,?)",
+                    (revision_id, requirement_id, item_id, text, position))
             conn.execute(
                 "UPDATE requirements SET current_revision_id=?,status='draft',version=version+1,"
                 "updated_at=? WHERE requirement_id=?", (revision_id, created_at, requirement_id))
             return (self._requirement(conn, project_id, requirement_id),
                     self._revision(conn, project_id, requirement_id, revision_id))
+
+    @staticmethod
+    def _acceptance_items(pairs) -> list[tuple[str, str]]:
+        if not isinstance(pairs, (list, tuple)) or len(pairs) > 256:
+            raise ValidationError("Invalid acceptance items")
+        normalized = []
+        for pair in pairs:
+            if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+                raise ValidationError("Invalid acceptance item")
+            item_id, text = pair
+            if (not isinstance(item_id, str)
+                    or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", item_id)):
+                raise ValidationError("Invalid acceptance item id")
+            _text(text, "acceptance item text", 4096)
+            normalized.append((item_id, text))
+        if len({item_id for item_id, _ in normalized}) != len(normalized):
+            raise ValidationError("Duplicate acceptance item ids")
+        return normalized
+
+    def list_acceptance_items(self, project_id: str, requirement_id: str,
+                              revision_id: str) -> list[RevisionAcceptanceItem]:
+        with self._read() as conn:
+            self._revision(conn, project_id, requirement_id, revision_id)
+            return [_record(RevisionAcceptanceItem, row) for row in conn.execute(
+                f"SELECT {_ACCEPTANCE_COLUMNS} FROM revision_acceptance_items WHERE revision_id=? "
+                "AND requirement_id=? ORDER BY position,item_id", (revision_id, requirement_id))]
+
+    def set_requirement_status(self, project_id: str, requirement_id: str, *, status: str,
+                               expected_version: int, updated_at: float) -> Requirement:
+        _choice(status, ("planning_blocked", "executing"), "status")
+        with self._write() as conn:
+            requirement = self._requirement(conn, project_id, requirement_id)
+            _version(requirement.version, expected_version)
+            conn.execute(
+                "UPDATE requirements SET status=?,version=version+1,updated_at=? WHERE requirement_id=?",
+                (status, updated_at, requirement_id))
+            return self._requirement(conn, project_id, requirement_id)
 
     @staticmethod
     def _revision(conn, project_id, requirement_id, revision_id):
@@ -740,3 +807,309 @@ class CollaborationStore:
             items += [("requirement_returned", _record(Requirement, row)) for row in returned]
         items.sort(key=lambda item: (-item[1].updated_at, item[1].requirement_id))
         return items
+
+    @staticmethod
+    def _work_item_fields(raw) -> dict:
+        if not isinstance(raw, dict):
+            raise ValidationError("Invalid work item")
+        key = raw.get("key")
+        if not isinstance(key, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", key):
+            raise ValidationError("Invalid work item key")
+        fields = {"key": key}
+        for name, limit in (("title", 512), ("objective", 8192), ("scope", 8192),
+                            ("non_goals", 8192), ("duty", 8192)):
+            fields[name] = _text(raw.get(name), name, limit)
+        for name in ("assignee_user_id", "binding_id"):
+            fields[name] = _text(raw.get(name), name)
+        estimated = raw.get("estimated_units")
+        if type(estimated) is not int or not 0 <= estimated <= 10 ** 9:
+            raise ValidationError("Invalid estimated_units")
+        fields["estimated_units"] = estimated
+        depends_on = raw.get("depends_on", [])
+        if (not isinstance(depends_on, (list, tuple))
+                or any(not isinstance(value, str) or not value for value in depends_on)):
+            raise ValidationError("Invalid depends_on")
+        fields["depends_on"] = list(dict.fromkeys(depends_on))
+        return fields
+
+    def create_plan(self, project_id: str, requirement_id: str, *, revision_id: str,
+                    revision_hash: str, status: str, report: str, total_units: int,
+                    created_by: str | None, created_at: float, items=()) -> Plan:
+        _choice(status, ("blocked", "published"), "status")
+        if not isinstance(report, str) or not report.strip() or len(report) > 65536:
+            raise ValidationError("Invalid plan report")
+        if type(total_units) is not int or not 0 <= total_units <= 10 ** 12:
+            raise ValidationError("Invalid plan total")
+        fields = [self._work_item_fields(raw) for raw in items]
+        if status == "blocked" and fields:
+            raise ValidationError("A blocked plan cannot carry work items")
+        with self._write() as conn:
+            self._requirement(conn, project_id, requirement_id)
+            plan_id = uuid4().hex
+            conn.execute(
+                "INSERT INTO plans(plan_id,project_id,requirement_id,revision_id,revision_hash,status,"
+                "report,total_units,created_by,created_at,published_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                (plan_id, project_id, requirement_id, revision_id, revision_hash, status, report,
+                 total_units, created_by, created_at,
+                 created_at if status == "published" else None))
+            if status == "published":
+                ids_by_key = {}
+                for raw in fields:
+                    work_item_id = uuid4().hex
+                    ids_by_key[raw["key"]] = work_item_id
+                    conn.execute(
+                        "INSERT INTO work_items(work_item_id,plan_id,project_id,key,title,objective,"
+                        "scope,non_goals,duty,assignee_user_id,binding_id,status,estimated_units,"
+                        "created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                        (work_item_id, plan_id, project_id, raw["key"], raw["title"], raw["objective"],
+                         raw["scope"], raw["non_goals"], raw["duty"], raw["assignee_user_id"],
+                         raw["binding_id"],
+                         "pending_dependency" if raw["depends_on"] else "ready",
+                         raw["estimated_units"], created_at, created_at))
+                for raw in fields:
+                    for dependency_key in raw["depends_on"]:
+                        dependency_id = ids_by_key.get(dependency_key)
+                        if dependency_id is None:
+                            raise ValidationError("Unknown dependency reference")
+                        conn.execute(
+                            "INSERT INTO work_item_dependencies(work_item_id,depends_on_id,plan_id,"
+                            "project_id) VALUES(?,?,?,?)",
+                            (ids_by_key[raw["key"]], dependency_id, plan_id, project_id))
+            return self._plan(conn, project_id, plan_id)
+
+    @staticmethod
+    def _plan(conn, project_id, plan_id):
+        return _one(conn, Plan, f"SELECT {_PLAN_COLUMNS} FROM plans WHERE project_id=? AND plan_id=?",
+                    (project_id, plan_id))
+
+    def get_plan(self, project_id: str, plan_id: str) -> Plan:
+        with self._read() as conn:
+            return self._plan(conn, project_id, plan_id)
+
+    def list_plans(self, project_id: str, requirement_id: str) -> list[Plan]:
+        with self._read() as conn:
+            self._requirement(conn, project_id, requirement_id)
+            return [_record(Plan, row) for row in conn.execute(
+                f"SELECT {_PLAN_COLUMNS} FROM plans WHERE project_id=? AND requirement_id=? "
+                "ORDER BY created_at,rowid", (project_id, requirement_id))]
+
+    def published_plan(self, project_id: str, requirement_id: str) -> Plan | None:
+        with self._read() as conn:
+            return _maybe(conn, Plan,
+                          f"SELECT {_PLAN_COLUMNS} FROM plans WHERE project_id=? AND requirement_id=? "
+                          "AND status='published'", (project_id, requirement_id))
+
+    @staticmethod
+    def _work_item(conn, work_item_id):
+        return _one(conn, WorkItem,
+                    f"SELECT {_WORK_ITEM_COLUMNS} FROM work_items WHERE work_item_id=?",
+                    (work_item_id,))
+
+    def get_work_item(self, project_id: str, work_item_id: str) -> WorkItem:
+        with self._read() as conn:
+            return _one(conn, WorkItem,
+                        f"SELECT {_WORK_ITEM_COLUMNS} FROM work_items WHERE project_id=? AND "
+                        "work_item_id=?", (project_id, work_item_id))
+
+    def list_work_items(self, project_id: str, plan_id: str) -> list[WorkItem]:
+        with self._read() as conn:
+            self._plan(conn, project_id, plan_id)
+            return [_record(WorkItem, row) for row in conn.execute(
+                f"SELECT {_WORK_ITEM_COLUMNS} FROM work_items WHERE project_id=? AND plan_id=? "
+                "ORDER BY rowid", (project_id, plan_id))]
+
+    def list_work_item_dependencies(self, project_id: str, plan_id: str) -> list[WorkItemDependency]:
+        with self._read() as conn:
+            self._plan(conn, project_id, plan_id)
+            return [_record(WorkItemDependency, row) for row in conn.execute(
+                "SELECT work_item_id,depends_on_id,plan_id,project_id FROM work_item_dependencies "
+                "WHERE project_id=? AND plan_id=? ORDER BY rowid", (project_id, plan_id))]
+
+    def pending_work_items(self, project_id: str | None = None) -> list[WorkItem]:
+        statuses = ",".join("?" * len(WORK_ITEM_QUEUE_STATUSES))
+        with self._read() as conn:
+            if project_id is None:
+                rows = conn.execute(
+                    f"SELECT {_WORK_ITEM_COLUMNS} FROM work_items WHERE status IN ({statuses}) "
+                    "ORDER BY rowid", WORK_ITEM_QUEUE_STATUSES)
+            else:
+                rows = conn.execute(
+                    f"SELECT {_WORK_ITEM_COLUMNS} FROM work_items WHERE project_id=? AND "
+                    f"status IN ({statuses}) ORDER BY rowid", (project_id, *WORK_ITEM_QUEUE_STATUSES))
+            return [_record(WorkItem, row) for row in rows]
+
+    def dependency_gap_count(self, work_item_id: str) -> int:
+        with self._read() as conn:
+            return conn.execute(
+                "SELECT COUNT(*) FROM work_item_dependencies d JOIN work_items x "
+                "ON x.work_item_id=d.depends_on_id WHERE d.work_item_id=? AND x.status<>'accepted'",
+                (work_item_id,)).fetchone()[0]
+
+    def binding_has_live_instance(self, binding_id: str, *, fresh_since: float) -> bool:
+        with self._read() as conn:
+            return conn.execute(
+                "SELECT 1 FROM execution_instances WHERE binding_id=? AND status='active' "
+                "AND heartbeat_at IS NOT NULL AND heartbeat_at>=? LIMIT 1",
+                (binding_id, fresh_since)).fetchone() is not None
+
+    def advance_work_item(self, work_item_id: str, *, status: str, expected_version: int,
+                          updated_at: float) -> WorkItem:
+        _choice(status, WORK_ITEM_ADVANCE_STATUSES, "status")
+        with self._write() as conn:
+            item = self._work_item(conn, work_item_id)
+            _version(item.version, expected_version)
+            conn.execute(
+                "UPDATE work_items SET status=?,version=version+1,updated_at=? WHERE work_item_id=?",
+                (status, updated_at, work_item_id))
+            return self._work_item(conn, work_item_id)
+
+    def enqueue_event(self, project_id: str, topic: str, payload: dict, created_at: float) -> OutboxEvent:
+        _text(topic, "topic", 128)
+        if not isinstance(payload, dict):
+            raise ValidationError("Invalid event payload")
+        serialized = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        if len(serialized) > 65536:
+            raise ValidationError("Event payload is too large")
+        with self._write() as conn:
+            event_id = uuid4().hex
+            conn.execute(
+                "INSERT INTO outbox_events(event_id,project_id,topic,payload,created_at,"
+                "next_attempt_at) VALUES(?,?,?,?,?,?)",
+                (event_id, project_id, topic, serialized, created_at, created_at))
+            return _one(conn, OutboxEvent,
+                        f"SELECT {_OUTBOX_COLUMNS} FROM outbox_events WHERE event_id=?", (event_id,))
+
+    def get_event(self, event_id: str) -> OutboxEvent:
+        with self._read() as conn:
+            return _one(conn, OutboxEvent,
+                        f"SELECT {_OUTBOX_COLUMNS} FROM outbox_events WHERE event_id=?", (event_id,))
+
+    def list_events(self, project_id: str | None = None, *, limit: int = 200) -> list[OutboxEvent]:
+        with self._read() as conn:
+            if project_id is None:
+                rows = conn.execute(
+                    f"SELECT {_OUTBOX_COLUMNS} FROM outbox_events ORDER BY created_at DESC,"
+                    "event_id DESC LIMIT ?", (limit,))
+            else:
+                rows = conn.execute(
+                    f"SELECT {_OUTBOX_COLUMNS} FROM outbox_events WHERE project_id=? "
+                    "ORDER BY created_at DESC,event_id DESC LIMIT ?", (project_id, limit))
+            return [_record(OutboxEvent, row) for row in rows]
+
+    def claim_due_events(self, *, now: float, lease_ttl: int, batch_size: int,
+                         project_id: str | None = None) -> list[OutboxEvent]:
+        with self._write() as conn:
+            if project_id is None:
+                rows = conn.execute(
+                    f"SELECT {_OUTBOX_COLUMNS} FROM outbox_events WHERE delivered_at IS NULL "
+                    "AND next_attempt_at<=? AND (claim_expires_at IS NULL OR claim_expires_at<=?) "
+                    "ORDER BY next_attempt_at,created_at,event_id LIMIT ?",
+                    (now, now, batch_size)).fetchall()
+            else:
+                rows = conn.execute(
+                    f"SELECT {_OUTBOX_COLUMNS} FROM outbox_events WHERE project_id=? "
+                    "AND delivered_at IS NULL AND next_attempt_at<=? "
+                    "AND (claim_expires_at IS NULL OR claim_expires_at<=?) "
+                    "ORDER BY next_attempt_at,created_at,event_id LIMIT ?",
+                    (project_id, now, now, batch_size)).fetchall()
+            claimed = []
+            for row in rows:
+                claim_expires_at = now + lease_ttl
+                conn.execute("UPDATE outbox_events SET claim_expires_at=? WHERE event_id=?",
+                             (claim_expires_at, row["event_id"]))
+                values = dict(row)
+                values["claim_expires_at"] = claim_expires_at
+                claimed.append(OutboxEvent(**values))
+            return claimed
+
+    def mark_event_delivered(self, event_id: str, *, claim_expires_at: float,
+                             delivered_at: float) -> bool:
+        with self._write() as conn:
+            cursor = conn.execute(
+                "UPDATE outbox_events SET delivered_at=?,claim_expires_at=NULL "
+                "WHERE event_id=? AND claim_expires_at=?",
+                (delivered_at, event_id, claim_expires_at))
+            return cursor.rowcount == 1
+
+    def defer_event(self, event_id: str, *, claim_expires_at: float, next_attempt_at: float,
+                    last_error: str | None) -> bool:
+        with self._write() as conn:
+            cursor = conn.execute(
+                "UPDATE outbox_events SET attempts=attempts+1,next_attempt_at=?,claim_expires_at=NULL,"
+                "last_error=? WHERE event_id=? AND claim_expires_at=?",
+                (next_attempt_at, last_error, event_id, claim_expires_at))
+            return cursor.rowcount == 1
+
+    def get_budget_account(self, scope: str, ref_id: str) -> BudgetAccount | None:
+        with self._read() as conn:
+            return _maybe(conn, BudgetAccount,
+                          f"SELECT {_BUDGET_ACCOUNT_COLUMNS} FROM budget_accounts "
+                          "WHERE scope=? AND ref_id=?", (scope, ref_id))
+
+    def list_budget_accounts(self, project_id: str | None = None) -> list[BudgetAccount]:
+        with self._read() as conn:
+            if project_id is None:
+                rows = conn.execute(
+                    f"SELECT {_BUDGET_ACCOUNT_COLUMNS} FROM budget_accounts ORDER BY scope,ref_id")
+            else:
+                rows = conn.execute(
+                    f"SELECT {_BUDGET_ACCOUNT_COLUMNS} FROM budget_accounts WHERE scope='global' "
+                    "OR (scope='project' AND ref_id=?) OR (scope='requirement' AND ref_id IN "
+                    "(SELECT requirement_id FROM requirements WHERE project_id=?)) "
+                    "ORDER BY scope,ref_id", (project_id, project_id))
+            return [_record(BudgetAccount, row) for row in rows]
+
+    def upsert_budget_account(self, scope: str, ref_id: str, *, limit_units: int,
+                              expected_version: int | None, updated_at: float) -> BudgetAccount:
+        _choice(scope, ("global", "project", "requirement"), "scope")
+        if scope == "global":
+            if ref_id != "":
+                raise ValidationError("The global budget uses an empty reference")
+        elif not isinstance(ref_id, str) or not ref_id.strip() or len(ref_id) > 64:
+            raise ValidationError("Invalid budget reference")
+        if type(limit_units) is not int or not 0 <= limit_units <= 10 ** 12:
+            raise ValidationError("Invalid budget limit")
+        with self._write() as conn:
+            row = conn.execute("SELECT * FROM budget_accounts WHERE scope=? AND ref_id=?",
+                               (scope, ref_id)).fetchone()
+            if row is None:
+                if expected_version is not None:
+                    raise Conflict("Budget account does not exist")
+                conn.execute(
+                    "INSERT INTO budget_accounts(scope,ref_id,limit_units,version,updated_at) "
+                    "VALUES(?,?,?,1,?)", (scope, ref_id, limit_units, updated_at))
+            else:
+                if expected_version is None:
+                    raise Conflict("expected_version is required for an existing budget account")
+                _version(row["version"], expected_version)
+                conn.execute(
+                    "UPDATE budget_accounts SET limit_units=?,version=version+1,updated_at=? "
+                    "WHERE scope=? AND ref_id=?", (limit_units, updated_at, scope, ref_id))
+            return _one(conn, BudgetAccount,
+                        f"SELECT {_BUDGET_ACCOUNT_COLUMNS} FROM budget_accounts "
+                        "WHERE scope=? AND ref_id=?", (scope, ref_id))
+
+    def add_budget_entry(self, scope: str, ref_id: str, *, ref_type: str, ref_key: str, kind: str,
+                         delta_units: int, created_at: float) -> BudgetEntry:
+        _choice(scope, ("global", "project", "requirement"), "scope")
+        _choice(ref_type, ("plan", "work_item", "attempt", "adjustment"), "ref_type")
+        _choice(kind, ("reserve", "settle", "release", "adjustment"), "kind")
+        _text(ref_key, "ref_key", 128)
+        if type(delta_units) is not int or not -10 ** 12 <= delta_units <= 10 ** 12:
+            raise ValidationError("Invalid budget delta")
+        with self._write() as conn:
+            conn.execute(
+                "INSERT INTO budget_entries(entry_id,scope,ref_id,ref_type,ref_key,kind,delta_units,"
+                "created_at) VALUES(?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(scope,ref_id,ref_type,ref_key,kind) DO NOTHING",
+                (uuid4().hex, scope, ref_id, ref_type, ref_key, kind, delta_units, created_at))
+            return _one(conn, BudgetEntry,
+                        f"SELECT {_BUDGET_ENTRY_COLUMNS} FROM budget_entries WHERE scope=? AND ref_id=? "
+                        "AND ref_type=? AND ref_key=? AND kind=?",
+                        (scope, ref_id, ref_type, ref_key, kind))
+
+    def list_budget_entries(self, scope: str, ref_id: str) -> list[BudgetEntry]:
+        with self._read() as conn:
+            return [_record(BudgetEntry, row) for row in conn.execute(
+                f"SELECT {_BUDGET_ENTRY_COLUMNS} FROM budget_entries WHERE scope=? AND ref_id=? "
+                "ORDER BY created_at,rowid", (scope, ref_id))]

@@ -27,6 +27,18 @@ class SchemaVersionError(CollaborationError):
     """The database schema is not supported by this runtime."""
 
 
+class Unavailable(CollaborationError):
+    """A required dependency (for example the planner) is not available."""
+
+
+# Statuses that mean the approved text is the requirement's working version, so
+# every project member may see it even after the drafting cycle has moved on.
+POST_APPROVAL_STATUSES = (
+    "approved", "planning", "planning_blocked", "executing", "integrating",
+    "awaiting_acceptance", "rework", "paused", "cancelling", "cancelled", "completed",
+)
+
+
 @dataclass(frozen=True)
 class User:
     user_id: str
@@ -161,4 +173,92 @@ class RequirementReview:
     reviewer_id: str
     decision: str
     reason: str = ""
+    created_at: float = 0.0
+
+
+@dataclass(frozen=True)
+class RevisionAcceptanceItem:
+    revision_id: str
+    requirement_id: str
+    item_id: str
+    text: str
+    position: int
+
+
+@dataclass(frozen=True)
+class Plan:
+    plan_id: str
+    project_id: str
+    requirement_id: str
+    revision_id: str
+    revision_hash: str
+    status: str
+    report: str
+    total_units: int
+    created_by: str | None = None
+    created_at: float = 0.0
+    published_at: float | None = None
+    version: int = 1
+
+
+@dataclass(frozen=True)
+class WorkItem:
+    work_item_id: str
+    plan_id: str
+    project_id: str
+    key: str
+    title: str
+    objective: str
+    scope: str
+    non_goals: str
+    duty: str
+    assignee_user_id: str
+    binding_id: str
+    status: str = "pending_dependency"
+    estimated_units: int = 0
+    version: int = 1
+    created_at: float = 0.0
+    updated_at: float = 0.0
+
+
+@dataclass(frozen=True)
+class WorkItemDependency:
+    work_item_id: str
+    depends_on_id: str
+    plan_id: str
+    project_id: str
+
+
+@dataclass(frozen=True)
+class OutboxEvent:
+    event_id: str
+    project_id: str
+    topic: str
+    payload: str
+    created_at: float
+    next_attempt_at: float
+    attempts: int = 0
+    claim_expires_at: float | None = None
+    delivered_at: float | None = None
+    last_error: str | None = None
+
+
+@dataclass(frozen=True)
+class BudgetAccount:
+    scope: str
+    ref_id: str
+    limit_units: int
+    version: int = 1
+    updated_at: float = 0.0
+
+
+@dataclass(frozen=True)
+class BudgetEntry:
+    entry_id: str
+    scope: str
+    ref_id: str
+    ref_type: str
+    ref_key: str
+    kind: str
+    delta_units: int
     created_at: float = 0.0

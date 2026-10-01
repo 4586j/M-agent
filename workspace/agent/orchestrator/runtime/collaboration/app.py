@@ -4,6 +4,7 @@ from __future__ import annotations
 from contextlib import asynccontextmanager, contextmanager
 from dataclasses import asdict, dataclass
 from ipaddress import ip_address
+import json
 from pathlib import Path
 import re
 import sqlite3
@@ -17,10 +18,14 @@ from starlette.exceptions import HTTPException
 from starlette.responses import JSONResponse
 
 from .auth import AuthService, Unauthorized, Forbidden, RateLimited
+from .budgets import BudgetService
 from .database import Database
 from .instances import InstanceService
-from .models import Conflict, InvalidState, NotFound, ValidationError
+from .models import Conflict, InvalidState, NotFound, Unavailable, ValidationError
+from .planning import PlanService, plan_document
 from .requirements import RequirementService
+from .scheduler import QueueService, Scheduler
+from .store import CollaborationStore
 
 
 PREFIX = "/collab/v1"
@@ -74,6 +79,9 @@ Username = Annotated[str, Field(min_length=3, max_length=64)]
 Password = Annotated[SecretStr, Field(min_length=12, max_length=1024)]
 Version = Annotated[int, Field(strict=True, ge=1)]
 AuditLimit = Annotated[int, Query(ge=1, le=200)]
+EventLimit = Annotated[int, Query(ge=1, le=200)]
+AcceptanceText = Annotated[str, Field(min_length=1, max_length=4096)]
+AcceptanceItems = Annotated[list[AcceptanceText], Field(max_length=256)]
 
 
 class Input(BaseModel):
@@ -165,6 +173,7 @@ class MachineClaim(Input):
 class RequirementCreate(Input):
     title: Name
     content: Annotated[str, Field(max_length=8388608)] | None = None
+    acceptance_items: AcceptanceItems | None = None
 
 
 class RequirementMessageCreate(Input):
@@ -173,6 +182,7 @@ class RequirementMessageCreate(Input):
 
 class RequirementRevisionCreate(Input):
     content: Annotated[str, Field(min_length=1, max_length=8388608)]
+    acceptance_items: AcceptanceItems | None = None
     expected_version: Version
 
 
@@ -184,10 +194,15 @@ class RequirementReviewCreate(Input):
     expected_version: Version
 
 
+class BudgetLimit(Input):
+    limit_units: Annotated[int, Field(strict=True, ge=0, le=10 ** 12)]
+    expected_version: Version | None = None
+
+
 _ERRORS = {
     401: "Unauthorized", 403: "Forbidden", 404: "Not found", 405: "Method not allowed",
     409: "Conflict", 422: "Invalid request", 429: "Too many requests",
-    500: "Internal server error",
+    500: "Internal server error", 503: "Service unavailable",
 }
 
 
@@ -199,6 +214,16 @@ def _error(status: int) -> JSONResponse:
 def _access(request: Request, **kwargs):
     return request.app.state.auth.access(
         request.cookies.get(COOKIE), request.headers.get("X-CSRF-Token"), **kwargs)
+
+
+def _authorized_actor(request: Request, **kwargs) -> str:
+    """Authorize on a short-lived transaction, then release it before service work.
+
+    Collaboration services open their own connections; holding this transaction
+    across them would keep the single-writer lock of the SQLite file busy.
+    """
+    with _access(request, write=True, **kwargs) as access:
+        return access.user.user_id
 
 
 def _audit(request: Request, access, action: str, target_id: str, version: int,
@@ -251,6 +276,12 @@ def create_app(config: AppConfig) -> FastAPI:
         app.state.auth = AuthService(database, session_ttl=config.session_ttl)
         app.state.instances = InstanceService(database)
         app.state.requirements = RequirementService()
+        app.state.budgets = BudgetService()
+        app.state.planning = PlanService(database, budgets=app.state.budgets)
+        app.state.queue = QueueService(database,
+                                       heartbeat_timeout=app.state.instances.heartbeat_timeout)
+        app.state.scheduler = Scheduler(database, planning=app.state.planning,
+                                        queue=app.state.queue)
         yield
 
     app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None,
@@ -278,15 +309,16 @@ def create_app(config: AppConfig) -> FastAPI:
 
     async def domain_error(request: Request, exc: Exception):
         for kind, status in ((Unauthorized, 401), (Forbidden, 403), (RateLimited, 429),
-                             (NotFound, 404), (Conflict, 409), (InvalidState, 409),
-                             (ValidationError, 422), (RequestValidationError, 422),
-                             (sqlite3.IntegrityError, 409)):
+                             (Unavailable, 503), (NotFound, 404), (Conflict, 409),
+                             (InvalidState, 409), (ValidationError, 422),
+                             (RequestValidationError, 422), (sqlite3.IntegrityError, 409)):
             if isinstance(exc, kind):
                 return _error(status)
         return _error(500)
 
-    for kind in (Unauthorized, Forbidden, RateLimited, NotFound, Conflict, InvalidState,
-                 ValidationError, RequestValidationError, sqlite3.DatabaseError):
+    for kind in (Unauthorized, Forbidden, RateLimited, Unavailable, NotFound, Conflict,
+                 InvalidState, ValidationError, RequestValidationError,
+                 sqlite3.DatabaseError):
         app.add_exception_handler(kind, domain_error)
 
     @app.exception_handler(HTTPException)
@@ -521,7 +553,8 @@ def create_app(config: AppConfig) -> FastAPI:
     def create_requirement(pid: str, body: RequirementCreate, request: Request):
         with _access(request, project_id=pid, write=True) as access:
             return asdict(app.state.requirements.create_requirement(
-                access, project_id=pid, title=body.title, content=body.content))
+                access, project_id=pid, title=body.title, content=body.content,
+                acceptance_items=body.acceptance_items))
 
     @router.get("/projects/{pid}/requirements")
     def list_requirements(pid: str, request: Request):
@@ -552,7 +585,7 @@ def create_app(config: AppConfig) -> FastAPI:
         with _access(request, project_id=pid, write=True) as access:
             requirement, revision = app.state.requirements.save_revision(
                 access, project_id=pid, requirement_id=rid, content=body.content,
-                expected_version=body.expected_version)
+                acceptance_items=body.acceptance_items, expected_version=body.expected_version)
             return {"requirement": asdict(requirement), "revision": asdict(revision)}
 
     @router.get("/projects/{pid}/requirements/{rid}/revisions")
@@ -598,6 +631,70 @@ def create_app(config: AppConfig) -> FastAPI:
         with _access(request, project_id=pid) as access:
             return [asdict(review) for review in app.state.requirements.list_reviews(
                 access, project_id=pid, requirement_id=rid)]
+
+    @router.post("/projects/{pid}/requirements/{rid}/plans", status_code=201)
+    def generate_plan(pid: str, rid: str, request: Request):
+        actor_id = _authorized_actor(request, project_id=pid, roles=MANAGERS)
+        plan = app.state.planning.plan(project_id=pid, requirement_id=rid, actor_id=actor_id,
+                                       require_approved_only=False)
+        store = CollaborationStore(app.state.planning.database)
+        return {"plan": plan_document(plan),
+                "work_items": [asdict(item) for item in store.list_work_items(pid, plan.plan_id)],
+                "dependencies": [asdict(dependency) for dependency in
+                                 store.list_work_item_dependencies(pid, plan.plan_id)]}
+
+    @router.get("/projects/{pid}/requirements/{rid}/plans")
+    def list_plans(pid: str, rid: str, request: Request):
+        with _access(request, project_id=pid) as access:
+            return [plan_document(plan) for plan in app.state.planning.list_plans(
+                access, project_id=pid, requirement_id=rid)]
+
+    @router.get("/projects/{pid}/requirements/{rid}/plans/{planid}")
+    def get_plan(pid: str, rid: str, planid: str, request: Request):
+        with _access(request, project_id=pid) as access:
+            plan, items, dependencies = app.state.planning.plan_detail(
+                access, project_id=pid, requirement_id=rid, plan_id=planid)
+            return {"plan": plan_document(plan),
+                    "work_items": [asdict(item) for item in items],
+                    "dependencies": [asdict(dependency) for dependency in dependencies]}
+
+    @router.post("/projects/{pid}/scheduler/tick")
+    def scheduler_tick(pid: str, request: Request):
+        _authorized_actor(request, project_id=pid, roles=MANAGERS)
+        return app.state.scheduler.tick(project_id=pid)
+
+    @router.get("/projects/{pid}/outbox")
+    def list_outbox(pid: str, request: Request, limit: EventLimit = 100):
+        with _access(request, project_id=pid, roles=MANAGERS) as access:
+            return [{**asdict(event), "payload": json.loads(event.payload)}
+                    for event in access.store.list_events(pid, limit=limit)]
+
+    @router.get("/projects/{pid}/budget")
+    def get_budget(pid: str, request: Request):
+        with _access(request, project_id=pid) as access:
+            return app.state.budgets.budget_view(access, project_id=pid)
+
+    @router.put("/projects/{pid}/budget")
+    def set_project_budget(pid: str, body: BudgetLimit, request: Request):
+        with _access(request, project_id=pid, roles=MANAGERS, write=True) as access:
+            return app.state.budgets.set_limit(
+                access, scope="project", ref_id=pid, limit_units=body.limit_units,
+                expected_version=body.expected_version, project_id=pid)
+
+    @router.put("/projects/{pid}/requirements/{rid}/budget")
+    def set_requirement_budget(pid: str, rid: str, body: BudgetLimit, request: Request):
+        with _access(request, project_id=pid, roles=MANAGERS, write=True) as access:
+            access.store.get_requirement(pid, rid)
+            return app.state.budgets.set_limit(
+                access, scope="requirement", ref_id=rid, limit_units=body.limit_units,
+                expected_version=body.expected_version, project_id=pid)
+
+    @router.put("/admin/budget")
+    def set_global_budget(body: BudgetLimit, request: Request):
+        with _access(request, admin=True, write=True) as access:
+            return app.state.budgets.set_limit(
+                access, scope="global", ref_id="", limit_units=body.limit_units,
+                expected_version=body.expected_version)
 
     @router.get("/inbox")
     def inbox(request: Request):

@@ -8,7 +8,7 @@ from typing import Iterator
 from .models import SchemaVersionError
 
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 _SCHEMA_STATEMENTS = (
     """
@@ -382,6 +382,202 @@ _REQUIREMENT_SCHEMA = (
     """,
 )
 
+_PLANNING_SCHEMA = (
+    # Rebuilds `requirements` while child tables keep foreign keys to it; initialize()
+    # disables FK enforcement for this migration transaction and uses foreign_key_check.
+    """
+    CREATE TABLE requirements_v5 (
+        requirement_id TEXT NOT NULL PRIMARY KEY,
+        project_id TEXT NOT NULL REFERENCES projects(project_id),
+        title TEXT NOT NULL CHECK(length(trim(title))>0),
+        requester_id TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'draft'
+            CHECK(status IN ('draft','in_review','approved','planning','planning_blocked',
+                             'executing','integrating','awaiting_acceptance','rework','paused',
+                             'cancelling','cancelled','completed')),
+        reviewer_id TEXT,
+        current_revision_id TEXT,
+        review_revision_id TEXT,
+        review_revision_hash TEXT CHECK(review_revision_hash IS NULL OR length(review_revision_hash)=64),
+        approved_revision_id TEXT,
+        approved_revision_hash TEXT CHECK(approved_revision_hash IS NULL OR length(approved_revision_hash)=64),
+        version INTEGER NOT NULL DEFAULT 1 CHECK(version>0),
+        created_at REAL NOT NULL,
+        updated_at REAL NOT NULL,
+        UNIQUE (requirement_id, project_id),
+        FOREIGN KEY (project_id, requester_id) REFERENCES project_members(project_id, user_id),
+        FOREIGN KEY (project_id, reviewer_id) REFERENCES project_members(project_id, user_id),
+        FOREIGN KEY (current_revision_id, requirement_id)
+            REFERENCES requirement_revisions(revision_id, requirement_id),
+        FOREIGN KEY (review_revision_id, requirement_id)
+            REFERENCES requirement_revisions(revision_id, requirement_id),
+        FOREIGN KEY (approved_revision_id, requirement_id)
+            REFERENCES requirement_revisions(revision_id, requirement_id),
+        CHECK(status='in_review' OR
+              (reviewer_id IS NULL AND review_revision_id IS NULL AND review_revision_hash IS NULL)),
+        CHECK(status!='in_review' OR
+              (reviewer_id IS NOT NULL AND review_revision_id IS NOT NULL
+               AND review_revision_hash IS NOT NULL)),
+        CHECK(status!='approved' OR
+              (approved_revision_id IS NOT NULL AND approved_revision_hash IS NOT NULL)),
+        CHECK((approved_revision_id IS NULL)=(approved_revision_hash IS NULL))
+    )
+    """,
+    """
+    INSERT INTO requirements_v5
+        (requirement_id,project_id,title,requester_id,status,reviewer_id,current_revision_id,
+         review_revision_id,review_revision_hash,approved_revision_id,approved_revision_hash,
+         version,created_at,updated_at)
+    SELECT requirement_id,project_id,title,requester_id,status,reviewer_id,current_revision_id,
+           review_revision_id,review_revision_hash,approved_revision_id,approved_revision_hash,
+           version,created_at,updated_at
+    FROM requirements
+    """,
+    "DROP TABLE requirements",
+    "ALTER TABLE requirements_v5 RENAME TO requirements",
+    "CREATE UNIQUE INDEX agent_bindings_scope ON agent_bindings (binding_id, project_id)",
+    """
+    CREATE TABLE plans (
+        plan_id TEXT NOT NULL PRIMARY KEY,
+        project_id TEXT NOT NULL,
+        requirement_id TEXT NOT NULL,
+        revision_id TEXT NOT NULL,
+        revision_hash TEXT NOT NULL CHECK(length(revision_hash)=64),
+        status TEXT NOT NULL CHECK(status IN ('blocked','published')),
+        report TEXT NOT NULL CHECK(length(trim(report))>0),
+        total_units INTEGER NOT NULL DEFAULT 0 CHECK(total_units>=0),
+        created_by TEXT,
+        created_at REAL NOT NULL,
+        published_at REAL,
+        version INTEGER NOT NULL DEFAULT 1 CHECK(version>0),
+        UNIQUE (plan_id, project_id),
+        FOREIGN KEY (requirement_id, project_id)
+            REFERENCES requirements(requirement_id, project_id),
+        FOREIGN KEY (revision_id, requirement_id)
+            REFERENCES requirement_revisions(revision_id, requirement_id),
+        CHECK((status='published')=(published_at IS NOT NULL))
+    )
+    """,
+    "CREATE UNIQUE INDEX plans_one_published ON plans(requirement_id) WHERE status='published'",
+    """
+    CREATE TABLE work_items (
+        work_item_id TEXT NOT NULL PRIMARY KEY,
+        plan_id TEXT NOT NULL,
+        project_id TEXT NOT NULL,
+        key TEXT NOT NULL CHECK(length(trim(key))>0),
+        title TEXT NOT NULL CHECK(length(trim(title))>0),
+        objective TEXT NOT NULL CHECK(length(trim(objective))>0),
+        scope TEXT NOT NULL CHECK(length(trim(scope))>0),
+        non_goals TEXT NOT NULL CHECK(length(trim(non_goals))>0),
+        duty TEXT NOT NULL CHECK(length(trim(duty))>0),
+        assignee_user_id TEXT NOT NULL,
+        binding_id TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending_dependency'
+            CHECK(status IN ('pending_dependency','ready','waiting_agent','running',
+                             'awaiting_owner_review','submitted','accepted','changes_requested',
+                             'blocked','failed','cancelled')),
+        estimated_units INTEGER NOT NULL DEFAULT 0 CHECK(estimated_units>=0),
+        version INTEGER NOT NULL DEFAULT 1 CHECK(version>0),
+        created_at REAL NOT NULL,
+        updated_at REAL NOT NULL,
+        UNIQUE (plan_id, key),
+        UNIQUE (work_item_id, plan_id, project_id),
+        FOREIGN KEY (plan_id, project_id) REFERENCES plans(plan_id, project_id),
+        FOREIGN KEY (project_id, assignee_user_id) REFERENCES project_members(project_id, user_id),
+        FOREIGN KEY (binding_id, project_id) REFERENCES agent_bindings(binding_id, project_id)
+    )
+    """,
+    "CREATE INDEX work_items_status ON work_items(status)",
+    """
+    CREATE TABLE work_item_dependencies (
+        work_item_id TEXT NOT NULL,
+        depends_on_id TEXT NOT NULL,
+        plan_id TEXT NOT NULL,
+        project_id TEXT NOT NULL,
+        PRIMARY KEY (work_item_id, depends_on_id),
+        CHECK (work_item_id <> depends_on_id),
+        FOREIGN KEY (work_item_id, plan_id, project_id)
+            REFERENCES work_items(work_item_id, plan_id, project_id),
+        FOREIGN KEY (depends_on_id, plan_id, project_id)
+            REFERENCES work_items(work_item_id, plan_id, project_id)
+    )
+    """,
+    "CREATE INDEX work_item_dependencies_reverse ON work_item_dependencies(depends_on_id)",
+    """
+    CREATE TABLE revision_acceptance_items (
+        revision_id TEXT NOT NULL,
+        requirement_id TEXT NOT NULL,
+        item_id TEXT NOT NULL CHECK(length(trim(item_id))>0),
+        text TEXT NOT NULL CHECK(length(trim(text))>0),
+        position INTEGER NOT NULL CHECK(position>=0),
+        PRIMARY KEY (revision_id, item_id),
+        FOREIGN KEY (revision_id, requirement_id)
+            REFERENCES requirement_revisions(revision_id, requirement_id)
+    )
+    """,
+    """
+    CREATE TRIGGER revision_acceptance_items_no_update
+    BEFORE UPDATE ON revision_acceptance_items
+    BEGIN
+        SELECT RAISE(ABORT, 'acceptance items are immutable');
+    END
+    """,
+    """
+    CREATE TRIGGER revision_acceptance_items_no_delete
+    BEFORE DELETE ON revision_acceptance_items
+    BEGIN
+        SELECT RAISE(ABORT, 'acceptance items are immutable');
+    END
+    """,
+    """
+    CREATE TABLE outbox_events (
+        event_id TEXT NOT NULL PRIMARY KEY,
+        project_id TEXT NOT NULL REFERENCES projects(project_id),
+        topic TEXT NOT NULL CHECK(length(trim(topic))>0),
+        payload TEXT NOT NULL,
+        created_at REAL NOT NULL,
+        next_attempt_at REAL NOT NULL,
+        attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts>=0),
+        claim_expires_at REAL,
+        delivered_at REAL,
+        last_error TEXT
+    )
+    """,
+    "CREATE INDEX outbox_due ON outbox_events(delivered_at,next_attempt_at)",
+    """
+    CREATE TRIGGER outbox_events_identity_immutable
+    BEFORE UPDATE ON outbox_events
+    WHEN NEW.event_id<>OLD.event_id OR NEW.project_id<>OLD.project_id
+         OR NEW.topic<>OLD.topic OR NEW.payload<>OLD.payload OR NEW.created_at<>OLD.created_at
+    BEGIN
+        SELECT RAISE(ABORT, 'outbox event identity is immutable');
+    END
+    """,
+    """
+    CREATE TABLE budget_accounts (
+        scope TEXT NOT NULL CHECK(scope IN ('global','project','requirement')),
+        ref_id TEXT NOT NULL,
+        limit_units INTEGER NOT NULL CHECK(limit_units>=0),
+        version INTEGER NOT NULL DEFAULT 1 CHECK(version>0),
+        updated_at REAL NOT NULL,
+        PRIMARY KEY (scope, ref_id)
+    )
+    """,
+    """
+    CREATE TABLE budget_entries (
+        entry_id TEXT NOT NULL PRIMARY KEY,
+        scope TEXT NOT NULL CHECK(scope IN ('global','project','requirement')),
+        ref_id TEXT NOT NULL,
+        ref_type TEXT NOT NULL CHECK(ref_type IN ('plan','work_item','attempt','adjustment')),
+        ref_key TEXT NOT NULL CHECK(length(trim(ref_key))>0),
+        kind TEXT NOT NULL CHECK(kind IN ('reserve','settle','release','adjustment')),
+        delta_units INTEGER NOT NULL,
+        created_at REAL NOT NULL,
+        UNIQUE (scope, ref_id, ref_type, ref_key, kind)
+    )
+    """,
+)
+
 
 def _check_schema_version(connection: sqlite3.Connection) -> None:
     version = connection.execute("PRAGMA user_version").fetchone()[0]
@@ -415,6 +611,13 @@ class Database:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._connection("rwc") as connection:
             try:
+                pending = connection.execute("PRAGMA user_version").fetchone()[0]
+                if pending == 4:
+                    # v4 -> v5 rebuilds `requirements`, which several tables reference.
+                    # DROP TABLE would trip those foreign keys, so enforcement is off for
+                    # this transaction and `PRAGMA foreign_key_check` verifies the result
+                    # before the commit instead. The pragma only applies before BEGIN.
+                    connection.execute("PRAGMA foreign_keys = OFF")
                 connection.execute("BEGIN IMMEDIATE")
                 version = connection.execute("PRAGMA user_version").fetchone()[0]
                 migrated = False
@@ -447,9 +650,20 @@ class Database:
                         connection.execute(statement)
                     version = 4
                     migrated = True
+                if version == 4:
+                    for statement in _PLANNING_SCHEMA:
+                        connection.execute(statement)
+                    version = 5
+                    migrated = True
                 if migrated:
                     connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
                 _check_schema_version(connection)
+                if pending == 4:
+                    violations = connection.execute("PRAGMA foreign_key_check").fetchall()
+                    if violations:
+                        raise SchemaVersionError(
+                            "Migration left foreign key violations in: "
+                            + ", ".join(sorted({row[0] for row in violations})))
                 connection.commit()
             except BaseException:
                 connection.rollback()

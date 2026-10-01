@@ -8,13 +8,15 @@ from dataclasses import asdict
 
 from .auth import Access, Forbidden, record_audit
 from .models import (
-    Conflict, InvalidState, NotFound, Requirement, RequirementMessage, RequirementReview,
-    RequirementRevision, ValidationError,
+    Conflict, InvalidState, NotFound, POST_APPROVAL_STATUSES, Requirement, RequirementMessage,
+    RequirementReview, RequirementRevision, ValidationError,
 )
 
 MAX_CONTENT_BYTES = 8 * 1024 * 1024
 MAX_MESSAGE_CHARS = 8192
 MAX_REASON_CHARS = 2048
+MAX_ACCEPTANCE_ITEMS = 256
+MAX_ACCEPTANCE_TEXT_CHARS = 4096
 
 
 def content_digest(content: str, *, limit: int = MAX_CONTENT_BYTES) -> tuple[str, int]:
@@ -52,7 +54,7 @@ class RequirementService:
 
     @staticmethod
     def _visible(requirement: Requirement, user_id: str) -> None:
-        if requirement.status == "approved" or requirement.requester_id == user_id:
+        if requirement.status in POST_APPROVAL_STATUSES or requirement.requester_id == user_id:
             return
         if requirement.status == "in_review" and requirement.reviewer_id == user_id:
             return
@@ -62,7 +64,7 @@ class RequirementService:
     def _requester_only(requirement: Requirement, user_id: str) -> None:
         if requirement.requester_id == user_id:
             return
-        if requirement.status == "approved":
+        if requirement.status in POST_APPROVAL_STATUSES:
             raise Forbidden("Only the requester can change this requirement")
         raise NotFound("Resource not found")
 
@@ -72,9 +74,31 @@ class RequirementService:
         self._visible(requirement, access.user.user_id)
         return requirement
 
+    @staticmethod
+    def _acceptance(acceptance_items: list[str] | None) -> tuple[tuple[str, str], ...]:
+        if acceptance_items is None:
+            return ()
+        if not isinstance(acceptance_items, list) or len(acceptance_items) > MAX_ACCEPTANCE_ITEMS:
+            raise ValidationError("Invalid acceptance items")
+        normalized = []
+        for index, text in enumerate(acceptance_items):
+            if (not isinstance(text, str) or not text.strip()
+                    or len(text) > MAX_ACCEPTANCE_TEXT_CHARS):
+                raise ValidationError("Invalid acceptance item text")
+            try:
+                text.encode("utf-8")
+            except UnicodeEncodeError:
+                raise ValidationError("Invalid acceptance item text") from None
+            normalized.append((f"AC-{index + 1:03d}", text))
+        return tuple(normalized)
+
     def create_requirement(self, access: Access, *, project_id: str, title: str,
-                           content: str | None = None) -> Requirement:
+                           content: str | None = None,
+                           acceptance_items: list[str] | None = None) -> Requirement:
         self._active_member(access, project_id)
+        acceptance = self._acceptance(acceptance_items)
+        if acceptance and content is None:
+            raise ValidationError("Acceptance items require revision content")
         now = self.clock()
         requirement = access.store.create_requirement(project_id, title, access.user.user_id, now)
         record_audit(access.conn, now, access.user.user_id, "requirement.created",
@@ -82,17 +106,19 @@ class RequirementService:
                      target_version=requirement.version)
         if content is not None:
             requirement, _ = self._add_revision(access, requirement, content,
-                                                expected_version=requirement.version)
+                                                expected_version=requirement.version,
+                                                acceptance_items=acceptance)
         return requirement
 
     def _add_revision(self, access: Access, requirement: Requirement, content: str,
-                      expected_version: int) -> tuple[Requirement, RequirementRevision]:
+                      expected_version: int,
+                      acceptance_items: tuple[tuple[str, str], ...] = ()) -> tuple[Requirement, RequirementRevision]:
         content_hash, content_size = content_digest(content, limit=self.max_content_bytes)
         now = self.clock()
         updated, revision = access.store.add_revision(
             requirement.project_id, requirement.requirement_id, content=content,
             content_hash=content_hash, content_size=content_size, author_id=access.user.user_id,
-            expected_version=expected_version, created_at=now)
+            expected_version=expected_version, created_at=now, acceptance_items=acceptance_items)
         record_audit(access.conn, now, access.user.user_id, "requirement.revision_saved",
                      revision.revision_id, project_id=requirement.project_id,
                      target_version=updated.version)
@@ -106,11 +132,14 @@ class RequirementService:
         return self._get_visible(access, project_id, requirement_id)
 
     def save_revision(self, access: Access, *, project_id: str, requirement_id: str, content: str,
-                      expected_version: int) -> tuple[Requirement, RequirementRevision]:
+                      expected_version: int,
+                      acceptance_items: list[str] | None = None) -> tuple[Requirement, RequirementRevision]:
         self._active_member(access, project_id)
         requirement = access.store.get_requirement(project_id, requirement_id)
         self._requester_only(requirement, access.user.user_id)
-        return self._add_revision(access, requirement, content, expected_version=expected_version)
+        return self._add_revision(access, requirement, content,
+                                  expected_version=expected_version,
+                                  acceptance_items=self._acceptance(acceptance_items))
 
     def list_revisions(self, access: Access, *, project_id: str,
                        requirement_id: str) -> list[RequirementRevision]:
@@ -237,6 +266,12 @@ class RequirementService:
         updated, review = access.store.decide_requirement_review(
             project_id, requirement_id, revision_id=revision_id, reviewer_id=user_id,
             decision=decision, reason=reason, expected_version=expected_version, created_at=now)
+        if decision == "approved":
+            access.store.enqueue_event(project_id, "requirement.approved", {
+                "requirement_id": requirement_id,
+                "revision_id": updated.approved_revision_id,
+                "revision_hash": updated.approved_revision_hash,
+                "requirement_version": updated.version}, created_at=now)
         record_audit(access.conn, now, user_id,
                      "requirement.review_approved" if decision == "approved"
                      else "requirement.review_rejected",

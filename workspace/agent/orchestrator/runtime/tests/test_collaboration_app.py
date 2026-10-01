@@ -1048,3 +1048,147 @@ def test_requirement_flow_creates_no_execution_rows_over_http(api):
                      json={"action": "approve", "revision_id": revision_id,
                            "expected_version": 3}))
     assert counts() == before
+
+
+# --- T06: plans, scheduler, outbox and budgets --------------------------------
+
+def approval_setup(api, acceptance=("第一条验收",)):
+    project = api.project()
+    member = api.member(project)
+    api.member(project, "manager", "manager")
+    binding = api.binding(project, api.agent())
+    created = checked(api.send("member", "POST",
+                               f"/projects/{project['project_id']}/requirements",
+                               json={"title": "需求文档", "content": "# 需求原文",
+                                     "acceptance_items": list(acceptance)}), 201)
+    requirement_id, revision_id = created["requirement_id"], created["current_revision_id"]
+    checked(api.send("member", "POST", reviews_path(project, requirement_id),
+                     json={"action": "request", "revision_id": revision_id,
+                           "reviewer_user_id": api.identities["manager"]["user"]["user_id"],
+                           "expected_version": created["version"]}))
+    checked(api.send("manager", "POST", reviews_path(project, requirement_id),
+                     json={"action": "approve", "revision_id": revision_id,
+                           "expected_version": created["version"] + 1}))
+    return project, member, binding, requirement_id
+
+
+def wire_planner(api, binding, member_uid, *, estimate=2, depends_on=()):
+    candidate = {"items": [{
+        "key": "A", "title": "任务 A", "objective": "完成目标", "scope": "范围内",
+        "non_goals": "不做的事", "duty": BINDING_FIELDS["duty"],
+        "assignee_user_id": member_uid, "binding_id": binding["binding_id"],
+        "acceptance_ids": ["AC-001"], "estimated_units": estimate,
+        "depends_on": list(depends_on)}]}
+    api.client.app.state.planning.planner = lambda context: candidate
+
+
+def plans_path(project, requirement_id):
+    return f"/projects/{project['project_id']}/requirements/{requirement_id}/plans"
+
+
+def test_plan_generation_listing_and_replay_over_http(api):
+    project, member, binding, requirement_id = approval_setup(api)
+    pid = project["project_id"]
+    path = plans_path(project, requirement_id)
+    checked(api.send("member", "POST", path), 403)
+    checked(api.send("outsider", "POST", path), 404)
+    checked(api.send("manager", "POST", path, headers={"X-CSRF-Token": None}), 403)
+    checked(api.send("outsider", "GET", path), 404)
+    checked(api.send("manager", "POST", path), 503)  # no planner wired yet
+    wire_planner(api, binding, member["user_id"])
+    created = checked(api.send("manager", "POST", path), 201)
+    plan = created["plan"]
+    assert plan["status"] == "published" and plan["total_units"] == 2
+    assert plan["report"]["item_count"] == 1 and plan["report"]["problems"] == []
+    assert plan["created_by"] == api.identities["manager"]["user"]["user_id"]
+    assert plan["published_at"] is not None
+    assert [item["key"] for item in created["work_items"]] == ["A"]
+    assert created["work_items"][0]["status"] == "ready"
+    assert created["work_items"][0]["assignee_user_id"] == member["user_id"]
+    assert created["dependencies"] == []
+    assert checked(api.send("member", "GET",
+                            f"/projects/{pid}/requirements/{requirement_id}"))["status"] == \
+        "executing"
+    listing = checked(api.send("member", "GET", path))
+    assert [entry["plan_id"] for entry in listing] == [plan["plan_id"]]
+    detail = checked(api.send("member", "GET", path + f"/{plan['plan_id']}"))
+    assert detail == created
+    checked(api.send("member", "GET", path + "/" + "0" * 32), 404)
+    checked(api.send("manager", "POST", path), 409)
+
+
+def test_scheduler_tick_and_outbox_over_http(api):
+    project, member, binding, requirement_id = approval_setup(api)
+    pid = project["project_id"]
+    wire_planner(api, binding, member["user_id"])
+    tick_path = f"/projects/{pid}/scheduler/tick"
+    checked(api.send("member", "POST", tick_path), 403)
+    checked(api.send("outsider", "POST", tick_path), 404)
+    tick = checked(api.send("manager", "POST", tick_path))
+    assert tick == {"claimed": 1, "delivered": 1, "deferred": 0, "work_items_changed": 1}
+    assert checked(api.send("member", "GET",
+                            f"/projects/{pid}/requirements/{requirement_id}"))["status"] == \
+        "executing"
+    plans = checked(api.send("member", "GET", plans_path(project, requirement_id)))
+    assert [entry["status"] for entry in plans] == ["published"]
+    outbox_path = f"/projects/{pid}/outbox"
+    checked(api.send("member", "GET", outbox_path), 403)
+    checked(api.send("outsider", "GET", outbox_path), 404)
+    events = {event["topic"]: event for event in
+              checked(api.send("manager", "GET", outbox_path))}
+    assert events["requirement.approved"]["delivered_at"] is not None
+    assert events["plan.published"]["delivered_at"] is None
+    assert events["plan.published"]["payload"] == {
+        "plan_id": plans[0]["plan_id"], "requirement_id": requirement_id,
+        "revision_id": plans[0]["revision_id"]}
+    checked(api.send("manager", "POST", tick_path))
+    events = {event["topic"]: event for event in
+              checked(api.send("manager", "GET", outbox_path))}
+    assert all(event["delivered_at"] is not None for event in events.values())
+
+
+def test_budget_scopes_versions_and_publication_gate_over_http(api):
+    project, member, binding, requirement_id = approval_setup(api)
+    pid = project["project_id"]
+    wire_planner(api, binding, member["user_id"])
+    path = plans_path(project, requirement_id)
+    budget_path = f"/projects/{pid}/budget"
+    checked(api.send("member", "PUT", budget_path, json={"limit_units": 1}), 403)
+    checked(api.send("outsider", "PUT", budget_path, json={"limit_units": 1}), 404)
+    checked(api.send("manager", "PUT", budget_path, json={"limit_units": 1},
+                     headers={"X-CSRF-Token": None}), 403)
+    for body in ({"limit_units": -1}, {"limit_units": "5"}, {"limit_units": True},
+                 {"limit_units": 1, "expected_version": 0}):
+        checked(api.send("manager", "PUT", budget_path, json=body), 422)
+    first = checked(api.send("manager", "PUT", budget_path, json={"limit_units": 1}))
+    assert (first["scope"], first["ref_id"], first["limit_units"], first["used_units"],
+            first["remaining_units"], first["version"]) == ("project", pid, 1, 0, 1, 1)
+    blocked = checked(api.send("manager", "POST", path), 201)["plan"]
+    assert blocked["status"] == "blocked"
+    assert blocked["report"]["problems"] == ["budget_exceeded:project"]
+    assert checked(api.send("member", "GET",
+                            f"/projects/{pid}/requirements/{requirement_id}"))["status"] == \
+        "planning_blocked"
+    checked(api.send("manager", "PUT", budget_path,
+                     json={"limit_units": 10, "expected_version": 7}), 409)
+    updated = checked(api.send("manager", "PUT", budget_path,
+                               json={"limit_units": 10, "expected_version": 1}))
+    assert updated["version"] == 2
+    published = checked(api.send("manager", "POST", path), 201)["plan"]
+    assert published["status"] == "published" and published["total_units"] == 2
+    accounts = checked(api.send("member", "GET", budget_path))["accounts"]
+    assert [(entry["scope"], entry["limit_units"], entry["used_units"],
+             entry["remaining_units"], entry["version"]) for entry in accounts] == \
+        [("project", 10, 2, 8, 2)]
+    requirement_budget = f"/projects/{pid}/requirements/{requirement_id}/budget"
+    checked(api.send("manager", "PUT", requirement_budget, json={"limit_units": 4}), 200)
+    scoped = checked(api.send("member", "GET", budget_path))["accounts"]
+    assert [(entry["scope"], entry["limit_units"]) for entry in scoped] == \
+        [("project", 10), ("requirement", 4)]
+    checked(api.send("manager", "PUT",
+                     f"/projects/{pid}/requirements/{'0' * 32}/budget",
+                     json={"limit_units": 4}), 404)
+    checked(api.send("owner", "PUT", "/admin/budget", json={"limit_units": 100}), 403)
+    global_account = checked(api.send("admin", "PUT", "/admin/budget", json={"limit_units": 100}))
+    assert (global_account["scope"], global_account["limit_units"], global_account["version"]) == \
+        ("global", 100, 1)
