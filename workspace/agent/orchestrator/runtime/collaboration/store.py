@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import asdict
 from uuid import uuid4
 
@@ -17,6 +17,10 @@ from .models import (
 def _text(value: str, field: str, limit: int = 512) -> str:
     if not isinstance(value, str) or not value.strip() or len(value) > limit:
         raise ValidationError(f"Invalid {field}")
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        raise ValidationError(f"Invalid {field}") from None
     return value
 
 
@@ -62,13 +66,20 @@ def _binding_fields(duty, persona_version, allowed_tools, workspace_ref, provide
 
 
 class CollaborationStore:
-    def __init__(self, database: Database):
+    def __init__(self, database: Database, *, connection: sqlite3.Connection | None = None):
         self.database = database
+        self.connection = connection
+        if connection is not None and not connection.in_transaction:
+            raise InvalidState("A bound store requires an active transaction")
+
+    def _read(self):
+        return nullcontext(self.connection) if self.connection is not None else self.database.read()
 
     @contextmanager
     def _write(self):
         try:
-            with self.database.transaction() as conn:
+            context = nullcontext(self.connection) if self.connection is not None else self.database.transaction()
+            with context as conn:
                 yield conn
         except sqlite3.IntegrityError as exc:
             raise Conflict("Identity or uniqueness constraint violated") from exc
@@ -135,7 +146,7 @@ class CollaborationStore:
             return self._user(conn, user_id)
 
     def get_user(self, user_id: str) -> User:
-        with self.database.read() as conn:
+        with self._read() as conn:
             return self._user(conn, user_id)
 
     def update_user(self, user_id: str, *, display_name: str, status: str, expected_version: int) -> User:
@@ -163,11 +174,11 @@ class CollaborationStore:
             return self._project(conn, project_id)
 
     def get_project(self, project_id: str) -> Project:
-        with self.database.read() as conn:
+        with self._read() as conn:
             return self._project(conn, project_id)
 
     def list_projects(self, user_id: str) -> list[Project]:
-        with self.database.read() as conn:
+        with self._read() as conn:
             self._active(self._user(conn, user_id))
             return [_record(Project, row) for row in conn.execute(
                 "SELECT p.* FROM projects p JOIN project_members m ON m.project_id=p.project_id "
@@ -197,11 +208,11 @@ class CollaborationStore:
             return self._member(conn, project_id, user_id)
 
     def get_member(self, project_id: str, user_id: str) -> ProjectMember:
-        with self.database.read() as conn:
+        with self._read() as conn:
             return self._member(conn, project_id, user_id)
 
     def list_members(self, project_id: str) -> list[ProjectMember]:
-        with self.database.read() as conn:
+        with self._read() as conn:
             self._project(conn, project_id)
             return [_record(ProjectMember, row) for row in conn.execute(
                 "SELECT * FROM project_members WHERE project_id=? ORDER BY user_id", (project_id,))]
@@ -239,12 +250,12 @@ class CollaborationStore:
             return self._agent(conn, agent_id)
 
     def get_agent(self, agent_id: str, owner_user_id: str) -> Agent:
-        with self.database.read() as conn:
+        with self._read() as conn:
             return _one(conn, Agent, "SELECT * FROM agents WHERE agent_id=? AND owner_user_id=?",
                         (agent_id, owner_user_id))
 
     def list_agents(self, owner_user_id: str) -> list[Agent]:
-        with self.database.read() as conn:
+        with self._read() as conn:
             self._active(self._user(conn, owner_user_id))
             return [_record(Agent, row) for row in conn.execute(
                 "SELECT * FROM agents WHERE owner_user_id=? ORDER BY agent_id", (owner_user_id,))]
@@ -281,11 +292,11 @@ class CollaborationStore:
             return binding
 
     def get_binding(self, project_id: str, binding_id: str) -> AgentProjectBinding:
-        with self.database.read() as conn:
+        with self._read() as conn:
             return self._binding(conn, project_id, binding_id)
 
     def list_bindings(self, project_id: str) -> list[AgentProjectBinding]:
-        with self.database.read() as conn:
+        with self._read() as conn:
             self._project(conn, project_id)
             return [_record(AgentProjectBinding, row) for row in conn.execute(
                 "SELECT * FROM agent_bindings WHERE project_id=? ORDER BY binding_id", (project_id,))]
@@ -313,7 +324,7 @@ class CollaborationStore:
             return self._binding(conn, project_id, binding_id)
 
     def get_binding_revision(self, project_id: str, binding_id: str, version: int) -> AgentProjectBinding:
-        with self.database.read() as conn:
+        with self._read() as conn:
             self._binding(conn, project_id, binding_id)
             row = conn.execute("SELECT snapshot FROM binding_revisions WHERE binding_id=? AND version=?",
                                (binding_id, version)).fetchone()
@@ -324,7 +335,7 @@ class CollaborationStore:
             return AgentProjectBinding(**values)
 
     def validate_binding(self, project_id: str, binding_id: str, *, expected_version: int) -> AgentProjectBinding:
-        with self.database.read() as conn:
+        with self._read() as conn:
             binding = self._active(self._binding(conn, project_id, binding_id))
             _version(binding.version, expected_version)
             self._eligible(conn, project_id, binding.agent_id, binding.member_user_id)

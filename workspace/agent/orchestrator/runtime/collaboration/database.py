@@ -8,7 +8,7 @@ from typing import Iterator
 from .models import SchemaVersionError
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 _SCHEMA_STATEMENTS = (
     """
@@ -121,6 +121,85 @@ _SCHEMA_STATEMENTS = (
     """,
 )
 
+_AUTH_SCHEMA = (
+    """
+    CREATE TABLE auth_accounts (
+        user_id TEXT NOT NULL PRIMARY KEY REFERENCES users(user_id),
+        username TEXT NOT NULL UNIQUE,
+        password_hash TEXT NOT NULL,
+        is_admin INTEGER NOT NULL DEFAULT 0 CHECK(is_admin IN (0,1))
+    )
+    """,
+    """
+    CREATE TABLE auth_sessions (
+        token_hash TEXT NOT NULL PRIMARY KEY CHECK(length(token_hash)=64),
+        user_id TEXT NOT NULL REFERENCES users(user_id),
+        user_version INTEGER NOT NULL CHECK(user_version>0),
+        csrf_token TEXT NOT NULL,
+        created_at REAL NOT NULL,
+        expires_at REAL NOT NULL CHECK(expires_at>created_at),
+        revoked INTEGER NOT NULL DEFAULT 0 CHECK(revoked IN (0,1)),
+        version INTEGER NOT NULL DEFAULT 1 CHECK(version>0)
+    )
+    """,
+    """
+    CREATE TABLE auth_invitations (
+        invitation_id TEXT NOT NULL PRIMARY KEY,
+        token_hash TEXT NOT NULL UNIQUE CHECK(length(token_hash)=64),
+        username TEXT NOT NULL,
+        display_name TEXT NOT NULL,
+        created_by TEXT NOT NULL REFERENCES users(user_id),
+        created_by_version INTEGER NOT NULL CHECK(created_by_version>0),
+        created_at REAL NOT NULL,
+        expires_at REAL NOT NULL CHECK(expires_at>created_at),
+        status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','accepted','revoked')),
+        accepted_user_id TEXT REFERENCES users(user_id),
+        version INTEGER NOT NULL DEFAULT 1 CHECK(version>0)
+    )
+    """,
+    """
+    CREATE TABLE auth_login_limits (
+        peer_hash TEXT NOT NULL PRIMARY KEY,
+        window_start REAL NOT NULL,
+        attempts INTEGER NOT NULL CHECK(attempts>0)
+    )
+    """,
+    """
+    CREATE TABLE collaboration_audit (
+        event_id TEXT NOT NULL PRIMARY KEY,
+        project_id TEXT REFERENCES projects(project_id),
+        actor_id TEXT REFERENCES users(user_id),
+        action TEXT NOT NULL,
+        target_id TEXT,
+        target_version INTEGER,
+        created_at REAL NOT NULL
+    )
+    """,
+    "CREATE INDEX collaboration_audit_project_time ON collaboration_audit(project_id,created_at,event_id)",
+    """
+    CREATE TRIGGER collaboration_audit_no_replace
+    BEFORE INSERT ON collaboration_audit
+    WHEN EXISTS (SELECT 1 FROM collaboration_audit WHERE event_id=NEW.event_id)
+    BEGIN
+        SELECT RAISE(ABORT, 'audit events are immutable');
+    END
+    """,
+    """
+    CREATE TRIGGER collaboration_audit_no_update
+    BEFORE UPDATE ON collaboration_audit
+    BEGIN
+        SELECT RAISE(ABORT, 'audit events are immutable');
+    END
+    """,
+    """
+    CREATE TRIGGER collaboration_audit_no_delete
+    BEFORE DELETE ON collaboration_audit
+    BEGIN
+        SELECT RAISE(ABORT, 'audit events are immutable');
+    END
+    """,
+)
+
 
 def _check_schema_version(connection: sqlite3.Connection) -> None:
     version = connection.execute("PRAGMA user_version").fetchone()[0]
@@ -168,9 +247,12 @@ class Database:
                         )
                     for statement in _SCHEMA_STATEMENTS:
                         connection.execute(statement)
+                    version = 1
+                if version == 1:
+                    for statement in _AUTH_SCHEMA:
+                        connection.execute(statement)
                     connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
-                else:
-                    _check_schema_version(connection)
+                _check_schema_version(connection)
                 connection.commit()
             except BaseException:
                 connection.rollback()
