@@ -67,10 +67,20 @@ def verify_password(password: str, encoded: str) -> bool:
     return hmac.compare_digest(actual, expected_bytes)
 
 
-def _token_hash(token: str | None) -> str:
+def token_digest(token: str | None) -> str:
     if not isinstance(token, str) or not re.fullmatch(r"[A-Za-z0-9_-]{43}", token):
         raise Unauthorized("Authentication required")
     return hashlib.sha256(token.encode("ascii")).hexdigest()
+
+
+def record_audit(conn, created_at: float, actor_id: str | None, action: str,
+                 target_id: str | None, *, project_id: str | None = None,
+                 target_version: int | None = None) -> None:
+    conn.execute(
+        "INSERT INTO collaboration_audit(event_id,project_id,actor_id,action,target_id,target_version,created_at) "
+        "VALUES(?,?,?,?,?,?,?)",
+        (uuid4().hex, project_id, actor_id, action, target_id, target_version, created_at),
+    )
 
 
 @dataclass(frozen=True)
@@ -112,16 +122,13 @@ class AuthService:
 
     def audit(self, conn, actor_id: str | None, action: str, target_id: str | None, *,
               project_id: str | None = None, target_version: int | None = None):
-        conn.execute(
-            "INSERT INTO collaboration_audit(event_id,project_id,actor_id,action,target_id,target_version,created_at) "
-            "VALUES(?,?,?,?,?,?,?)",
-            (uuid4().hex, project_id, actor_id, action, target_id, target_version, self.clock()),
-        )
+        record_audit(conn, self.clock(), actor_id, action, target_id,
+                     project_id=project_id, target_version=target_version)
 
     def _authenticate(self, conn, token) -> Access:
         row = conn.execute(
             "SELECT s.*,a.is_admin FROM auth_sessions s JOIN auth_accounts a ON a.user_id=s.user_id "
-            "WHERE s.token_hash=?", (_token_hash(token),)).fetchone()
+            "WHERE s.token_hash=?", (token_digest(token),)).fetchone()
         if row is None or row["revoked"] or row["expires_at"] <= self.clock():
             raise Unauthorized("Authentication required")
         store = CollaborationStore(self.database, connection=conn)
@@ -213,7 +220,7 @@ class AuthService:
                 raise Unauthorized("Invalid credentials")
             if previous_token is not None:
                 try:
-                    previous_hash = _token_hash(previous_token)
+                    previous_hash = token_digest(previous_token)
                 except Unauthorized:
                     previous_hash = None
                 if previous_hash is not None:
@@ -225,7 +232,7 @@ class AuthService:
             expires = now + self.session_ttl
             conn.execute(
                 "INSERT INTO auth_sessions(token_hash,user_id,user_version,csrf_token,created_at,expires_at) "
-                "VALUES(?,?,?,?,?,?)", (_token_hash(token), current["user_id"], current["version"], csrf, now, expires))
+                "VALUES(?,?,?,?,?,?)", (token_digest(token), current["user_id"], current["version"], csrf, now, expires))
             user = CollaborationStore(self.database, connection=conn).get_user(current["user_id"])
             self.audit(conn, user.user_id, "login.succeeded", user.user_id)
             return SessionResult(user, bool(current["is_admin"]), token, csrf, expires)
@@ -233,7 +240,7 @@ class AuthService:
     def logout(self, token: str, csrf: str) -> None:
         with self.access(token, csrf, write=True) as access:
             access.conn.execute("UPDATE auth_sessions SET revoked=1,version=version+1 WHERE token_hash=?",
-                                (_token_hash(token),))
+                                (token_digest(token),))
             self.audit(access.conn, access.user.user_id, "session.revoked", access.user.user_id)
 
     def create_invitation(self, token: str, csrf: str, username: str, display_name: str) -> InvitationResult:
@@ -253,7 +260,7 @@ class AuthService:
             conn.execute(
                 "INSERT INTO auth_invitations(invitation_id,token_hash,username,display_name,created_by,created_by_version,created_at,expires_at) "
                 "VALUES(?,?,?,?,?,?,?,?)",
-                (invitation_id, _token_hash(invitation_token), username, display_name, access.user.user_id,
+                (invitation_id, token_digest(invitation_token), username, display_name, access.user.user_id,
                  access.user.version, now, expires))
             self.audit(conn, access.user.user_id, "invitation.created", invitation_id, target_version=1)
             return InvitationResult(invitation_id, invitation_token, expires, 1)
@@ -273,7 +280,7 @@ class AuthService:
             return {"invitation_id": invitation_id, "status": "revoked", "version": row["version"] + 1}
 
     def register(self, invitation_token: str, password: str) -> User:
-        token_hash = _token_hash(invitation_token)
+        token_hash = token_digest(invitation_token)
         with self.database.read() as conn:
             row = conn.execute("SELECT * FROM auth_invitations WHERE token_hash=?", (token_hash,)).fetchone()
             if row is None or row["status"] != "pending" or row["expires_at"] <= self.clock():

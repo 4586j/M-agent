@@ -10,6 +10,7 @@ import sqlite3
 from .app import AppConfig, create_app
 from .auth import AuthService, Unauthorized, Forbidden, RateLimited
 from .database import Database
+from .instances import InstanceService
 from .models import CollaborationError
 
 
@@ -31,6 +32,12 @@ def main(argv=None) -> int:
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=7400)
     serve.add_argument("--origin", default="http://127.0.0.1:7400")
+    enroll = commands.add_parser("node-enroll", help="Register an execution node; prints its token once")
+    enroll.add_argument("--data-dir", type=Path, required=True)
+    enroll.add_argument("--name", required=True)
+    disable = commands.add_parser("node-disable", help="Disable an execution node and its live instances")
+    disable.add_argument("--data-dir", type=Path, required=True)
+    disable.add_argument("--node-id", required=True)
     args = parser.parse_args(argv)
 
     if args.command == "bootstrap":
@@ -47,6 +54,27 @@ def main(argv=None) -> int:
         except (CollaborationError, Unauthorized, Forbidden, RateLimited, sqlite3.Error):
             parser.error("Bootstrap failed")
         print(user.user_id)
+        return 0
+
+    if args.command == "node-enroll":
+        try:
+            database = Database(args.data_dir / "metadata.sqlite3")
+            database.initialize()
+            node, token = InstanceService(database).enroll_node(args.name)
+        except (CollaborationError, Unauthorized, Forbidden, RateLimited, sqlite3.Error):
+            parser.error("Node operation failed")
+        print(node.node_id)
+        print(token)
+        return 0
+
+    if args.command == "node-disable":
+        try:
+            database = Database(args.data_dir / "metadata.sqlite3")
+            database.initialize()
+            node, _ = InstanceService(database).disable_node(args.node_id)
+        except (CollaborationError, Unauthorized, Forbidden, RateLimited, sqlite3.Error):
+            parser.error("Node operation failed")
+        print(node.node_id)
         return 0
 
     if not 1 <= args.port <= 65535:

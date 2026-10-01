@@ -18,6 +18,7 @@ from starlette.responses import JSONResponse
 
 from .auth import AuthService, Unauthorized, Forbidden, RateLimited
 from .database import Database
+from .instances import InstanceService
 from .models import Conflict, InvalidState, NotFound, ValidationError
 
 
@@ -140,6 +141,26 @@ class BindingUpdate(BindingFields, ExpectedVersion):
     pass
 
 
+class InstanceCreate(Input):
+    node_id: Name
+
+
+class MachinePolicy(Input):
+    workspace_ref: Annotated[str, Field(min_length=1, max_length=128)]
+    provider_ref: Annotated[str, Field(min_length=1, max_length=128)]
+    allowed_tools: Annotated[list[str], Field(max_length=256)]
+    env_allowlist: Annotated[list[str], Field(max_length=64)]
+
+
+class MachineClaim(Input):
+    claim_token: Annotated[SecretStr, Field(min_length=1, max_length=512)]
+    protocol_version: Name
+    capacity: Annotated[int, Field(strict=True, ge=1, le=64)]
+    isolation_mode: Literal["none", "os_account", "container", "vm"]
+    isolation_attestation: Annotated[str, Field(max_length=1024)] = ""
+    policy: MachinePolicy
+
+
 _ERRORS = {
     401: "Unauthorized", 403: "Forbidden", 404: "Not found", 405: "Method not allowed",
     409: "Conflict", 422: "Invalid request", 429: "Too many requests",
@@ -179,6 +200,8 @@ def _cascading_revocations(request: Request, access, *, project_id=None,
         if binding.status == "revoked":
             _audit(request, access, "binding.revoked", binding.binding_id,
                    binding.version, binding.project_id)
+            request.app.state.instances.disable_for_binding(
+                access, project_id=binding.project_id, binding_id=binding.binding_id)
 
 
 def _audit_rows(conn, project_id: str | None, limit: int):
@@ -203,6 +226,7 @@ def create_app(config: AppConfig) -> FastAPI:
         database = Database(config.data_dir / "metadata.sqlite3")
         database.initialize()
         app.state.auth = AuthService(database, session_ttl=config.session_ttl)
+        app.state.instances = InstanceService(database)
         yield
 
     app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None,
@@ -216,7 +240,9 @@ def create_app(config: AppConfig) -> FastAPI:
         if (len(hosts) != 1 or hosts[0].lower() != authority
                 or len(origins) > 1 or (origins and origins[0] != origin)
                 or (write and not origins)
-                or len(request.headers.getlist("x-csrf-token")) > 1):
+                or len(request.headers.getlist("x-csrf-token")) > 1
+                or len(request.headers.getlist("x-node-token")) > 1
+                or len(request.headers.getlist("x-instance-token")) > 1):
             return _error(403)
         try:
             response = await call_next(request)
@@ -407,6 +433,7 @@ def create_app(config: AppConfig) -> FastAPI:
         with _access(request, project_id=pid, roles=MANAGERS, write=True) as access:
             binding = access.store.revoke_binding(pid, bid, expected_version=body.expected_version)
             _audit(request, access, "binding.revoked", bid, binding.version, pid)
+            app.state.instances.disable_for_binding(access, project_id=pid, binding_id=bid)
             return asdict(binding)
 
     @router.get("/projects/{pid}/agent-bindings/{bid}/revisions/{version}")
@@ -414,6 +441,57 @@ def create_app(config: AppConfig) -> FastAPI:
                              request: Request):
         with _access(request, project_id=pid) as access:
             return asdict(access.store.get_binding_revision(pid, bid, version))
+
+    @router.get("/projects/{pid}/agent-bindings/{bid}/instances")
+    def list_instances(pid: str, bid: str, request: Request):
+        with _access(request, project_id=pid) as access:
+            return [asdict(instance) for instance in access.store.list_instances(pid, bid)]
+
+    @router.post("/projects/{pid}/agent-bindings/{bid}/instances", status_code=201)
+    def register_instance(pid: str, bid: str, body: InstanceCreate, request: Request):
+        with _access(request, project_id=pid, roles=MANAGERS, write=True) as access:
+            instance, claim_token = app.state.instances.register_slot(
+                access, project_id=pid, binding_id=bid, node_id=body.node_id)
+            return {**asdict(instance), "claim_token": claim_token}
+
+    @router.post("/projects/{pid}/agent-bindings/{bid}/instances/{iid}/disable")
+    def disable_instance(pid: str, bid: str, iid: str, body: ExpectedVersion, request: Request):
+        with _access(request, project_id=pid, roles=MANAGERS, write=True) as access:
+            return asdict(app.state.instances.disable(
+                access, project_id=pid, binding_id=bid, instance_id=iid,
+                expected_version=body.expected_version))
+
+    @router.post("/projects/{pid}/agent-bindings/{bid}/instances/{iid}/verify")
+    def verify_instance(pid: str, bid: str, iid: str, body: ExpectedVersion, request: Request):
+        with _access(request, project_id=pid, roles=("owner",), write=True) as access:
+            return asdict(app.state.instances.verify(
+                access, project_id=pid, binding_id=bid, instance_id=iid,
+                expected_version=body.expected_version))
+
+    @router.post("/machine/instances/claim", status_code=201)
+    def machine_claim(body: MachineClaim, request: Request):
+        instance, instance_token, binding = app.state.instances.claim(
+            request.headers.get("X-Node-Token"), body.claim_token.get_secret_value(),
+            protocol_version=body.protocol_version, capacity=body.capacity,
+            isolation_mode=body.isolation_mode,
+            isolation_attestation=body.isolation_attestation,
+            workspace_ref=body.policy.workspace_ref, provider_ref=body.policy.provider_ref,
+            allowed_tools=body.policy.allowed_tools, env_allowlist=body.policy.env_allowlist)
+        return {**asdict(instance), "instance_token": instance_token,
+                "project_id": binding.project_id, "binding_version": binding.version,
+                "heartbeat_timeout": app.state.instances.heartbeat_timeout}
+
+    @router.post("/machine/instances/heartbeat")
+    def machine_heartbeat(request: Request):
+        instance = app.state.instances.heartbeat(request.headers.get("X-Instance-Token"))
+        return {"instance_id": instance.instance_id, "status": instance.status,
+                "heartbeat_at": instance.heartbeat_at}
+
+    @router.get("/machine/instances/me")
+    def machine_me(request: Request):
+        instance, binding = app.state.instances.describe(request.headers.get("X-Instance-Token"))
+        return {**asdict(instance), "project_id": binding.project_id,
+                "binding_version": binding.version}
 
     @router.get("/projects/{pid}/audit")
     def project_audit(pid: str, request: Request, limit: AuditLimit = 100):

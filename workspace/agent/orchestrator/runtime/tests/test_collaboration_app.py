@@ -8,6 +8,7 @@ from pathlib import Path
 import sqlite3
 import subprocess
 import sys
+import time
 
 import pytest
 from fastapi.testclient import TestClient
@@ -722,3 +723,151 @@ def test_invalid_unicode_input_returns_safe_error(api):
     response = api.send("owner", "POST", "/projects", content=json.dumps({"name": chr(0xD800)}),
                         headers={"Content-Type": "application/json"})
     checked(response, 422)
+
+
+def machine_claim(api, node_token, claim_token, **overrides):
+    policy = dict(workspace_ref="workspace-a", provider_ref="provider-a",
+                  allowed_tools=["Read"], env_allowlist=["PYTHONPATH"])
+    policy.update(overrides.pop("policy", {}))
+    body = dict(protocol_version="1", capacity=2, isolation_mode="container",
+                isolation_attestation="podman sandbox", policy=policy, claim_token=claim_token)
+    body.update(overrides)
+    return api.send(None, "POST", "/machine/instances/claim", json=body,
+                    headers={"X-Node-Token": node_token})
+
+
+def test_instance_registration_claim_and_machine_round_trip(api):
+    project = api.project()
+    pid = project["project_id"]
+    api.member(project)
+    binding = api.binding(project, api.agent())
+    node, node_token = api.client.app.state.instances.enroll_node("node-1")
+    path = f"/projects/{pid}/agent-bindings/{binding['binding_id']}/instances"
+    checked(api.send("member", "POST", path, json={"node_id": node.node_id}), 403)
+    checked(api.send("outsider", "POST", path, json={"node_id": node.node_id}), 404)
+    created = checked(api.send("owner", "POST", path, json={"node_id": node.node_id}), 201)
+    assert created["status"] == "pending" and created["version"] == 1
+    assert len(created["claim_token"]) == 43
+    checked(api.send("owner", "POST", path, json={"node_id": node.node_id}), 409)
+    listing = checked(api.send("member", "GET", path))
+    assert [item["instance_id"] for item in listing] == [created["instance_id"]]
+    assert "claim_token" not in json.dumps(listing)
+    checked(api.send("outsider", "GET", path), 404)
+    claimed = checked(machine_claim(api, node_token, created["claim_token"]), 201)
+    assert claimed["status"] == "active" and claimed["project_id"] == pid
+    assert claimed["binding_version"] == 1 and "claim_token" not in claimed
+    checked(machine_claim(api, node_token, created["claim_token"]), 409)
+    token = claimed["instance_token"]
+    beat = checked(api.send(None, "POST", "/machine/instances/heartbeat",
+                            headers={"X-Instance-Token": token}))
+    assert (beat["instance_id"], beat["status"]) == (created["instance_id"], "active")
+    me = checked(api.send(None, "GET", "/machine/instances/me",
+                          headers={"X-Instance-Token": token}))
+    assert me["instance_id"] == created["instance_id"] and me["project_id"] == pid
+    checked(api.send(None, "GET", "/me", headers={"X-Instance-Token": token}), 401)
+    checked(api.send(None, "GET", "/projects", headers={"X-Instance-Token": token}), 401)
+
+
+def test_instance_verification_is_owner_only_and_disable_is_manager_level(api):
+    project = api.project()
+    pid = project["project_id"]
+    api.member(project)
+    api.member(project, "manager", "manager")
+    binding = api.binding(project, api.agent())
+    node, node_token = api.client.app.state.instances.enroll_node("node-1")
+    path = f"/projects/{pid}/agent-bindings/{binding['binding_id']}/instances"
+    created = checked(api.send("owner", "POST", path, json={"node_id": node.node_id}), 201)
+    claimed = checked(machine_claim(api, node_token, created["claim_token"]), 201)
+    verify_path = f"{path}/{created['instance_id']}/verify"
+    checked(api.send("member", "POST", verify_path,
+                     json={"expected_version": claimed["version"]}), 403)
+    checked(api.send("manager", "POST", verify_path,
+                     json={"expected_version": claimed["version"]}), 403)
+    checked(api.send("outsider", "POST", verify_path,
+                     json={"expected_version": claimed["version"]}), 404)
+    verified = checked(api.send("owner", "POST", verify_path,
+                                json={"expected_version": claimed["version"]}))
+    assert verified["isolation_verified"] == 1 and verified["verified_at"] is not None
+    checked(api.send("owner", "POST", verify_path,
+                     json={"expected_version": verified["version"]}), 409)
+    disable_path = f"{path}/{created['instance_id']}/disable"
+    checked(api.send("member", "POST", disable_path,
+                     json={"expected_version": verified["version"]}), 403)
+    disabled = checked(api.send("manager", "POST", disable_path,
+                                json={"expected_version": verified["version"]}))
+    assert disabled["status"] == "disabled"
+    checked(api.send(None, "POST", "/machine/instances/heartbeat",
+                     headers={"X-Instance-Token": claimed["instance_token"]}), 401)
+
+
+@pytest.mark.parametrize("operation", ["revoke", "agent", "member", "project", "user"])
+def test_instance_cascade_disable_is_audited_and_blocks_heartbeat(api, operation):
+    project = api.project()
+    pid = project["project_id"]
+    member = api.member(project)
+    agent = api.agent()
+    binding = api.binding(project, agent)
+    node, node_token = api.client.app.state.instances.enroll_node("node-1")
+    path = f"/projects/{pid}/agent-bindings/{binding['binding_id']}/instances"
+    created = checked(api.send("owner", "POST", path, json={"node_id": node.node_id}), 201)
+    claimed = checked(machine_claim(api, node_token, created["claim_token"]), 201)
+    actor, method, target, body = {
+        "revoke": ("owner", "POST",
+                   f"/projects/{pid}/agent-bindings/{binding['binding_id']}/revoke",
+                   {"expected_version": 1}),
+        "agent": ("member", "PATCH", f"/agents/{agent['agent_id']}",
+                  {"name": "Disabled Agent", "status": "disabled", "expected_version": 1}),
+        "member": ("owner", "PATCH", f"/projects/{pid}/members/{member['user_id']}",
+                   {"access_role": "member", "status": "removed", "expected_version": 1}),
+        "project": ("owner", "PATCH", f"/projects/{pid}",
+                    {"name": "Archived", "status": "archived", "expected_version": 1}),
+        "user": ("admin", "PATCH", f"/admin/users/{member['user_id']}",
+                 {"status": "disabled", "expected_version": 1}),
+    }[operation]
+    checked(api.send(actor, method, target, json=body))
+    listing = checked(api.send("owner", "GET", path))
+    assert listing[0]["status"] == "disabled"
+    checked(api.send(None, "POST", "/machine/instances/heartbeat",
+                     headers={"X-Instance-Token": claimed["instance_token"]}), 401)
+    events = checked(api.send("owner", "GET", f"/projects/{pid}/audit"))
+    disabled = [event for event in events if event["action"] == "instance.disabled"]
+    assert len(disabled) == 1
+    assert disabled[0]["target_id"] == created["instance_id"]
+
+
+@pytest.mark.parametrize("header", ["X-Node-Token", "X-Instance-Token", "X-CSRF-Token"])
+def test_duplicate_machine_token_headers_are_rejected(api, header):
+    headers = [("Host", "testserver"), ("Origin", ORIGIN),
+               (header, "a" * 43), (header, "b" * 43)]
+    response = api.client.request("POST", PREFIX + "/machine/instances/heartbeat",
+                                  headers=headers)
+    checked(response, 403)
+
+
+def test_machine_claim_failure_modes_do_not_leak_state(api, monkeypatch):
+    project = api.project()
+    pid = project["project_id"]
+    api.member(project)
+    binding = api.binding(project, api.agent())
+    node, node_token = api.client.app.state.instances.enroll_node("node-1")
+    path = f"/projects/{pid}/agent-bindings/{binding['binding_id']}/instances"
+    created = checked(api.send("owner", "POST", path, json={"node_id": node.node_id}), 201)
+    checked(machine_claim(api, "bad", created["claim_token"]), 401)
+    checked(machine_claim(api, "x" * 43, created["claim_token"]), 401)
+    checked(machine_claim(api, node_token, "y" * 43), 409)
+    checked(machine_claim(api, node_token, created["claim_token"],
+                          policy={"workspace_ref": "workspace-b"}), 422)
+    checked(machine_claim(api, node_token, created["claim_token"],
+                          policy={"allowed_tools": ["Read", "Write"]}), 422)
+    checked(machine_claim(api, node_token, created["claim_token"],
+                          policy={"env_allowlist": ["OPENAI_API_KEY"]}), 422)
+    checked(machine_claim(api, node_token, created["claim_token"],
+                          isolation_mode="docker"), 422)
+    checked(machine_claim(api, node_token, created["claim_token"]), 201)
+    checked(machine_claim(api, node_token, created["claim_token"]), 409)
+    node2, _ = api.client.app.state.instances.enroll_node("node-2")
+    monkeypatch.setattr(api.client.app.state.instances, "clock", lambda: time.time() + 100)
+    late = checked(api.send("owner", "POST", path, json={"node_id": node2.node_id}), 201)
+    monkeypatch.setattr(api.client.app.state.instances, "clock",
+                        lambda: time.time() + 100 + 86401)
+    checked(machine_claim(api, node_token, late["claim_token"]), 409)

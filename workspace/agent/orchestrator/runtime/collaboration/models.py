@@ -75,3 +75,35 @@ class AgentProjectBinding:
     provider_ref: str
     status: str = "active"
     version: int = 1
+
+
+@dataclass(frozen=True)
+class ExecutionNode:
+    node_id: str
+    name: str
+    status: str = "active"
+    version: int = 1
+
+
+@dataclass(frozen=True)
+class ExecutionInstance:
+    instance_id: str
+    binding_id: str
+    node_id: str
+    status: str = "pending"
+    version: int = 1
+    claim_expires_at: float = 0.0
+    protocol_version: str | None = None
+    capacity: int | None = None
+    isolation_mode: str | None = None
+    isolation_attestation: str | None = None
+    isolation_verified: int = 0
+    verified_at: float | None = None
+    workspace_ref: str | None = None
+    provider_ref: str | None = None
+    allowed_tools: tuple[str, ...] | None = None
+    env_allowlist: tuple[str, ...] | None = None
+    created_by: str = ""
+    created_at: float = 0.0
+    claimed_at: float | None = None
+    heartbeat_at: float | None = None

@@ -108,3 +108,95 @@ def test_independent_http_services_do_not_share_credentials_or_data(tmp_path):
                     process.wait(timeout=10)
         for log in logs:
             log.close()
+
+
+def test_real_process_machine_enrollment_and_instance_claim(tmp_path):
+    root = RUNTIME.parents[3]
+    data = tmp_path / "collaboration"
+    database = Database(data / "metadata.sqlite3")
+    database.initialize()
+    AuthService(database).bootstrap("admin", "管理员", "local-test-password-42")
+    env = {k: v for k, v in os.environ.items()
+           if not k.startswith(("AGENT_", "ORCH_", "ANTHROPIC_", "OPENAI_"))}
+    env.update(AGENT_ENV_FILE=str(tmp_path / "missing.env"), PYTHONIOENCODING="utf-8",
+               PYTHONPATH=os.pathsep.join((str(root), str(RUNTIME))))
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+    sock.close()
+    url = f"http://127.0.0.1:{port}"
+    log = (tmp_path / "server.log").open("w", encoding="utf-8")
+    process = subprocess.Popen(
+        [sys.executable, "-m", "collaboration", "serve", "--data-dir", str(data),
+         "--port", str(port), "--origin", url],
+        cwd=tmp_path, env=env, stdout=log, stderr=subprocess.STDOUT)
+    try:
+        with httpx.Client(base_url=url, headers={"Origin": url}, trust_env=False) as client:
+            deadline = time.monotonic() + 30
+            while True:
+                assert process.poll() is None, "Test service exited during startup"
+                assert time.monotonic() < deadline, "Test service startup timed out"
+                try:
+                    assert client.get("/collab/v1/me", timeout=1).status_code == 401
+                    break
+                except (httpx.ConnectError, httpx.ConnectTimeout):
+                    time.sleep(0.05)
+            enrolled = subprocess.run(
+                [sys.executable, "-m", "collaboration", "node-enroll",
+                 "--data-dir", str(data), "--name", "node-1"],
+                cwd=tmp_path, env=env, capture_output=True, text=True, timeout=60)
+            assert enrolled.returncode == 0, enrolled.stderr
+            node_id, node_token = enrolled.stdout.splitlines()
+            assert len(node_id) == 32 and len(node_token) == 43
+            login = client.post("/collab/v1/auth/login",
+                                json={"username": "admin", "password": "local-test-password-42"})
+            assert login.status_code == 200
+            csrf = login.json()["csrf_token"]
+            user_id = login.json()["user"]["user_id"]
+            agent = client.post("/collab/v1/agents", json={"name": "甲的 Agent"},
+                                headers={"X-CSRF-Token": csrf})
+            assert agent.status_code == 201, agent.text
+            project = client.post("/collab/v1/projects", json={"name": "真项目"},
+                                  headers={"X-CSRF-Token": csrf})
+            assert project.status_code == 201, project.text
+            pid = project.json()["project_id"]
+            binding = client.post(f"/collab/v1/projects/{pid}/agent-bindings", json={
+                "agent_id": agent.json()["agent_id"], "member_user_id": user_id,
+                "duty": "执行", "persona_version": "v1", "allowed_tools": ["Read"],
+                "workspace_ref": "workspace-a", "provider_ref": "provider-a"},
+                headers={"X-CSRF-Token": csrf})
+            assert binding.status_code == 201, binding.text
+            bid = binding.json()["binding_id"]
+            slot = client.post(f"/collab/v1/projects/{pid}/agent-bindings/{bid}/instances",
+                               json={"node_id": node_id}, headers={"X-CSRF-Token": csrf})
+            assert slot.status_code == 201, slot.text
+            claim = client.post("/collab/v1/machine/instances/claim", json={
+                "claim_token": slot.json()["claim_token"], "protocol_version": "1", "capacity": 1,
+                "isolation_mode": "container", "isolation_attestation": "podman sandbox",
+                "policy": {"workspace_ref": "workspace-a", "provider_ref": "provider-a",
+                           "allowed_tools": ["Read"], "env_allowlist": ["PYTHONPATH"]}},
+                headers={"X-Node-Token": node_token})
+            assert claim.status_code == 201, claim.text
+            instance_token = claim.json()["instance_token"]
+            assert claim.json()["project_id"] == pid
+            assert claim.json()["binding_version"] == 1
+            beat = client.post("/collab/v1/machine/instances/heartbeat",
+                               headers={"X-Instance-Token": instance_token})
+            assert beat.status_code == 200 and beat.json()["status"] == "active"
+            me = client.get("/collab/v1/machine/instances/me",
+                            headers={"X-Instance-Token": instance_token})
+            assert me.status_code == 200, me.text
+            assert me.json()["instance_id"] == slot.json()["instance_id"]
+            assert me.json()["project_id"] == pid
+        stored = (data / "metadata.sqlite3").read_bytes()
+        for secret in (node_token, instance_token, slot.json()["claim_token"]):
+            assert secret.encode() not in stored
+    finally:
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=10)
+        log.close()

@@ -8,7 +8,7 @@ from typing import Iterator
 from .models import SchemaVersionError
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 _SCHEMA_STATEMENTS = (
     """
@@ -200,6 +200,50 @@ _AUTH_SCHEMA = (
     """,
 )
 
+_INSTANCE_SCHEMA = (
+    """
+    CREATE TABLE nodes (
+        node_id TEXT NOT NULL PRIMARY KEY,
+        name TEXT NOT NULL CHECK(length(trim(name))>0),
+        credential_hash TEXT NOT NULL UNIQUE CHECK(length(credential_hash)=64),
+        status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','disabled')),
+        version INTEGER NOT NULL DEFAULT 1 CHECK(version>0)
+    )
+    """,
+    """
+    CREATE TABLE execution_instances (
+        instance_id TEXT NOT NULL PRIMARY KEY,
+        binding_id TEXT NOT NULL REFERENCES agent_bindings(binding_id),
+        node_id TEXT NOT NULL REFERENCES nodes(node_id),
+        status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','active','disabled')),
+        version INTEGER NOT NULL DEFAULT 1 CHECK(version>0),
+        claim_token_hash TEXT NOT NULL UNIQUE CHECK(length(claim_token_hash)=64),
+        claim_expires_at REAL NOT NULL,
+        instance_token_hash TEXT UNIQUE CHECK(instance_token_hash IS NULL OR length(instance_token_hash)=64),
+        protocol_version TEXT,
+        capacity INTEGER CHECK(capacity IS NULL OR (capacity BETWEEN 1 AND 64)),
+        isolation_mode TEXT CHECK(isolation_mode IS NULL OR isolation_mode IN ('none','os_account','container','vm')),
+        isolation_attestation TEXT,
+        isolation_verified INTEGER NOT NULL DEFAULT 0 CHECK(isolation_verified IN (0,1)),
+        verified_at REAL,
+        workspace_ref TEXT,
+        provider_ref TEXT,
+        allowed_tools TEXT,
+        env_allowlist TEXT,
+        created_by TEXT NOT NULL REFERENCES users(user_id),
+        created_at REAL NOT NULL,
+        claimed_at REAL,
+        heartbeat_at REAL,
+        CHECK(NOT (isolation_verified=1 AND (isolation_mode IS NULL OR isolation_mode='none')))
+    )
+    """,
+    """
+    CREATE UNIQUE INDEX execution_instances_live_slot
+        ON execution_instances (binding_id, node_id) WHERE status IN ('pending','active')
+    """,
+    "CREATE INDEX execution_instances_node ON execution_instances(node_id)",
+)
+
 
 def _check_schema_version(connection: sqlite3.Connection) -> None:
     version = connection.execute("PRAGMA user_version").fetchone()[0]
@@ -235,6 +279,7 @@ class Database:
             try:
                 connection.execute("BEGIN IMMEDIATE")
                 version = connection.execute("PRAGMA user_version").fetchone()[0]
+                migrated = False
                 if version == 0:
                     existing_object = connection.execute(
                         "SELECT name FROM sqlite_master "
@@ -248,9 +293,18 @@ class Database:
                     for statement in _SCHEMA_STATEMENTS:
                         connection.execute(statement)
                     version = 1
+                    migrated = True
                 if version == 1:
                     for statement in _AUTH_SCHEMA:
                         connection.execute(statement)
+                    version = 2
+                    migrated = True
+                if version == 2:
+                    for statement in _INSTANCE_SCHEMA:
+                        connection.execute(statement)
+                    version = 3
+                    migrated = True
+                if migrated:
                     connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
                 _check_schema_version(connection)
                 connection.commit()

@@ -9,8 +9,8 @@ from uuid import uuid4
 
 from .database import Database
 from .models import (
-    Agent, AgentProjectBinding, Conflict, InvalidState, NotFound,
-    Project, ProjectMember, User, ValidationError,
+    Agent, AgentProjectBinding, Conflict, ExecutionInstance, ExecutionNode,
+    InvalidState, NotFound, Project, ProjectMember, User, ValidationError,
 )
 
 
@@ -43,6 +43,10 @@ def _record(cls, row):
     values = dict(row)
     if cls is AgentProjectBinding:
         values["allowed_tools"] = tuple(json.loads(values["allowed_tools"]))
+    elif cls is ExecutionInstance:
+        for name in ("allowed_tools", "env_allowlist"):
+            if values[name] is not None:
+                values[name] = tuple(json.loads(values[name]))
     return cls(**values)
 
 
@@ -63,6 +67,15 @@ def _binding_fields(duty, persona_version, allowed_tools, workspace_ref, provide
     if len(set(allowed_tools)) != len(allowed_tools):
         raise ValidationError("Duplicate tools")
     return duty, persona_version, json.dumps(allowed_tools), workspace_ref, provider_ref
+
+
+# Credential material never leaves these tables in public projections.
+_NODE_COLUMNS = "node_id,name,status,version"
+_INSTANCE_COLUMNS = (
+    "instance_id,binding_id,node_id,status,version,claim_expires_at,protocol_version,capacity,"
+    "isolation_mode,isolation_attestation,isolation_verified,verified_at,workspace_ref,provider_ref,"
+    "allowed_tools,env_allowlist,created_by,created_at,claimed_at,heartbeat_at"
+)
 
 
 class CollaborationStore:
@@ -340,3 +353,145 @@ class CollaborationStore:
             _version(binding.version, expected_version)
             self._eligible(conn, project_id, binding.agent_id, binding.member_user_id)
             return binding
+
+    @staticmethod
+    def _binding_by_id(conn, binding_id):
+        return _one(conn, AgentProjectBinding, "SELECT * FROM agent_bindings WHERE binding_id=?",
+                    (binding_id,))
+
+    @staticmethod
+    def _node(conn, node_id):
+        return _one(conn, ExecutionNode,
+                    f"SELECT {_NODE_COLUMNS} FROM nodes WHERE node_id=?", (node_id,))
+
+    @staticmethod
+    def _instance(conn, instance_id):
+        return _one(conn, ExecutionInstance,
+                    f"SELECT {_INSTANCE_COLUMNS} FROM execution_instances WHERE instance_id=?",
+                    (instance_id,))
+
+    def create_node(self, name: str, credential_hash: str) -> ExecutionNode:
+        _text(name, "name")
+        node_id = uuid4().hex
+        with self._write() as conn:
+            conn.execute("INSERT INTO nodes(node_id,name,credential_hash) VALUES(?,?,?)",
+                         (node_id, name, credential_hash))
+            return self._node(conn, node_id)
+
+    def get_node(self, node_id: str) -> ExecutionNode:
+        with self._read() as conn:
+            return self._node(conn, node_id)
+
+    def get_node_by_credential(self, credential_hash: str) -> ExecutionNode:
+        with self._read() as conn:
+            return _one(conn, ExecutionNode,
+                        f"SELECT {_NODE_COLUMNS} FROM nodes WHERE credential_hash=?", (credential_hash,))
+
+    def disable_node(self, node_id: str) -> ExecutionNode:
+        with self._write() as conn:
+            self._active(self._node(conn, node_id))
+            conn.execute("UPDATE nodes SET status='disabled',version=version+1 WHERE node_id=?", (node_id,))
+            return self._node(conn, node_id)
+
+    def get_binding_by_id(self, binding_id: str) -> AgentProjectBinding:
+        with self._read() as conn:
+            return self._binding_by_id(conn, binding_id)
+
+    def create_instance(self, binding_id: str, node_id: str, *, claim_token_hash: str,
+                        claim_expires_at: float, created_by: str, created_at: float) -> ExecutionInstance:
+        with self._write() as conn:
+            self._active(self._binding_by_id(conn, binding_id))
+            self._active(self._node(conn, node_id))
+            instance_id = uuid4().hex
+            conn.execute(
+                "INSERT INTO execution_instances(instance_id,binding_id,node_id,claim_token_hash,"
+                "claim_expires_at,created_by,created_at) VALUES(?,?,?,?,?,?,?)",
+                (instance_id, binding_id, node_id, claim_token_hash, claim_expires_at,
+                 created_by, created_at))
+            return self._instance(conn, instance_id)
+
+    def get_instance(self, project_id: str, instance_id: str) -> ExecutionInstance:
+        with self._read() as conn:
+            return _one(conn, ExecutionInstance,
+                        f"SELECT {_INSTANCE_COLUMNS} FROM execution_instances WHERE instance_id=? "
+                        "AND binding_id IN (SELECT binding_id FROM agent_bindings WHERE project_id=?)",
+                        (instance_id, project_id))
+
+    def list_instances(self, project_id: str, binding_id: str) -> list[ExecutionInstance]:
+        with self._read() as conn:
+            self._binding(conn, project_id, binding_id)
+            return [_record(ExecutionInstance, row) for row in conn.execute(
+                f"SELECT {_INSTANCE_COLUMNS} FROM execution_instances WHERE binding_id=? "
+                "ORDER BY created_at,instance_id", (binding_id,))]
+
+    def get_instance_by_claim(self, claim_token_hash: str) -> ExecutionInstance:
+        with self._read() as conn:
+            return _one(conn, ExecutionInstance,
+                        f"SELECT {_INSTANCE_COLUMNS} FROM execution_instances WHERE claim_token_hash=?",
+                        (claim_token_hash,))
+
+    def get_instance_by_token(self, instance_token_hash: str) -> ExecutionInstance:
+        with self._read() as conn:
+            return _one(conn, ExecutionInstance,
+                        f"SELECT {_INSTANCE_COLUMNS} FROM execution_instances WHERE instance_token_hash=?",
+                        (instance_token_hash,))
+
+    def live_instances_for_binding(self, binding_id: str) -> list[ExecutionInstance]:
+        with self._read() as conn:
+            return [_record(ExecutionInstance, row) for row in conn.execute(
+                f"SELECT {_INSTANCE_COLUMNS} FROM execution_instances WHERE binding_id=? "
+                "AND status IN ('pending','active') ORDER BY created_at,instance_id", (binding_id,))]
+
+    def live_instances_for_node(self, node_id: str) -> list[ExecutionInstance]:
+        with self._read() as conn:
+            return [_record(ExecutionInstance, row) for row in conn.execute(
+                f"SELECT {_INSTANCE_COLUMNS} FROM execution_instances WHERE node_id=? "
+                "AND status IN ('pending','active') ORDER BY created_at,instance_id", (node_id,))]
+
+    def mark_claimed(self, instance_id: str, *, protocol_version: str, capacity: int,
+                     isolation_mode: str, isolation_attestation: str | None,
+                     workspace_ref: str, provider_ref: str, allowed_tools: str,
+                     env_allowlist: str, instance_token_hash: str,
+                     claimed_at: float) -> ExecutionInstance:
+        with self._write() as conn:
+            cursor = conn.execute(
+                "UPDATE execution_instances SET status='active',version=version+1,protocol_version=?,"
+                "capacity=?,isolation_mode=?,isolation_attestation=?,workspace_ref=?,provider_ref=?,"
+                "allowed_tools=?,env_allowlist=?,instance_token_hash=?,claimed_at=?,heartbeat_at=? "
+                "WHERE instance_id=? AND status='pending'",
+                (protocol_version, capacity, isolation_mode, isolation_attestation, workspace_ref,
+                 provider_ref, allowed_tools, env_allowlist, instance_token_hash, claimed_at,
+                 claimed_at, instance_id))
+            if cursor.rowcount != 1:
+                raise Conflict("Instance is not available")
+            return self._instance(conn, instance_id)
+
+    def touch_heartbeat(self, instance_id: str, heartbeat_at: float) -> ExecutionInstance:
+        with self._write() as conn:
+            cursor = conn.execute(
+                "UPDATE execution_instances SET heartbeat_at=? WHERE instance_id=? AND status='active'",
+                (heartbeat_at, instance_id))
+            if cursor.rowcount != 1:
+                raise InvalidState("Instance is not active")
+            return self._instance(conn, instance_id)
+
+    def set_verified(self, instance_id: str, expected_version: int, verified_at: float) -> ExecutionInstance:
+        with self._write() as conn:
+            instance = self._instance(conn, instance_id)
+            _version(instance.version, expected_version)
+            conn.execute(
+                "UPDATE execution_instances SET isolation_verified=1,verified_at=?,version=version+1 "
+                "WHERE instance_id=?", (verified_at, instance_id))
+            return self._instance(conn, instance_id)
+
+    def set_disabled(self, instance_id: str, expected_version: int | None = None) -> ExecutionInstance:
+        with self._write() as conn:
+            instance = self._instance(conn, instance_id)
+            if instance.status == "disabled":
+                raise InvalidState("Instance is already disabled")
+            if expected_version is not None:
+                _version(instance.version, expected_version)
+            conn.execute(
+                "UPDATE execution_instances SET status='disabled',version=version+1 WHERE instance_id=?",
+                (instance_id,))
+            return self._instance(conn, instance_id)
