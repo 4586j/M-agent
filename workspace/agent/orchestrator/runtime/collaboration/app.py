@@ -24,6 +24,7 @@ from .database import Database
 from .dispatch import DispatchService
 from .execution import (ExecutionService, MAX_ARTIFACT_BYTES, PACKAGE_MIME, REQUIREMENT_MIME,
                         decode_artifact)
+from .inbox import InboxService
 from .instances import InstanceService
 from .models import Conflict, InvalidState, NotFound, Unavailable, ValidationError
 from .planning import PlanService, plan_document
@@ -424,6 +425,7 @@ def create_app(config: AppConfig) -> FastAPI:
                                                lease_ttl=config.lease_ttl,
                                                budgets=app.state.budgets)
         app.state.reviews = ReviewService(budgets=app.state.budgets)
+        app.state.inbox = InboxService()
         app.state.scheduler = Scheduler(database, planning=app.state.planning,
                                         queue=app.state.queue, dispatch=app.state.dispatch,
                                         auto_dispatch=config.auto_dispatch)
@@ -1049,8 +1051,11 @@ def create_app(config: AppConfig) -> FastAPI:
 
     @router.get("/inbox")
     def inbox(request: Request):
+        """Drafting to-dos and execution decisions in one list, newest first."""
         with _access(request) as access:
-            return app.state.requirements.inbox(access)
+            merged = app.state.requirements.inbox(access) + app.state.inbox.pending(access)
+            return sorted(merged, key=lambda entry: (-entry["updated_at"], entry["item_type"],
+                                                     entry.get("requirement_id") or ""))
 
     @router.get("/projects/{pid}/audit")
     def project_audit(pid: str, request: Request, limit: AuditLimit = 100):

@@ -1878,3 +1878,39 @@ def test_the_requester_signs_for_the_requirement_delivery_over_http(api):
     checked(api.send("member", "POST", actions,
                      json={"action": "cancel", "expected_version": done["version"]}), 409)
 
+
+def test_inbox_to_dos_lead_to_working_endpoints(api):
+    seen = delivered(api)
+    pid = seen.project["project_id"]
+    wid = seen.plan["work_items"][0]["work_item_id"]
+    requirement_id = seen.requirement_id
+    base = f"/projects/{pid}/requirements/{requirement_id}"
+
+    def owed(actor):
+        return [(entry["item_type"], entry["action"], entry["href"]) for entry in
+                checked(api.send(actor, "GET", "/inbox"))
+                if not entry["item_type"].startswith("requirement_")]
+
+    reviews = f"/projects/{pid}/attempts/{seen.attempt.attempt_id}/reviews"
+    assert owed("member") == [("delivery_confirmation", "confirm_delivery", reviews)]
+    assert owed("outsider") == []
+    checked(api.send("member", "POST", reviews,
+                     json={"decision": "confirmed", "expected_version": seen.reported["version"]}))
+    assert owed("member") == []
+    accept = f"/projects/{pid}/work-items/{wid}/accept"
+    assert owed("manager") == [("business_acceptance", "accept_work_item", accept)]
+    item = checked(api.send("manager", "GET", plans_path(seen.project, requirement_id)
+                            + f"/{seen.plan['plan']['plan_id']}"))["work_items"][0]
+    checked(api.send("manager", "POST", accept, json={"decision": "accepted",
+                                                      "expected_version": item["version"]}))
+    assert owed("manager") == []
+    requirement = checked(api.send("member", "GET", base))
+    checked(api.send("member", "POST", f"{base}/actions",
+                     json={"action": "advance", "expected_version": requirement["version"]}))
+    final = f"{base}/acceptance"
+    assert owed("member") == [("final_acceptance", "accept_requirement", final)]
+    waiting = checked(api.send("member", "GET", base))
+    checked(api.send("member", "POST", final, json={"decision": "accepted",
+                                                    "expected_version": waiting["version"]}))
+    assert owed("member") == [] and owed("manager") == []
+

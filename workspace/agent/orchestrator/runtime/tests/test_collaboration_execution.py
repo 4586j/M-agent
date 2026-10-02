@@ -22,6 +22,7 @@ from collaboration.budgets import BudgetService
 from collaboration.database import Database, SCHEMA_VERSION
 from collaboration.dispatch import DispatchService, TOPIC_ATTEMPT_ASSIGNED, TOPIC_ATTEMPT_REVOKED
 from collaboration.execution import ExecutionService, decode_artifact
+from collaboration.inbox import InboxService
 from collaboration.instances import AdmissionDenied, InstanceService
 from collaboration.scheduler import OutboxDispatcher, QueueService, Scheduler
 from collaboration.models import (
@@ -2290,4 +2291,96 @@ def test_a_requirement_return_needs_a_carrier_while_items_can_still_come_back(te
     rows = team.store.list_requirement_acceptances(project_id, requirement_id)
     assert [(row.decision, row.evidence_hash) for row in rows] == [
         ("accepted", final["evidence_hash"])]
+
+
+# --- inbox ------------------------------------------------------------------------
+
+def todos(team, actor):
+    with session(team, actor) as access:
+        return [(entry["item_type"], entry["action"], entry["href"])
+                for entry in InboxService(clock=team.clock).pending(access)]
+
+
+def test_the_inbox_offers_each_person_only_the_decisions_they_owe(team):
+    outsider = team.store.create_user("局外人")
+    stranger = team.store.create_user("他人")
+    team.store.add_member(team.project_b.project_id, stranger.user_id)
+    requirement, plan, _instance, token = reserved_plan(
+        team, plan_item(team, "A", estimate=5), plan_item(team, "B", estimate=3))
+    project_id, requirement_id = requirement.project_id, requirement.requirement_id
+    item_a, item_b = work_item(team, plan, "A"), work_item(team, plan, "B")
+    dispatch = team.make_dispatch(requires_real_data=False)
+    accept_item(team, project_id, item_a, token)
+    assert todos(team, outsider) == [] and todos(team, stranger) == []
+
+    attempt_b = dispatch.dispatch(project_id, item_b.work_item_id)
+    reported = deliver(team, token, attempt_b, "B 自认完成")
+    owed = ("delivery_confirmation", "confirm_delivery",
+            f"/projects/{project_id}/attempts/{reported.attempt.attempt_id}/reviews")
+    assert todos(team, team.worker) == [owed] == todos(team, team.reviewer)
+    assert todos(team, team.requester) == []
+    with session(team, team.owner) as access:
+        team.reviews.confirm(access, project_id=project_id, attempt_id=reported.attempt.attempt_id,
+                             decision="changes_requested", reason="第二条验收没做",
+                             expected_version=reported.attempt.version)
+    assert todos(team, team.reviewer) == [
+        ("rework_queue", "rework_work_item",
+         f"/projects/{project_id}/work-items/{item_b.work_item_id}/rework")]
+    assert todos(team, team.worker) == []
+    with session(team, team.reviewer) as access:
+        moved = team.store.get_work_item(project_id, item_b.work_item_id)
+        team.reviews.rework(access, project_id=project_id, work_item_id=item_b.work_item_id,
+                            expected_version=moved.version)
+    second_b = dispatch.dispatch(project_id, item_b.work_item_id)
+    second_reported = deliver(team, token, second_b, "B 补上了")
+    with session(team, team.owner) as access:
+        _confirmed, _review = team.reviews.confirm(
+            access, project_id=project_id, attempt_id=second_b.attempt_id, decision="confirmed",
+            expected_version=second_reported.attempt.version)
+    submitted = team.store.get_work_item(project_id, item_b.work_item_id)
+    assert todos(team, team.reviewer) == [(
+        "business_acceptance", "accept_work_item",
+        f"/projects/{project_id}/work-items/{item_b.work_item_id}/accept")]
+    waiting_for = team.store.get_requirement(project_id, requirement_id)
+    with session(team, team.reviewer) as access:
+        team.reviews.accept(access, project_id=project_id, work_item_id=item_b.work_item_id,
+                            decision="accepted", expected_version=submitted.version)
+        waiting = team.reviews.advance_requirement(access, project_id=project_id,
+                                                  requirement_id=requirement_id,
+                                                  expected_version=waiting_for.version)
+    assert waiting.status == "awaiting_acceptance"
+    assert todos(team, team.requester) == [(
+        "final_acceptance", "accept_requirement",
+        f"/projects/{project_id}/requirements/{requirement_id}/acceptance")]
+    assert todos(team, team.worker) == [] and todos(team, team.reviewer) == []
+    with session(team, team.requester) as access:
+        done = team.reviews.accept_requirement(access, project_id=project_id,
+                                              requirement_id=requirement_id, decision="accepted",
+                                              expected_version=waiting.version)
+    assert done.status == "completed" and todos(team, team.requester) == []
+
+
+def test_an_expired_lease_and_an_unconfirmed_withdrawal_become_to_dos(team):
+    requirement, plan, _instance, token = reserved_plan(team, plan_item(team, "A", estimate=5))
+    project_id = requirement.project_id
+    item = work_item(team, plan, "A")
+    attempt = team.make_dispatch(requires_real_data=False, lease_ttl=120.0).dispatch(
+        project_id, item.work_item_id)
+    execution = team.make_execution(lease_ttl=120.0)
+    execution.start(token, attempt.attempt_id, **claims(attempt))
+    assert todos(team, team.worker) == [] and todos(team, team.reviewer) == []
+    team.clock.advance(121.0)
+    assert todos(team, team.worker) == [(
+        "worker_attention", "inspect_worker",
+        f"/projects/{project_id}/agent-bindings/{attempt.binding_id}/instances")]
+    with session(team, team.reviewer) as access:
+        team.reviews.cancel(access, project_id=project_id, work_item_id=item.work_item_id,
+                            reason="先停下来", expected_version=team.store.get_work_item(
+                                project_id, item.work_item_id).version)
+    pending = todos(team, team.reviewer)
+    # 租约过期的提醒在对账之后不再重复：撤销未确认的执行本身就是要看的那一条。
+    assert pending == [(
+        "attempt_reconciliation", "reconcile_attempt",
+        f"/projects/{project_id}/attempts/{attempt.attempt_id}/reconcile")]
+    assert todos(team, team.worker) == pending
 
