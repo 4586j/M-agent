@@ -95,6 +95,7 @@ def validate_candidate(candidate, *, members, bindings, agents,
                 or any(not isinstance(value, str) for value in references)):
             problems.append(f"invalid_field:{label}:acceptance_ids")
         else:
+            record["acceptance_ids"] = list(dict.fromkeys(references))
             for acceptance_id in references:
                 if acceptance_id not in acceptance_ids:
                     problems.append(f"acceptance_unknown:{acceptance_id}")

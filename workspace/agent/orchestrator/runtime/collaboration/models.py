@@ -38,6 +38,13 @@ POST_APPROVAL_STATUSES = (
     "awaiting_acceptance", "rework", "paused", "cancelling", "cancelled", "completed",
 )
 
+# An attempt holds the work item while it is in one of these statuses; only one
+# attempt per work item may be open at a time (partial unique index).
+OPEN_ATTEMPT_STATUSES = ("assigned", "acked", "running", "reconciliation_required")
+ATTEMPT_TERMINAL_STATUSES = ("accepted", "changes_requested", "failed", "cancelled")
+ATTEMPT_STATUSES = OPEN_ATTEMPT_STATUSES + ATTEMPT_TERMINAL_STATUSES + ("submitted",)
+REPORT_STAGES = ("ack", "start", "lease", "artifact", "result", "cancel")
+
 
 @dataclass(frozen=True)
 class User:
@@ -119,6 +126,8 @@ class ExecutionInstance:
     created_at: float = 0.0
     claimed_at: float | None = None
     heartbeat_at: float | None = None
+    worker_url: str | None = None
+    control_epoch: int = 1
 
 
 @dataclass(frozen=True)
@@ -262,3 +271,106 @@ class BudgetEntry:
     kind: str
     delta_units: int
     created_at: float = 0.0
+
+
+@dataclass(frozen=True)
+class Attempt:
+    attempt_id: str
+    project_id: str
+    work_item_id: str
+    plan_id: str
+    requirement_id: str
+    revision_id: str
+    revision_hash: str
+    instance_id: str
+    binding_id: str
+    binding_version: int
+    assignee_user_id: str
+    number: int
+    schema_version: str
+    input_hash: str
+    package_json: str
+    status: str = "assigned"
+    lease_epoch: int = 1
+    control_epoch: int = 1
+    lease_expires_at: float = 0.0
+    usage_units: int = 0
+    result_json: str | None = None
+    result_hash: str | None = None
+    trace_id: str | None = None
+    version: int = 1
+    created_at: float = 0.0
+    updated_at: float = 0.0
+
+
+@dataclass(frozen=True)
+class AttemptReport:
+    report_id: str
+    attempt_id: str
+    project_id: str
+    stage: str
+    lease_epoch: int
+    control_epoch: int
+    input_hash: str
+    payload: str
+    accepted: int
+    reason: str | None = None
+    created_at: float = 0.0
+
+
+@dataclass(frozen=True)
+class AttemptArtifact:
+    artifact_id: str
+    attempt_id: str
+    project_id: str
+    work_item_id: str
+    name: str
+    media_type: str
+    size_bytes: int
+    sha256: str
+    created_at: float = 0.0
+
+
+@dataclass(frozen=True)
+class OwnerReview:
+    review_id: str
+    attempt_id: str
+    project_id: str
+    work_item_id: str
+    reviewer_user_id: str
+    decision: str
+    result_hash: str
+    reason: str = ""
+    created_at: float = 0.0
+
+
+@dataclass(frozen=True)
+class SecurityReview:
+    security_review_id: str
+    attempt_id: str
+    project_id: str
+    rule_key: str
+    input_hash: str
+    requirement_id: str
+    revision_id: str
+    binding_version: int
+    tool_policy_version: str
+    decision: str = "pending"
+    reviewer_user_id: str | None = None
+    reason: str = ""
+    expires_at: float = 0.0
+    version: int = 1
+    created_at: float = 0.0
+    updated_at: float = 0.0
+
+
+@dataclass(frozen=True)
+class SecurityGrant:
+    project_id: str
+    user_id: str
+    capability: str
+    status: str = "active"
+    granted_by: str = ""
+    version: int = 1
+    created_at: float = 0.0
+    updated_at: float = 0.0

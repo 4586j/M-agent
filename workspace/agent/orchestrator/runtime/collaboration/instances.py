@@ -22,6 +22,10 @@ from .store import CollaborationStore, _text, _version
 
 SUPPORTED_PROTOCOLS = ("1",)
 ISOLATION_MODES = ("none", "os_account", "container", "vm")
+_WORKER_URL_MAX = 512
+_WORKER_URL_HOST = re.compile(r"^[A-Za-z0-9.\-]+$")
+_WORKER_URL_PORT = re.compile(r"^\d{1,5}$")
+_WORKER_URL_PATH = re.compile(r"^/[A-Za-z0-9._~/-]*$")
 _ENV_DENY_TOKENS = frozenset({"KEY", "TOKEN", "SECRET", "PASSWORD", "PASSWD",
                               "CREDENTIAL", "CREDENTIALS", "CREDS"})
 _ENV_DENY_PREFIXES = ("ORCH_", "AGENT_", "COLLAB_", "ANTHROPIC_", "OPENAI_",
@@ -75,6 +79,37 @@ def _tool_policy(names) -> tuple[str, ...]:
     if len(set(tools)) != len(tools):
         raise ValidationError("Duplicate tools")
     return tools
+
+
+def _worker_url(value: str | None) -> str | None:
+    """Validate the owner-registered dispatch address of an execution instance.
+
+    Only scheme, host, optional port and path are accepted; credentials, queries or
+    fragments would let a registration smuggle an extra callback target.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, str) or not 0 < len(value) <= _WORKER_URL_MAX:
+        raise ValidationError("Invalid worker URL")
+    for scheme in ("http://", "https://"):
+        if value.startswith(scheme):
+            remainder = value[len(scheme):]
+            break
+    else:
+        raise ValidationError("Invalid worker URL")
+    if any(bad in remainder for bad in ("@", "?", "#", "\\", " ")) or "://" in remainder:
+        raise ValidationError("Invalid worker URL")
+    authority, separator, path = remainder.partition("/")
+    if separator and not _WORKER_URL_PATH.fullmatch("/" + path):
+        raise ValidationError("Invalid worker URL path")
+    host, colon, port = authority.partition(":")
+    if not _WORKER_URL_HOST.fullmatch(host) or len(host) > 253 \
+            or any(not 1 <= len(label) <= 63 or not label[0].isalnum() or not label[-1].isalnum()
+                   for label in host.split(".")):
+        raise ValidationError("Invalid worker URL host")
+    if colon and (not _WORKER_URL_PORT.fullmatch(port) or not 1 <= int(port) <= 65535):
+        raise ValidationError("Invalid worker URL port")
+    return value
 
 
 def _env_allowlist(names) -> tuple[str, ...]:
@@ -133,7 +168,7 @@ class InstanceService:
             return node, disabled
 
     def register_slot(self, access: Access, *, project_id: str, binding_id: str,
-                      node_id: str) -> tuple[ExecutionInstance, str]:
+                      node_id: str, worker_url: str | None = None) -> tuple[ExecutionInstance, str]:
         claim_token = secrets.token_urlsafe(32)
         now = self.clock()
         binding = access.store.get_binding(project_id, binding_id)
@@ -145,7 +180,7 @@ class InstanceService:
         instance = access.store.create_instance(
             binding_id, node_id, claim_token_hash=token_digest(claim_token),
             claim_expires_at=now + self.claim_ttl, created_by=access.user.user_id,
-            created_at=now)
+            created_at=now, worker_url=_worker_url(worker_url))
         record_audit(access.conn, now, access.user.user_id, "instance.registered",
                      instance.instance_id, project_id=project_id, target_version=instance.version)
         return instance, claim_token
@@ -252,7 +287,7 @@ class InstanceService:
         now = self.clock()
         with self.database.transaction() as conn:
             store = CollaborationStore(self.database, connection=conn)
-            instance = self._live_identity(store, digest)
+            instance = self.live_identity(store, digest)
             # Heartbeats are too frequent to audit; state changes carry the audit trail.
             return store.touch_heartbeat(instance.instance_id, now)
 
@@ -260,11 +295,11 @@ class InstanceService:
         digest = token_digest(instance_token)
         with self.database.read() as conn:
             store = CollaborationStore(self.database, connection=conn)
-            instance = self._live_identity(store, digest)
+            instance = self.live_identity(store, digest)
             return instance, store.get_binding_by_id(instance.binding_id)
 
     @staticmethod
-    def _live_identity(store: CollaborationStore, digest: str) -> ExecutionInstance:
+    def live_identity(store: CollaborationStore, digest: str) -> ExecutionInstance:
         try:
             instance = store.get_instance_by_token(digest)
         except NotFound:

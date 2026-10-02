@@ -2,7 +2,8 @@
 from __future__ import annotations
 
 from contextlib import closing
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
+import base64
 import hashlib
 import json
 from pathlib import Path
@@ -11,6 +12,7 @@ import subprocess
 import sys
 import time
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
@@ -18,7 +20,7 @@ RUNTIME = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(RUNTIME))
 
 from collaboration import __main__ as cli
-from collaboration.app import AppConfig, COOKIE, PREFIX, create_app
+from collaboration.app import AppConfig, COOKIE, PREFIX, _wake, create_app
 from collaboration.database import Database
 from collaboration.store import CollaborationStore
 
@@ -1192,3 +1194,193 @@ def test_budget_scopes_versions_and_publication_gate_over_http(api):
     global_account = checked(api.send("admin", "PUT", "/admin/budget", json={"limit_units": 100}))
     assert (global_account["scope"], global_account["limit_units"], global_account["version"]) == \
         ("global", 100, 1)
+
+
+# --- T07: machine execution protocol over HTTP ---------------------------------
+
+def machine_claims(source):
+    data = source if isinstance(source, dict) else asdict(source)
+    return {key: data[key] for key in ("input_hash", "control_epoch", "lease_epoch")}
+
+
+def machine_attempt(api, *, worker_url=None):
+    """Approved requirement, published plan, live claimed instance and one dispatched attempt."""
+    project, member, binding, requirement_id = approval_setup(api)
+    pid = project["project_id"]
+    wire_planner(api, binding, member["user_id"])
+    plan = checked(api.send("manager", "POST", plans_path(project, requirement_id)), 201)
+    node, node_token = api.client.app.state.instances.enroll_node("machine-node")
+    created = checked(api.send("owner", "POST",
+                               f"/projects/{pid}/agent-bindings/{binding['binding_id']}/instances",
+                               json={"node_id": node.node_id, "worker_url": worker_url}), 201)
+    claimed = checked(machine_claim(api, node_token, created["claim_token"]), 201)
+    token = claimed["instance_token"]
+    checked(api.send(None, "POST", "/machine/instances/heartbeat",
+                     headers={"X-Instance-Token": token}))
+    attempt = api.client.app.state.dispatch.dispatch(
+        pid, plan["work_items"][0]["work_item_id"], requires_real_data=False)
+    return project, requirement_id, plan, attempt, token
+
+
+def work_item_statuses(api, project, requirement_id, plan, actor="member"):
+    detail = checked(api.send(actor, "GET",
+                              plans_path(project, requirement_id) + f"/{plan['plan']['plan_id']}"))
+    return [entry["status"] for entry in detail["work_items"]]
+
+
+def test_machine_protocol_pulls_and_reports_over_http(api):
+    project, requirement_id, plan, attempt, token = machine_attempt(api)
+    pid = project["project_id"]
+    headers = {"X-Instance-Token": token}
+    base = f"/machine/attempts/{attempt.attempt_id}"
+
+    held = checked(api.send(None, "GET", "/machine/instances/me/attempts", headers=headers))
+    assert [entry["attempt_id"] for entry in held] == [attempt.attempt_id]
+    assert "package_json" not in json.dumps(held) and token not in json.dumps(held)
+    assert work_item_statuses(api, project, requirement_id, plan) == ["running"]
+
+    package = api.send(None, "GET", base + "/package", headers=headers)
+    payload = checked(package)
+    assert package.headers["x-input-hash"] == attempt.input_hash
+    assert hashlib.sha256(package.content).hexdigest() == attempt.input_hash
+    assert payload["documents"] == [{
+        "kind": "requirement_text", "revision_id": attempt.revision_id,
+        "content_hash": attempt.revision_hash, "size_bytes": len("# 需求原文".encode("utf-8")),
+        "media_type": "text/markdown;charset=utf-8", "href": "requirement", "complete": True}]
+    assert payload["subtask"]["acceptance"][0]["text"] == "第一条验收"
+    assert payload["policy"]["allowed_tools"] == BINDING_FIELDS["allowed_tools"]
+    assert (payload["policy"]["budget_units"], payload["policy"]["documents_are_untrusted_input"]) \
+        == (2, True)
+
+    original = api.send(None, "GET", base + "/requirement", headers=headers)
+    assert original.status_code == 200
+    assert original.headers["cache-control"] == "no-store"
+    assert (original.headers["x-content-hash"], original.headers["x-revision-id"]) == (
+        attempt.revision_hash, attempt.revision_id)
+    assert original.content.decode("utf-8") == "# 需求原文"
+
+    acked = checked(api.send(None, "POST", base + "/ack", json=machine_claims(attempt),
+                             headers=headers))
+    assert (acked["outcome"], acked["attempt"]["status"], acked["attempt"]["version"]) == (
+        "accepted", "acked", attempt.version + 1)
+    replay = checked(api.send(None, "POST", base + "/ack", json=machine_claims(acked["attempt"]),
+                              headers=headers))
+    assert (replay["outcome"], replay["attempt"]["version"]) == (
+        "duplicate", acked["attempt"]["version"])
+    started = checked(api.send(None, "POST", base + "/start",
+                               json={**machine_claims(replay["attempt"]), "trace_id": "trace-1"},
+                               headers=headers))
+    assert (started["attempt"]["status"], started["attempt"]["trace_id"]) == ("running", "trace-1")
+    renewed = checked(api.send(None, "POST", base + "/lease", json=machine_claims(started["attempt"]),
+                               headers=headers))
+    assert renewed["attempt"]["lease_epoch"] == started["attempt"]["lease_epoch"] + 1
+
+    content = "交付说明".encode("utf-8")
+    digest = hashlib.sha256(content).hexdigest()
+    uploaded = checked(api.send(None, "POST", base + "/artifacts", json={
+        **machine_claims(renewed["attempt"]), "name": "result.md", "media_type": "text/markdown",
+        "sha256": digest, "content": base64.b64encode(content).decode("ascii")}, headers=headers),
+        201)
+    assert (uploaded["outcome"], uploaded["artifact"]["size_bytes"]) == ("accepted", len(content))
+    listed = checked(api.send(None, "GET", base + "/artifacts", headers=headers))
+    assert [entry["href"] for entry in listed] == [
+        f"artifacts/{uploaded['artifact']['artifact_id']}"]
+    downloaded = api.send(None, "GET", f"{base}/{listed[0]['href']}", headers=headers)
+    assert downloaded.status_code == 200 and downloaded.headers["cache-control"] == "no-store"
+    assert (downloaded.content, downloaded.headers["x-content-hash"]) == (content, digest)
+    assert downloaded.headers["content-type"].startswith("text/markdown")
+
+    body = {**machine_claims(uploaded["attempt"]), "status": "submitted", "summary": "完成",
+            "usage_units": 2, "artifacts": [{"name": "result.md", "sha256": digest}]}
+    result = checked(api.send(None, "POST", base + "/result", json=body, headers=headers))
+    assert (result["outcome"], result["attempt"]["status"]) == ("accepted", "submitted")
+    assert result["attempt"]["result_hash"] == hashlib.sha256(json.dumps(
+        {"artifacts": [{"name": "result.md", "sha256": digest}], "summary": "完成"},
+        ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+    again = checked(api.send(None, "POST", base + "/result", json=body,
+                             headers=headers))
+    assert (again["outcome"], again["attempt"]["version"]) == (
+        "duplicate", result["attempt"]["version"])
+    assert work_item_statuses(api, project, requirement_id, plan) == ["awaiting_owner_review"]
+
+
+def test_machine_protocol_rejects_unauthenticated_forged_and_foreign_calls(api):
+    project, _requirement_id, _plan, attempt, token = machine_attempt(api)
+    base = f"/machine/attempts/{attempt.attempt_id}"
+    headers = {"X-Instance-Token": token}
+    claims = machine_claims(attempt)
+
+    checked(api.send(None, "GET", base + "/package"), 401)
+    checked(api.send("member", "GET", base + "/package"), 401)
+    checked(api.send("member", "POST", base + "/ack", json=claims), 401)
+    checked(api.send(None, "POST", base + "/ack", json={**claims, "input_hash": "z" * 64},
+                     headers=headers), 422)
+    checked(api.send(None, "POST", base + "/ack", json=claims), 401)
+    checked(api.send(None, "POST", base + "/ack", json={**claims, "input_hash": "b" * 64},
+                     headers=headers), 409)
+    checked(api.send(None, "POST", base + "/ack", json={**claims, "lease_epoch": 99},
+                     headers=headers), 409)
+    checked(api.send(None, "GET", f"/machine/attempts/{'0' * 32}/package", headers=headers), 404)
+    assert checked(api.send(None, "GET", "/machine/instances/me/attempts",
+                            headers=headers))[0]["status"] == "assigned"
+
+    other = api.project(name="Project B")
+    api.member(other)
+    other_binding = api.binding(other, api.agent())
+    node, node_token = api.client.app.state.instances.enroll_node("foreign-node")
+    created = checked(api.send("owner", "POST",
+        f"/projects/{other['project_id']}/agent-bindings/{other_binding['binding_id']}/instances",
+        json={"node_id": node.node_id}), 201)
+    claimed = checked(machine_claim(api, node_token, created["claim_token"]), 201)
+    foreign = {"X-Instance-Token": claimed["instance_token"]}
+    assert checked(api.send(None, "GET", "/machine/instances/me/attempts", headers=foreign)) == []
+    checked(api.send(None, "GET", base + "/package", headers=foreign), 404)
+    checked(api.send(None, "GET", base + "/requirement", headers=foreign), 404)
+    checked(api.send(None, "POST", base + "/ack", json=claims, headers=foreign), 404)
+    assert checked(api.send(None, "GET", "/machine/instances/me/attempts",
+                            headers=headers))[0]["status"] == "assigned"
+
+
+def test_machine_cancel_closes_the_attempt_and_a_late_report_is_refused(api):
+    project, requirement_id, plan, attempt, token = machine_attempt(api)
+    headers = {"X-Instance-Token": token}
+    base = f"/machine/attempts/{attempt.attempt_id}"
+    started = checked(api.send(None, "POST", base + "/start", json=machine_claims(attempt),
+                               headers=headers))
+    cancelled = checked(api.send(None, "POST", base + "/cancel",
+                                 json={**machine_claims(started["attempt"]), "reason": "节点停机"},
+                                 headers=headers))
+    assert (cancelled["outcome"], cancelled["attempt"]["status"]) == ("accepted", "cancelled")
+    assert checked(api.send(None, "POST", base + "/cancel",
+                            json={**machine_claims(cancelled["attempt"]), "reason": "节点停机"},
+                            headers=headers))["outcome"] == "duplicate"
+    digest = hashlib.sha256(b"late").hexdigest()
+    late = machine_claims(cancelled["attempt"])
+    checked(api.send(None, "POST", base + "/result",
+                     json={**late, "status": "submitted", "summary": "迟到的结果"},
+                     headers=headers), 409)
+    checked(api.send(None, "POST", base + "/lease", json=late, headers=headers), 409)
+    checked(api.send(None, "POST", base + "/artifacts", json={
+        **late, "name": "late.md", "media_type": "text/plain", "sha256": digest,
+        "content": base64.b64encode(b"late").decode("ascii")}, headers=headers), 409)
+    assert work_item_statuses(api, project, requirement_id, plan) == ["waiting_agent"]
+    # A closed attempt still serves its frozen inputs for reconciliation.
+    assert api.send(None, "GET", base + "/package", headers=headers).status_code == 200
+    assert api.send(None, "GET", base + "/requirement",
+                    headers=headers).content == "# 需求原文".encode("utf-8")
+
+
+def test_wake_helper_posts_advisory_payload_and_flags_failures():
+    seen = []
+
+    def handler(request):
+        seen.append((str(request.url), request.headers["x-collab-wake"],
+                     json.loads(request.content)))
+        return httpx.Response(204 if request.url.path == "/awake" else 500)
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        _wake(client, "https://worker.invalid/awake", {"attempt_id": "a"})
+        with pytest.raises(OSError):
+            _wake(client, "https://worker.invalid/asleep", {"attempt_id": "b"})
+    assert seen == [("https://worker.invalid/awake", "1", {"attempt_id": "a"}),
+                    ("https://worker.invalid/asleep", "1", {"attempt_id": "b"})]

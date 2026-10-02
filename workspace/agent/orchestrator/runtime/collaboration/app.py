@@ -13,6 +13,7 @@ from urllib.parse import urlsplit
 
 from fastapi import APIRouter, FastAPI, Path as PathParameter, Query, Request, Response
 from fastapi.exceptions import RequestValidationError
+import httpx
 from pydantic import BaseModel, ConfigDict, Field, SecretStr
 from starlette.exceptions import HTTPException
 from starlette.responses import JSONResponse
@@ -20,6 +21,9 @@ from starlette.responses import JSONResponse
 from .auth import AuthService, Unauthorized, Forbidden, RateLimited
 from .budgets import BudgetService
 from .database import Database
+from .dispatch import DispatchService
+from .execution import (ExecutionService, MAX_ARTIFACT_BYTES, PACKAGE_MIME, REQUIREMENT_MIME,
+                        decode_artifact)
 from .instances import InstanceService
 from .models import Conflict, InvalidState, NotFound, Unavailable, ValidationError
 from .planning import PlanService, plan_document
@@ -65,11 +69,14 @@ class AppConfig:
     data_dir: Path
     public_origin: str = "http://127.0.0.1:7400"
     session_ttl: int = 28800
+    lease_ttl: int = 120
 
     def __post_init__(self):
         canonical, _, _ = _origin(self.public_origin)
         if type(self.session_ttl) is not int or not 60 <= self.session_ttl <= 86400:
             raise ValueError("session_ttl must be between 60 and 86400 seconds")
+        if type(self.lease_ttl) is not int or not 30 <= self.lease_ttl <= 86400:
+            raise ValueError("lease_ttl must be between 30 and 86400 seconds")
         object.__setattr__(self, "data_dir", Path(self.data_dir))
         object.__setattr__(self, "public_origin", canonical)
 
@@ -82,6 +89,12 @@ AuditLimit = Annotated[int, Query(ge=1, le=200)]
 EventLimit = Annotated[int, Query(ge=1, le=200)]
 AcceptanceText = Annotated[str, Field(min_length=1, max_length=4096)]
 AcceptanceItems = Annotated[list[AcceptanceText], Field(max_length=256)]
+Digest = Annotated[str, Field(pattern="^[0-9a-f]{64}$")]
+Epoch = Annotated[int, Field(strict=True, ge=1, le=10 ** 12)]
+ArtifactName = Annotated[str, Field(min_length=1, max_length=512)]
+MediaType = Annotated[str, Field(min_length=1, max_length=128)]
+ArtifactContent = Annotated[str, Field(
+    min_length=1, max_length=4 * ((MAX_ARTIFACT_BYTES + 2) // 3) + 8)]
 
 
 class Input(BaseModel):
@@ -152,6 +165,7 @@ class BindingUpdate(BindingFields, ExpectedVersion):
 
 class InstanceCreate(Input):
     node_id: Name
+    worker_url: Annotated[str, Field(min_length=1, max_length=512)] | None = None
 
 
 class MachinePolicy(Input):
@@ -168,6 +182,40 @@ class MachineClaim(Input):
     isolation_mode: Literal["none", "os_account", "container", "vm"]
     isolation_attestation: Annotated[str, Field(max_length=1024)] = ""
     policy: MachinePolicy
+
+
+class MachineCallback(Input):
+    input_hash: Digest
+    control_epoch: Epoch
+    lease_epoch: Epoch
+
+
+class MachineStart(MachineCallback):
+    trace_id: Annotated[str, Field(min_length=1, max_length=128)] | None = None
+
+
+class ArtifactEntry(Input):
+    name: ArtifactName
+    sha256: Digest
+
+
+class MachineArtifact(MachineCallback):
+    name: ArtifactName
+    media_type: MediaType
+    sha256: Digest
+    content: ArtifactContent
+
+
+class MachineResult(MachineCallback):
+    status: Literal["submitted", "failed"]
+    summary: Annotated[str, Field(min_length=1, max_length=8192)]
+    artifacts: Annotated[list[ArtifactEntry], Field(max_length=256)] = []
+    usage_units: Annotated[int, Field(strict=True, ge=0, le=10 ** 12)] = 0
+    trace_id: Annotated[str, Field(min_length=1, max_length=128)] | None = None
+
+
+class MachineCancel(MachineCallback):
+    reason: Annotated[str, Field(max_length=2048)] = ""
 
 
 class RequirementCreate(Input):
@@ -252,6 +300,36 @@ def _cascading_revocations(request: Request, access, *, project_id=None,
                 access, project_id=binding.project_id, binding_id=binding.binding_id)
 
 
+_ATTEMPT_VIEW = (
+    "attempt_id", "work_item_id", "plan_id", "requirement_id", "revision_id", "number",
+    "schema_version", "input_hash", "status", "lease_epoch", "control_epoch",
+    "lease_expires_at", "usage_units", "result_hash", "trace_id", "version", "updated_at",
+)
+
+
+def _attempt_view(attempt) -> dict:
+    # The frozen package is only ever served from its own endpoint, never inside a status body.
+    return {name: getattr(attempt, name) for name in _ATTEMPT_VIEW}
+
+
+def _artifact_view(artifact) -> dict:
+    return {"artifact_id": artifact.artifact_id, "name": artifact.name,
+            "media_type": artifact.media_type, "sha256": artifact.sha256,
+            "size_bytes": artifact.size_bytes, "href": f"artifacts/{artifact.artifact_id}"}
+
+
+def _claims(body: MachineCallback) -> dict:
+    return {"input_hash": body.input_hash, "control_epoch": body.control_epoch,
+            "lease_epoch": body.lease_epoch}
+
+
+def _call_view(call) -> dict:
+    result = {"outcome": call.outcome, "attempt": _attempt_view(call.attempt)}
+    if call.artifact is not None:
+        result["artifact"] = _artifact_view(call.artifact)
+    return result
+
+
 def _audit_rows(conn, project_id: str | None, limit: int):
     columns = "event_id,project_id,actor_id,action,target_id,target_version,created_at"
     if project_id is None:
@@ -263,6 +341,13 @@ def _audit_rows(conn, project_id: str | None, limit: int):
             f"SELECT {columns} FROM collaboration_audit WHERE project_id=? "
             "ORDER BY created_at DESC,event_id DESC LIMIT ?", (project_id, limit))
     return [dict(row) for row in rows]
+
+
+def _wake(client: httpx.Client, url: str, payload: dict) -> None:
+    """Advisory wake-up of a registered worker; failure only delays its next pull."""
+    response = client.post(url, json=payload, headers={"x-collab-wake": "1"})
+    if response.status_code >= 400:
+        raise OSError(f"Wake delivery failed: {response.status_code}")
 
 
 def create_app(config: AppConfig) -> FastAPI:
@@ -280,9 +365,18 @@ def create_app(config: AppConfig) -> FastAPI:
         app.state.planning = PlanService(database, budgets=app.state.budgets)
         app.state.queue = QueueService(database,
                                        heartbeat_timeout=app.state.instances.heartbeat_timeout)
+        waker = httpx.Client(timeout=httpx.Timeout(10.0, connect=3.0))
+        app.state.dispatch = DispatchService(
+            database, instances=app.state.instances, lease_ttl=config.lease_ttl,
+            push=lambda url, payload: _wake(waker, url, payload))
+        app.state.execution = ExecutionService(database, instances=app.state.instances,
+                                               lease_ttl=config.lease_ttl)
         app.state.scheduler = Scheduler(database, planning=app.state.planning,
-                                        queue=app.state.queue)
-        yield
+                                        queue=app.state.queue, dispatch=app.state.dispatch)
+        try:
+            yield
+        finally:
+            waker.close()
 
     app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None,
                   redirect_slashes=False)
@@ -507,7 +601,8 @@ def create_app(config: AppConfig) -> FastAPI:
     def register_instance(pid: str, bid: str, body: InstanceCreate, request: Request):
         with _access(request, project_id=pid, roles=MANAGERS, write=True) as access:
             instance, claim_token = app.state.instances.register_slot(
-                access, project_id=pid, binding_id=bid, node_id=body.node_id)
+                access, project_id=pid, binding_id=bid, node_id=body.node_id,
+                worker_url=body.worker_url)
             return {**asdict(instance), "claim_token": claim_token}
 
     @router.post("/projects/{pid}/agent-bindings/{bid}/instances/{iid}/disable")
@@ -548,6 +643,78 @@ def create_app(config: AppConfig) -> FastAPI:
         instance, binding = app.state.instances.describe(request.headers.get("X-Instance-Token"))
         return {**asdict(instance), "project_id": binding.project_id,
                 "binding_version": binding.version}
+
+    @router.get("/machine/instances/me/attempts")
+    def machine_attempts(request: Request):
+        attempts = app.state.execution.held_attempts(request.headers.get("X-Instance-Token"))
+        return [_attempt_view(attempt) for attempt in attempts]
+
+    @router.get("/machine/attempts/{attempt_id}/package")
+    def machine_package(attempt_id: str, request: Request):
+        payload, attempt = app.state.execution.package(
+            request.headers.get("X-Instance-Token"), attempt_id)
+        return Response(content=payload, media_type=PACKAGE_MIME,
+                        headers={"X-Input-Hash": attempt.input_hash})
+
+    @router.get("/machine/attempts/{attempt_id}/requirement")
+    def machine_requirement(attempt_id: str, request: Request):
+        payload, attempt = app.state.execution.requirement_text(
+            request.headers.get("X-Instance-Token"), attempt_id)
+        return Response(content=payload, media_type=REQUIREMENT_MIME, headers={
+            "X-Content-Hash": attempt.revision_hash, "X-Revision-Id": attempt.revision_id})
+
+    @router.get("/machine/attempts/{attempt_id}/artifacts")
+    def machine_artifacts(attempt_id: str, request: Request):
+        listed = app.state.execution.artifacts(request.headers.get("X-Instance-Token"),
+                                               attempt_id)
+        return [_artifact_view(artifact) for artifact in listed]
+
+    @router.get("/machine/attempts/{attempt_id}/artifacts/{artifact_id}")
+    def machine_artifact_download(attempt_id: str, artifact_id: str, request: Request):
+        content, artifact = app.state.execution.artifact_content(
+            request.headers.get("X-Instance-Token"), attempt_id, artifact_id)
+        return Response(content=content, media_type=artifact.media_type,
+                        headers={"X-Content-Hash": artifact.sha256})
+
+    @router.post("/machine/attempts/{attempt_id}/ack")
+    def machine_ack(attempt_id: str, body: MachineCallback, request: Request):
+        call = app.state.execution.ack(request.headers.get("X-Instance-Token"), attempt_id,
+                                       **_claims(body))
+        return _call_view(call)
+
+    @router.post("/machine/attempts/{attempt_id}/start")
+    def machine_start(attempt_id: str, body: MachineStart, request: Request):
+        call = app.state.execution.start(request.headers.get("X-Instance-Token"), attempt_id,
+                                         trace_id=body.trace_id, **_claims(body))
+        return _call_view(call)
+
+    @router.post("/machine/attempts/{attempt_id}/lease")
+    def machine_lease(attempt_id: str, body: MachineCallback, request: Request):
+        call = app.state.execution.renew_lease(request.headers.get("X-Instance-Token"),
+                                               attempt_id, **_claims(body))
+        return _call_view(call)
+
+    @router.post("/machine/attempts/{attempt_id}/artifacts", status_code=201)
+    def machine_artifact_upload(attempt_id: str, body: MachineArtifact, request: Request):
+        call = app.state.execution.put_artifact(
+            request.headers.get("X-Instance-Token"), attempt_id, name=body.name,
+            media_type=body.media_type, sha256=body.sha256,
+            content=decode_artifact(body.content), **_claims(body))
+        return _call_view(call)
+
+    @router.post("/machine/attempts/{attempt_id}/result")
+    def machine_result(attempt_id: str, body: MachineResult, request: Request):
+        call = app.state.execution.report_result(
+            request.headers.get("X-Instance-Token"), attempt_id, status=body.status,
+            summary=body.summary, artifacts=tuple(entry.model_dump() for entry in body.artifacts),
+            usage_units=body.usage_units, trace_id=body.trace_id, **_claims(body))
+        return _call_view(call)
+
+    @router.post("/machine/attempts/{attempt_id}/cancel")
+    def machine_cancel(attempt_id: str, body: MachineCancel, request: Request):
+        call = app.state.execution.cancel(request.headers.get("X-Instance-Token"), attempt_id,
+                                          reason=body.reason, **_claims(body))
+        return _call_view(call)
 
     @router.post("/projects/{pid}/requirements", status_code=201)
     def create_requirement(pid: str, body: RequirementCreate, request: Request):

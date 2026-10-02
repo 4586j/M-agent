@@ -5,7 +5,9 @@ import json
 import time
 
 from .auth import record_audit
-from .models import NotFound
+from .dispatch import DISPATCHABLE_STATUSES, TOPIC_ATTEMPT_ASSIGNED
+from .instances import AdmissionDenied
+from .models import Conflict, InvalidState, NotFound
 from .store import CollaborationStore, WORK_ITEM_QUEUE_STATUSES
 
 TOPIC_REQUIREMENT_APPROVED = "requirement.approved"
@@ -124,17 +126,22 @@ class QueueService:
 
 
 class Scheduler:
-    """Connects design events to actions: approval plans, publication queues."""
+    """Connects design events to actions: approval plans, publication queues, dispatch."""
 
-    def __init__(self, database, *, planning, queue, dispatcher=None, clock=time.time):
+    def __init__(self, database, *, planning, queue, dispatch=None, auto_dispatch: bool = False,
+                 dispatcher=None, clock=time.time):
         self.database = database
         self.planning = planning
         self.queue = queue
+        self.dispatch = dispatch
+        self.auto_dispatch = auto_dispatch
         self.clock = clock
         self.dispatcher = dispatcher if dispatcher is not None else OutboxDispatcher(
             database, clock=clock)
         self.dispatcher.register(TOPIC_REQUIREMENT_APPROVED, self._on_approved)
         self.dispatcher.register(TOPIC_PLAN_PUBLISHED, self._on_published)
+        if dispatch is not None:
+            self.dispatcher.register(TOPIC_ATTEMPT_ASSIGNED, dispatch.wake)
 
     def _on_approved(self, event) -> None:
         payload = json.loads(event.payload)
@@ -148,7 +155,23 @@ class Scheduler:
         # rejects a corrupt payload so it defers with a recorded error.
         json.loads(event.payload)
 
+    def _dispatch_ready(self, project_id: str | None) -> int:
+        """Push every dispatchable item once; refusals stay queued for the next tick."""
+        dispatched = 0
+        listed = CollaborationStore(self.database).pending_work_items(project_id)
+        for item in listed:
+            if item.status not in DISPATCHABLE_STATUSES:
+                continue
+            try:
+                self.dispatch.dispatch(item.project_id, item.work_item_id)
+            except (AdmissionDenied, Conflict, InvalidState):
+                continue
+            dispatched += 1
+        return dispatched
+
     def tick(self, project_id: str | None = None) -> dict:
         delivery = self.dispatcher.dispatch_once(project_id=project_id)
         queue = self.queue.advance(project_id=project_id)
+        if self.dispatch is not None and self.auto_dispatch:
+            queue["attempts_dispatched"] = self._dispatch_ready(project_id)
         return {**delivery, **queue}

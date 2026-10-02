@@ -8,7 +8,7 @@ from typing import Iterator
 from .models import SchemaVersionError
 
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 _SCHEMA_STATEMENTS = (
     """
@@ -578,6 +578,255 @@ _PLANNING_SCHEMA = (
     """,
 )
 
+_EXECUTION_SCHEMA = (
+    """
+    ALTER TABLE execution_instances ADD COLUMN worker_url TEXT
+        CHECK(worker_url IS NULL OR (length(worker_url)<=512
+              AND (worker_url LIKE 'http://%' OR worker_url LIKE 'https://%')))
+    """,
+    """
+    ALTER TABLE execution_instances ADD COLUMN control_epoch INTEGER NOT NULL DEFAULT 1
+        CHECK(control_epoch>=1)
+    """,
+    """
+    CREATE TABLE attempts (
+        attempt_id TEXT NOT NULL PRIMARY KEY,
+        project_id TEXT NOT NULL,
+        work_item_id TEXT NOT NULL,
+        plan_id TEXT NOT NULL,
+        requirement_id TEXT NOT NULL,
+        revision_id TEXT NOT NULL,
+        revision_hash TEXT NOT NULL CHECK(length(revision_hash)=64),
+        instance_id TEXT NOT NULL,
+        binding_id TEXT NOT NULL,
+        binding_version INTEGER NOT NULL CHECK(binding_version>0),
+        assignee_user_id TEXT NOT NULL,
+        number INTEGER NOT NULL CHECK(number>=1),
+        schema_version TEXT NOT NULL CHECK(length(trim(schema_version))>0),
+        input_hash TEXT NOT NULL CHECK(length(input_hash)=64),
+        package_json TEXT NOT NULL CHECK(length(trim(package_json))>0),
+        status TEXT NOT NULL DEFAULT 'assigned'
+            CHECK(status IN ('assigned','acked','running','submitted','accepted',
+                             'changes_requested','failed','cancelled',
+                             'reconciliation_required')),
+        lease_epoch INTEGER NOT NULL DEFAULT 1 CHECK(lease_epoch>=1),
+        control_epoch INTEGER NOT NULL DEFAULT 1 CHECK(control_epoch>=1),
+        lease_expires_at REAL NOT NULL,
+        usage_units INTEGER NOT NULL DEFAULT 0 CHECK(usage_units>=0),
+        result_json TEXT,
+        result_hash TEXT CHECK(result_hash IS NULL OR length(result_hash)=64),
+        trace_id TEXT,
+        version INTEGER NOT NULL DEFAULT 1 CHECK(version>0),
+        created_at REAL NOT NULL,
+        updated_at REAL NOT NULL,
+        UNIQUE (attempt_id, project_id),
+        UNIQUE (work_item_id, number),
+        FOREIGN KEY (work_item_id, plan_id, project_id)
+            REFERENCES work_items(work_item_id, plan_id, project_id),
+        FOREIGN KEY (requirement_id, project_id)
+            REFERENCES requirements(requirement_id, project_id),
+        FOREIGN KEY (revision_id, requirement_id)
+            REFERENCES requirement_revisions(revision_id, requirement_id),
+        FOREIGN KEY (project_id, assignee_user_id) REFERENCES project_members(project_id, user_id),
+        FOREIGN KEY (binding_id, project_id) REFERENCES agent_bindings(binding_id, project_id),
+        FOREIGN KEY (instance_id) REFERENCES execution_instances(instance_id)
+    )
+    """,
+    """
+    CREATE UNIQUE INDEX attempts_open_per_work_item ON attempts(work_item_id)
+        WHERE status IN ('assigned','acked','running','reconciliation_required')
+    """,
+    "CREATE INDEX attempts_work_item ON attempts(work_item_id)",
+    "CREATE INDEX attempts_instance ON attempts(instance_id,status)",
+    """
+    CREATE TRIGGER attempts_identity_immutable
+    BEFORE UPDATE ON attempts
+    WHEN NEW.attempt_id<>OLD.attempt_id OR NEW.project_id<>OLD.project_id
+         OR NEW.work_item_id<>OLD.work_item_id OR NEW.plan_id<>OLD.plan_id
+         OR NEW.requirement_id<>OLD.requirement_id OR NEW.revision_id<>OLD.revision_id
+         OR NEW.revision_hash<>OLD.revision_hash OR NEW.instance_id<>OLD.instance_id
+         OR NEW.binding_id<>OLD.binding_id OR NEW.binding_version<>OLD.binding_version
+         OR NEW.assignee_user_id<>OLD.assignee_user_id OR NEW.number<>OLD.number
+         OR NEW.schema_version<>OLD.schema_version OR NEW.input_hash<>OLD.input_hash
+         OR NEW.package_json<>OLD.package_json OR NEW.created_at<>OLD.created_at
+    BEGIN
+        SELECT RAISE(ABORT, 'attempt identity is immutable');
+    END
+    """,
+    """
+    CREATE TABLE attempt_reports (
+        report_id TEXT NOT NULL PRIMARY KEY,
+        attempt_id TEXT NOT NULL,
+        project_id TEXT NOT NULL,
+        stage TEXT NOT NULL CHECK(stage IN ('ack','start','lease','artifact','result','cancel')),
+        lease_epoch INTEGER NOT NULL DEFAULT 0 CHECK(lease_epoch>=0),
+        control_epoch INTEGER NOT NULL DEFAULT 0 CHECK(control_epoch>=0),
+        input_hash TEXT NOT NULL CHECK(length(input_hash)=64),
+        payload TEXT NOT NULL,
+        accepted INTEGER NOT NULL CHECK(accepted IN (0,1)),
+        reason TEXT,
+        created_at REAL NOT NULL,
+        FOREIGN KEY (attempt_id, project_id) REFERENCES attempts(attempt_id, project_id)
+    )
+    """,
+    "CREATE INDEX attempt_reports_attempt ON attempt_reports(attempt_id)",
+    """
+    CREATE TRIGGER attempt_reports_immutable
+    BEFORE UPDATE ON attempt_reports
+    BEGIN
+        SELECT RAISE(ABORT, 'attempt reports are immutable');
+    END
+    """,
+    """
+    CREATE TRIGGER attempt_reports_no_delete
+    BEFORE DELETE ON attempt_reports
+    BEGIN
+        SELECT RAISE(ABORT, 'attempt reports are immutable');
+    END
+    """,
+    """
+    CREATE TABLE attempt_artifacts (
+        artifact_id TEXT NOT NULL PRIMARY KEY,
+        attempt_id TEXT NOT NULL,
+        project_id TEXT NOT NULL,
+        work_item_id TEXT NOT NULL,
+        name TEXT NOT NULL CHECK(length(trim(name))>0 AND length(name)<=512),
+        media_type TEXT NOT NULL CHECK(length(trim(media_type))>0 AND length(media_type)<=128),
+        size_bytes INTEGER NOT NULL CHECK(size_bytes>=0),
+        sha256 TEXT NOT NULL CHECK(length(sha256)=64),
+        content BLOB NOT NULL,
+        created_at REAL NOT NULL,
+        UNIQUE (attempt_id, name),
+        CHECK (length(content)=size_bytes),
+        FOREIGN KEY (attempt_id, project_id) REFERENCES attempts(attempt_id, project_id),
+        FOREIGN KEY (work_item_id) REFERENCES work_items(work_item_id)
+    )
+    """,
+    "CREATE INDEX attempt_artifacts_work_item ON attempt_artifacts(work_item_id)",
+    """
+    CREATE TRIGGER attempt_artifacts_immutable
+    BEFORE UPDATE ON attempt_artifacts
+    BEGIN
+        SELECT RAISE(ABORT, 'attempt artifacts are immutable');
+    END
+    """,
+    """
+    CREATE TRIGGER attempt_artifacts_no_delete
+    BEFORE DELETE ON attempt_artifacts
+    BEGIN
+        SELECT RAISE(ABORT, 'attempt artifacts are immutable');
+    END
+    """,
+    """
+    CREATE TABLE work_item_acceptance_items (
+        work_item_id TEXT NOT NULL,
+        item_id TEXT NOT NULL CHECK(length(trim(item_id))>0),
+        position INTEGER NOT NULL CHECK(position>=0),
+        PRIMARY KEY (work_item_id, item_id),
+        FOREIGN KEY (work_item_id) REFERENCES work_items(work_item_id)
+    )
+    """,
+    """
+    CREATE TABLE owner_reviews (
+        review_id TEXT NOT NULL PRIMARY KEY,
+        attempt_id TEXT NOT NULL,
+        project_id TEXT NOT NULL,
+        work_item_id TEXT NOT NULL,
+        reviewer_user_id TEXT NOT NULL,
+        decision TEXT NOT NULL CHECK(decision IN ('confirmed','changes_requested')),
+        result_hash TEXT NOT NULL CHECK(length(result_hash)=64),
+        reason TEXT NOT NULL DEFAULT '',
+        created_at REAL NOT NULL,
+        UNIQUE (attempt_id),
+        FOREIGN KEY (attempt_id, project_id) REFERENCES attempts(attempt_id, project_id),
+        FOREIGN KEY (work_item_id) REFERENCES work_items(work_item_id),
+        FOREIGN KEY (project_id, reviewer_user_id) REFERENCES project_members(project_id, user_id)
+    )
+    """,
+    """
+    CREATE TRIGGER owner_reviews_immutable
+    BEFORE UPDATE ON owner_reviews
+    BEGIN
+        SELECT RAISE(ABORT, 'owner reviews are immutable');
+    END
+    """,
+    """
+    CREATE TRIGGER owner_reviews_no_delete
+    BEFORE DELETE ON owner_reviews
+    BEGIN
+        SELECT RAISE(ABORT, 'owner reviews are immutable');
+    END
+    """,
+    """
+    CREATE TABLE security_reviews (
+        security_review_id TEXT NOT NULL PRIMARY KEY,
+        attempt_id TEXT NOT NULL,
+        project_id TEXT NOT NULL,
+        rule_key TEXT NOT NULL CHECK(length(trim(rule_key))>0 AND length(rule_key)<=128),
+        input_hash TEXT NOT NULL CHECK(length(input_hash)=64),
+        requirement_id TEXT NOT NULL,
+        revision_id TEXT NOT NULL,
+        binding_version INTEGER NOT NULL CHECK(binding_version>0),
+        tool_policy_version TEXT NOT NULL CHECK(length(tool_policy_version)=64),
+        decision TEXT NOT NULL DEFAULT 'pending'
+            CHECK(decision IN ('pending','approved','rejected')),
+        reviewer_user_id TEXT,
+        reason TEXT NOT NULL DEFAULT '',
+        expires_at REAL NOT NULL CHECK(expires_at>0),
+        version INTEGER NOT NULL DEFAULT 1 CHECK(version>0),
+        created_at REAL NOT NULL,
+        updated_at REAL NOT NULL,
+        UNIQUE (attempt_id, rule_key),
+        CHECK (decision='pending' OR reviewer_user_id IS NOT NULL),
+        FOREIGN KEY (attempt_id, project_id) REFERENCES attempts(attempt_id, project_id),
+        FOREIGN KEY (revision_id, requirement_id)
+            REFERENCES requirement_revisions(revision_id, requirement_id)
+    )
+    """,
+    "CREATE INDEX security_reviews_attempt ON security_reviews(attempt_id)",
+    """
+    CREATE TRIGGER security_reviews_identity_immutable
+    BEFORE UPDATE ON security_reviews
+    WHEN NEW.security_review_id<>OLD.security_review_id OR NEW.attempt_id<>OLD.attempt_id
+         OR NEW.project_id<>OLD.project_id OR NEW.rule_key<>OLD.rule_key
+         OR NEW.input_hash<>OLD.input_hash OR NEW.revision_id<>OLD.revision_id
+         OR NEW.binding_version<>OLD.binding_version
+         OR NEW.tool_policy_version<>OLD.tool_policy_version OR NEW.created_at<>OLD.created_at
+    BEGIN
+        SELECT RAISE(ABORT, 'security review binding is immutable');
+    END
+    """,
+    """
+    CREATE TRIGGER security_reviews_decided_once
+    BEFORE UPDATE OF decision ON security_reviews
+    WHEN OLD.decision<>'pending' AND NEW.decision<>OLD.decision
+    BEGIN
+        SELECT RAISE(ABORT, 'security review decision is final');
+    END
+    """,
+    """
+    CREATE TRIGGER security_reviews_no_delete
+    BEFORE DELETE ON security_reviews
+    BEGIN
+        SELECT RAISE(ABORT, 'security reviews are immutable');
+    END
+    """,
+    """
+    CREATE TABLE security_grants (
+        project_id TEXT NOT NULL,
+        user_id TEXT NOT NULL,
+        capability TEXT NOT NULL CHECK(capability='security:approve'),
+        status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','revoked')),
+        granted_by TEXT NOT NULL,
+        version INTEGER NOT NULL DEFAULT 1 CHECK(version>0),
+        created_at REAL NOT NULL,
+        updated_at REAL NOT NULL,
+        PRIMARY KEY (project_id, user_id, capability),
+        FOREIGN KEY (project_id, user_id) REFERENCES project_members(project_id, user_id)
+    )
+    """,
+)
+
 
 def _check_schema_version(connection: sqlite3.Connection) -> None:
     version = connection.execute("PRAGMA user_version").fetchone()[0]
@@ -654,6 +903,11 @@ class Database:
                     for statement in _PLANNING_SCHEMA:
                         connection.execute(statement)
                     version = 5
+                    migrated = True
+                if version == 5:
+                    for statement in _EXECUTION_SCHEMA:
+                        connection.execute(statement)
+                    version = 6
                     migrated = True
                 if migrated:
                     connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")

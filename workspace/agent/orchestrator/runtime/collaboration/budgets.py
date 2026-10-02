@@ -35,15 +35,44 @@ class BudgetService:
                 problems.append(f"budget_exceeded:{scope}")
         return problems
 
+    def _entries(self, store, *, project_id: str, requirement_id: str, ref_type: str,
+                 ref_key: str, kind: str, delta_units: int, created_at: float) -> None:
+        if delta_units == 0:
+            return
+        for scope, ref_id in self._scopes(project_id, requirement_id):
+            store.add_budget_entry(scope, ref_id, ref_type=ref_type, ref_key=ref_key,
+                                   kind=kind, delta_units=delta_units, created_at=created_at)
+
     def reserve(self, store, *, project_id: str, requirement_id: str, plan_id: str, amount: int,
                 created_at: float) -> None:
         if type(amount) is not int or amount < 0:
             raise ValidationError("Invalid budget reservation")
-        if amount == 0:
-            return
-        for scope, ref_id in self._scopes(project_id, requirement_id):
-            store.add_budget_entry(scope, ref_id, ref_type="plan", ref_key=plan_id,
-                                   kind="reserve", delta_units=amount, created_at=created_at)
+        self._entries(store, project_id=project_id, requirement_id=requirement_id,
+                      ref_type="plan", ref_key=plan_id, kind="reserve",
+                      delta_units=amount, created_at=created_at)
+
+    def settle(self, store, *, project_id: str, requirement_id: str, attempt_id: str,
+               reserved_units: int, actual_units: int, created_at: float) -> None:
+        """Charge one attempt's real usage against the share already reserved for it.
+
+        The entry is keyed by the attempt id, so repeated or concurrent result
+        callbacks adjust the books exactly once.
+        """
+        for name, value in (("reserved_units", reserved_units), ("actual_units", actual_units)):
+            if type(value) is not int or value < 0:
+                raise ValidationError(f"Invalid {name}")
+        self._entries(store, project_id=project_id, requirement_id=requirement_id,
+                      ref_type="attempt", ref_key=attempt_id, kind="settle",
+                      delta_units=actual_units - reserved_units, created_at=created_at)
+
+    def release(self, store, *, project_id: str, requirement_id: str, attempt_id: str,
+                reserved_units: int, created_at: float) -> None:
+        """Give an unspent reservation back after a cancelled attempt, once per attempt."""
+        if type(reserved_units) is not int or reserved_units <= 0:
+            raise ValidationError("Invalid released amount")
+        self._entries(store, project_id=project_id, requirement_id=requirement_id,
+                      ref_type="attempt", ref_key=attempt_id, kind="release",
+                      delta_units=-reserved_units, created_at=created_at)
 
     @classmethod
     def account_payload(cls, store, account) -> dict:

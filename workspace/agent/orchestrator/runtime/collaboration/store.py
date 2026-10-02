@@ -10,16 +10,23 @@ from uuid import uuid4
 
 from .database import Database
 from .models import (
-    Agent, AgentProjectBinding, BudgetAccount, BudgetEntry, Conflict, ExecutionInstance,
-    ExecutionNode, InvalidState, NotFound, OutboxEvent, Plan, POST_APPROVAL_STATUSES, Project,
-    ProjectMember, Requirement, RequirementMessage, RequirementReview, RequirementRevision,
-    RevisionAcceptanceItem, User, ValidationError, WorkItem, WorkItemDependency,
+    Agent, AgentProjectBinding, ATTEMPT_STATUSES, Attempt, AttemptArtifact, AttemptReport,
+    BudgetAccount,
+    BudgetEntry, Conflict, ExecutionInstance, ExecutionNode, InvalidState, NotFound, OutboxEvent,
+    OPEN_ATTEMPT_STATUSES, OwnerReview, Plan, POST_APPROVAL_STATUSES, Project, ProjectMember,
+    Requirement,
+    RequirementMessage, RequirementReview, RequirementRevision, REPORT_STAGES,
+    RevisionAcceptanceItem,
+    SecurityGrant, SecurityReview, User, ValidationError, WorkItem, WorkItemDependency,
 )
 
 
 REVISION_SAVE_STATUSES = ("draft", "approved", "planning_blocked")
 WORK_ITEM_QUEUE_STATUSES = ("pending_dependency", "ready", "waiting_agent")
-WORK_ITEM_ADVANCE_STATUSES = ("pending_dependency", "ready", "waiting_agent", "blocked")
+WORK_ITEM_STATUSES = (
+    "pending_dependency", "ready", "waiting_agent", "running", "awaiting_owner_review",
+    "submitted", "accepted", "changes_requested", "blocked", "failed", "cancelled",
+)
 
 
 def _text(value: str, field: str, limit: int = 512) -> str:
@@ -43,6 +50,18 @@ def _version(actual: int, expected: int) -> None:
         raise ValidationError("expected_version must be a positive integer")
     if actual != expected:
         raise Conflict("Version changed")
+
+
+def _digest(value: str, field: str) -> str:
+    if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value):
+        raise ValidationError(f"Invalid {field}")
+    return value
+
+
+def _epoch(value: int, field: str) -> int:
+    if type(value) is not int or value < 1:
+        raise ValidationError(f"Invalid {field}")
+    return value
 
 
 def _record(cls, row):
@@ -87,7 +106,8 @@ _NODE_COLUMNS = "node_id,name,status,version"
 _INSTANCE_COLUMNS = (
     "instance_id,binding_id,node_id,status,version,claim_expires_at,protocol_version,capacity,"
     "isolation_mode,isolation_attestation,isolation_verified,verified_at,workspace_ref,provider_ref,"
-    "allowed_tools,env_allowlist,created_by,created_at,claimed_at,heartbeat_at"
+    "allowed_tools,env_allowlist,created_by,created_at,claimed_at,heartbeat_at,worker_url,"
+    "control_epoch"
 )
 _REQUIREMENT_COLUMNS = (
     "requirement_id,project_id,title,requester_id,status,reviewer_id,current_revision_id,"
@@ -118,6 +138,32 @@ _OUTBOX_COLUMNS = (
 )
 _BUDGET_ACCOUNT_COLUMNS = "scope,ref_id,limit_units,version,updated_at"
 _BUDGET_ENTRY_COLUMNS = "entry_id,scope,ref_id,ref_type,ref_key,kind,delta_units,created_at"
+_ATTEMPT_COLUMNS = (
+    "attempt_id,project_id,work_item_id,plan_id,requirement_id,revision_id,revision_hash,"
+    "instance_id,binding_id,binding_version,assignee_user_id,number,schema_version,input_hash,"
+    "package_json,status,lease_epoch,control_epoch,lease_expires_at,usage_units,result_json,"
+    "result_hash,trace_id,version,created_at,updated_at"
+)
+_ATTEMPT_SELECT = ",".join(f"a.{name}" for name in _ATTEMPT_COLUMNS.split(","))
+_REPORT_COLUMNS = (
+    "report_id,attempt_id,project_id,stage,lease_epoch,control_epoch,input_hash,payload,"
+    "accepted,reason,created_at"
+)
+_ARTIFACT_COLUMNS = (
+    "artifact_id,attempt_id,project_id,work_item_id,name,media_type,size_bytes,sha256,created_at"
+)
+_OWNER_REVIEW_COLUMNS = (
+    "review_id,attempt_id,project_id,work_item_id,reviewer_user_id,decision,result_hash,reason,"
+    "created_at"
+)
+_SECURITY_REVIEW_COLUMNS = (
+    "security_review_id,attempt_id,project_id,rule_key,input_hash,requirement_id,revision_id,"
+    "binding_version,tool_policy_version,decision,reviewer_user_id,reason,expires_at,version,"
+    "created_at,updated_at"
+)
+_SECURITY_GRANT_COLUMNS = (
+    "project_id,user_id,capability,status,granted_by,version,created_at,updated_at"
+)
 
 
 class CollaborationStore:
@@ -440,16 +486,17 @@ class CollaborationStore:
             return self._binding_by_id(conn, binding_id)
 
     def create_instance(self, binding_id: str, node_id: str, *, claim_token_hash: str,
-                        claim_expires_at: float, created_by: str, created_at: float) -> ExecutionInstance:
+                        claim_expires_at: float, created_by: str, created_at: float,
+                        worker_url: str | None = None) -> ExecutionInstance:
         with self._write() as conn:
             self._active(self._binding_by_id(conn, binding_id))
             self._active(self._node(conn, node_id))
             instance_id = uuid4().hex
             conn.execute(
                 "INSERT INTO execution_instances(instance_id,binding_id,node_id,claim_token_hash,"
-                "claim_expires_at,created_by,created_at) VALUES(?,?,?,?,?,?,?)",
+                "claim_expires_at,created_by,created_at,worker_url) VALUES(?,?,?,?,?,?,?,?)",
                 (instance_id, binding_id, node_id, claim_token_hash, claim_expires_at,
-                 created_by, created_at))
+                 created_by, created_at, worker_url))
             return self._instance(conn, instance_id)
 
     def get_instance(self, project_id: str, instance_id: str) -> ExecutionInstance:
@@ -533,8 +580,11 @@ class CollaborationStore:
                 raise InvalidState("Instance is already disabled")
             if expected_version is not None:
                 _version(instance.version, expected_version)
+            # Revoking the instance advances its control epoch so attempts dispatched
+            # under the old epoch can no longer report progress.
             conn.execute(
-                "UPDATE execution_instances SET status='disabled',version=version+1 WHERE instance_id=?",
+                "UPDATE execution_instances SET status='disabled',version=version+1,"
+                "control_epoch=control_epoch+1 WHERE instance_id=?",
                 (instance_id,))
             return self._instance(conn, instance_id)
 
@@ -830,6 +880,11 @@ class CollaborationStore:
                 or any(not isinstance(value, str) or not value for value in depends_on)):
             raise ValidationError("Invalid depends_on")
         fields["depends_on"] = list(dict.fromkeys(depends_on))
+        acceptance = raw.get("acceptance_ids", [])
+        if not isinstance(acceptance, (list, tuple)):
+            raise ValidationError("Invalid acceptance_ids")
+        fields["acceptance_ids"] = list(dict.fromkeys(
+            _text(item, "acceptance item id", 128) for item in acceptance))
         return fields
 
     def create_plan(self, project_id: str, requirement_id: str, *, revision_id: str,
@@ -866,6 +921,10 @@ class CollaborationStore:
                          raw["binding_id"],
                          "pending_dependency" if raw["depends_on"] else "ready",
                          raw["estimated_units"], created_at, created_at))
+                    for position, item_id in enumerate(raw["acceptance_ids"]):
+                        conn.execute(
+                            "INSERT INTO work_item_acceptance_items(work_item_id,item_id,position) "
+                            "VALUES(?,?,?)", (work_item_id, item_id, position))
                 for raw in fields:
                     for dependency_key in raw["depends_on"]:
                         dependency_id = ids_by_key.get(dependency_key)
@@ -945,6 +1004,17 @@ class CollaborationStore:
                 "ON x.work_item_id=d.depends_on_id WHERE d.work_item_id=? AND x.status<>'accepted'",
                 (work_item_id,)).fetchone()[0]
 
+    def list_work_item_acceptance(self, work_item_id: str) -> list[tuple[str, str]]:
+        with self._read() as conn:
+            rows = conn.execute(
+                "SELECT w.item_id, r.text FROM work_item_acceptance_items w "
+                "JOIN work_items x ON x.work_item_id=w.work_item_id "
+                "JOIN plans p ON p.plan_id=x.plan_id "
+                "JOIN revision_acceptance_items r "
+                "ON r.revision_id=p.revision_id AND r.item_id=w.item_id "
+                "WHERE w.work_item_id=? ORDER BY w.position", (work_item_id,)).fetchall()
+            return [(row["item_id"], row["text"]) for row in rows]
+
     def binding_has_live_instance(self, binding_id: str, *, fresh_since: float) -> bool:
         with self._read() as conn:
             return conn.execute(
@@ -954,7 +1024,7 @@ class CollaborationStore:
 
     def advance_work_item(self, work_item_id: str, *, status: str, expected_version: int,
                           updated_at: float) -> WorkItem:
-        _choice(status, WORK_ITEM_ADVANCE_STATUSES, "status")
+        _choice(status, WORK_ITEM_STATUSES, "status")
         with self._write() as conn:
             item = self._work_item(conn, work_item_id)
             _version(item.version, expected_version)
@@ -1113,3 +1183,349 @@ class CollaborationStore:
             return [_record(BudgetEntry, row) for row in conn.execute(
                 f"SELECT {_BUDGET_ENTRY_COLUMNS} FROM budget_entries WHERE scope=? AND ref_id=? "
                 "ORDER BY created_at,rowid", (scope, ref_id))]
+
+    # --- execution attempts -----------------------------------------------------
+
+    def _attempt_row(self, conn, attempt_id: str) -> Attempt:
+        return _one(conn, Attempt,
+                    f"SELECT {_ATTEMPT_COLUMNS} FROM attempts WHERE attempt_id=?", (attempt_id,))
+
+    def create_attempt(self, project_id: str, work_item_id: str, *, plan_id: str,
+                       requirement_id: str, revision_id: str, revision_hash: str,
+                       instance_id: str, binding_id: str, binding_version: int,
+                       assignee_user_id: str, number: int, schema_version: str, input_hash: str,
+                       package_json: str, control_epoch: int, lease_expires_at: float,
+                       created_at: float) -> Attempt:
+        _text(schema_version, "schema_version", 64)
+        _digest(revision_hash, "revision_hash")
+        _digest(input_hash, "input_hash")
+        _epoch(binding_version, "binding_version")
+        _epoch(control_epoch, "control_epoch")
+        if type(number) is not int or number < 1:
+            raise ValidationError("Invalid attempt number")
+        if not isinstance(package_json, str) or not package_json.strip():
+            raise ValidationError("Invalid task package")
+        attempt_id = uuid4().hex
+        with self._write() as conn:
+            conn.execute(
+                "INSERT INTO attempts(attempt_id,project_id,work_item_id,plan_id,requirement_id,"
+                "revision_id,revision_hash,instance_id,binding_id,binding_version,"
+                "assignee_user_id,number,schema_version,input_hash,package_json,status,"
+                "lease_epoch,control_epoch,lease_expires_at,created_at,updated_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'assigned',1,?,?,?,?)",
+                (attempt_id, project_id, work_item_id, plan_id, requirement_id, revision_id,
+                 revision_hash, instance_id, binding_id, binding_version, assignee_user_id,
+                 number, schema_version, input_hash, package_json, control_epoch,
+                 lease_expires_at, created_at, created_at))
+            return self._attempt_row(conn, attempt_id)
+
+    def get_attempt(self, project_id: str, attempt_id: str) -> Attempt:
+        with self._read() as conn:
+            attempt = self._attempt_row(conn, attempt_id)
+            if attempt.project_id != project_id:
+                raise NotFound("Resource not found")
+            return attempt
+
+    def list_attempts(self, project_id: str, work_item_id: str) -> list[Attempt]:
+        with self._read() as conn:
+            if self._work_item(conn, work_item_id).project_id != project_id:
+                raise NotFound("Resource not found")
+            return [_record(Attempt, row) for row in conn.execute(
+                f"SELECT {_ATTEMPT_COLUMNS} FROM attempts WHERE project_id=? AND work_item_id=? "
+                "ORDER BY number", (project_id, work_item_id))]
+
+    def attempts_for_instance(self, instance_id: str) -> list[Attempt]:
+        with self._read() as conn:
+            return [_record(Attempt, row) for row in conn.execute(
+                f"SELECT {_ATTEMPT_COLUMNS} FROM attempts WHERE instance_id=? "
+                "ORDER BY created_at DESC,rowid", (instance_id,))]
+
+    def open_attempt(self, work_item_id: str) -> Attempt | None:
+        placeholders = ",".join("?" * len(OPEN_ATTEMPT_STATUSES))
+        with self._read() as conn:
+            row = conn.execute(
+                f"SELECT {_ATTEMPT_COLUMNS} FROM attempts WHERE work_item_id=? "
+                f"AND status IN ({placeholders}) ORDER BY number LIMIT 1",
+                (work_item_id, *OPEN_ATTEMPT_STATUSES)).fetchone()
+            return None if row is None else _record(Attempt, row)
+
+    def next_attempt_number(self, work_item_id: str) -> int:
+        with self._read() as conn:
+            return conn.execute("SELECT COALESCE(MAX(number),0)+1 FROM attempts "
+                                "WHERE work_item_id=?", (work_item_id,)).fetchone()[0]
+
+    def bump_attempt_lease(self, attempt_id: str, *, control_epoch: int,
+                           lease_expires_at: float, updated_at: float) -> Attempt:
+        """Take over the lease: only a live attempt under the current control epoch."""
+        with self._write() as conn:
+            attempt = self._attempt_row(conn, attempt_id)
+            if attempt.control_epoch != control_epoch:
+                raise Conflict("Control epoch changed")
+            if attempt.status not in OPEN_ATTEMPT_STATUSES:
+                raise InvalidState("Attempt is no longer open")
+            conn.execute(
+                "UPDATE attempts SET lease_epoch=lease_epoch+1,lease_expires_at=?,"
+                "version=version+1,updated_at=? WHERE attempt_id=?",
+                (lease_expires_at, updated_at, attempt_id))
+            return self._attempt_row(conn, attempt_id)
+
+    def advance_attempt(self, attempt_id: str, *, status: str, expected_version: int,
+                        updated_at: float, lease_epoch: int | None = None,
+                        control_epoch: int | None = None, result_json: str | None = None,
+                        result_hash: str | None = None, usage_units: int | None = None,
+                        trace_id: str | None = None) -> Attempt:
+        _choice(status, ATTEMPT_STATUSES, "status")
+        if result_hash is not None:
+            _digest(result_hash, "result_hash")
+        if usage_units is not None and (type(usage_units) is not int or usage_units < 0):
+            raise ValidationError("Invalid usage")
+        with self._write() as conn:
+            attempt = self._attempt_row(conn, attempt_id)
+            _version(attempt.version, expected_version)
+            if lease_epoch is not None and attempt.lease_epoch != lease_epoch:
+                raise Conflict("Lease epoch changed")
+            if control_epoch is not None and attempt.control_epoch != control_epoch:
+                raise Conflict("Control epoch changed")
+            assignments = ["status=?", "version=version+1", "updated_at=?"]
+            values: list = [status, updated_at]
+            for column, value in (("result_json", result_json), ("result_hash", result_hash),
+                                  ("usage_units", usage_units), ("trace_id", trace_id)):
+                if value is not None:
+                    assignments.append(f"{column}=?")
+                    values.append(value)
+            cursor = conn.execute(
+                f"UPDATE attempts SET {','.join(assignments)} WHERE attempt_id=? AND version=?",
+                (*values, attempt_id, attempt.version))
+            if cursor.rowcount != 1:
+                raise Conflict("Version changed")
+            return self._attempt_row(conn, attempt_id)
+
+    def set_attempt_control_epoch(self, instance_id: str, control_epoch: int) -> int:
+        """Freeze the open attempts of a revoked instance so late reports cannot advance."""
+        placeholders = ",".join("?" * len(OPEN_ATTEMPT_STATUSES))
+        with self._write() as conn:
+            cursor = conn.execute(
+                f"UPDATE attempts SET control_epoch=?,version=version+1 "
+                f"WHERE instance_id=? AND status IN ({placeholders})",
+                (control_epoch, instance_id, *OPEN_ATTEMPT_STATUSES))
+            return cursor.rowcount
+
+    # --- callback reports -------------------------------------------------------
+
+    def record_attempt_report(self, attempt_id: str, *, stage: str, lease_epoch: int,
+                              control_epoch: int, input_hash: str, payload: str,
+                              accepted: bool, reason: str | None,
+                              created_at: float) -> AttemptReport:
+        _choice(stage, REPORT_STAGES, "stage")
+        _digest(input_hash, "input_hash")
+        for value, field in ((lease_epoch, "lease_epoch"), (control_epoch, "control_epoch")):
+            if type(value) is not int or value < 0:
+                raise ValidationError(f"Invalid {field}")
+        if not isinstance(payload, str) or len(payload) > 262144:
+            raise ValidationError("Invalid report payload")
+        report_id = uuid4().hex
+        with self._write() as conn:
+            attempt = self._attempt_row(conn, attempt_id)
+            conn.execute(
+                "INSERT INTO attempt_reports(report_id,attempt_id,project_id,stage,lease_epoch,"
+                "control_epoch,input_hash,payload,accepted,reason,created_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                (report_id, attempt_id, attempt.project_id, stage, lease_epoch, control_epoch,
+                 input_hash, payload, 1 if accepted else 0,
+                 None if reason is None else _text(reason, "reason", 512), created_at))
+            return _one(conn, AttemptReport,
+                        f"SELECT {_REPORT_COLUMNS} FROM attempt_reports WHERE report_id=?",
+                        (report_id,))
+
+    def list_attempt_reports(self, project_id: str, attempt_id: str) -> list[AttemptReport]:
+        with self._read() as conn:
+            self.get_attempt(project_id, attempt_id)
+            return [_record(AttemptReport, row) for row in conn.execute(
+                f"SELECT {_REPORT_COLUMNS} FROM attempt_reports WHERE attempt_id=? "
+                "ORDER BY created_at,rowid", (attempt_id,))]
+
+    # --- artifacts --------------------------------------------------------------
+
+    def add_attempt_artifact(self, attempt_id: str, *, name: str, media_type: str, content: bytes,
+                             sha256: str, created_at: float) -> AttemptArtifact:
+        _text(name, "artifact name", 512)
+        _text(media_type, "media_type", 128)
+        _digest(sha256, "sha256")
+        if not isinstance(content, bytes):
+            raise ValidationError("Artifact content must be bytes")
+        if len(content) > 32 * 1024 * 1024:
+            raise ValidationError("Artifact exceeds the maximum size")
+        if hashlib.sha256(content).hexdigest() != sha256:
+            raise ValidationError("Artifact digest mismatch")
+        artifact_id = uuid4().hex
+        with self._write() as conn:
+            attempt = self._attempt_row(conn, attempt_id)
+            conn.execute(
+                "INSERT INTO attempt_artifacts(artifact_id,attempt_id,project_id,work_item_id,"
+                "name,media_type,size_bytes,sha256,content,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (artifact_id, attempt_id, attempt.project_id, attempt.work_item_id, name,
+                 media_type, len(content), sha256, sqlite3.Binary(content), created_at))
+            return _one(conn, AttemptArtifact,
+                        f"SELECT {_ARTIFACT_COLUMNS} FROM attempt_artifacts WHERE artifact_id=?",
+                        (artifact_id,))
+
+    def get_artifact_by_name(self, attempt_id: str, name: str) -> AttemptArtifact | None:
+        with self._read() as conn:
+            row = conn.execute(
+                f"SELECT {_ARTIFACT_COLUMNS} FROM attempt_artifacts WHERE attempt_id=? AND name=?",
+                (attempt_id, name)).fetchone()
+            return None if row is None else _record(AttemptArtifact, row)
+
+    def get_artifact(self, project_id: str, artifact_id: str) -> AttemptArtifact:
+        with self._read() as conn:
+            artifact = _one(conn, AttemptArtifact,
+                            f"SELECT {_ARTIFACT_COLUMNS} FROM attempt_artifacts WHERE artifact_id=?",
+                            (artifact_id,))
+            if artifact.project_id != project_id:
+                raise NotFound("Resource not found")
+            return artifact
+
+    def get_artifact_content(self, project_id: str, artifact_id: str) -> bytes:
+        with self._read() as conn:
+            self.get_artifact(project_id, artifact_id)
+            data = conn.execute("SELECT content FROM attempt_artifacts WHERE artifact_id=?",
+                                (artifact_id,)).fetchone()[0]
+            return bytes(data)
+
+    def list_artifacts(self, project_id: str, attempt_id: str) -> list[AttemptArtifact]:
+        with self._read() as conn:
+            self.get_attempt(project_id, attempt_id)
+            return [_record(AttemptArtifact, row) for row in conn.execute(
+                f"SELECT {_ARTIFACT_COLUMNS} FROM attempt_artifacts WHERE attempt_id=? "
+                "ORDER BY name", (attempt_id,))]
+
+    # --- owner review -----------------------------------------------------------
+
+    def add_owner_review(self, attempt_id: str, *, reviewer_user_id: str, decision: str,
+                         result_hash: str, reason: str, created_at: float) -> OwnerReview:
+        _choice(decision, ("confirmed", "changes_requested"), "decision")
+        _digest(result_hash, "result_hash")
+        review_id = uuid4().hex
+        with self._write() as conn:
+            attempt = self._attempt_row(conn, attempt_id)
+            conn.execute(
+                "INSERT INTO owner_reviews(review_id,attempt_id,project_id,work_item_id,"
+                "reviewer_user_id,decision,result_hash,reason,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                (review_id, attempt_id, attempt.project_id, attempt.work_item_id, reviewer_user_id,
+                 decision, result_hash, reason, created_at))
+            return _one(conn, OwnerReview,
+                        f"SELECT {_OWNER_REVIEW_COLUMNS} FROM owner_reviews WHERE review_id=?",
+                        (review_id,))
+
+    def get_owner_review(self, attempt_id: str) -> OwnerReview | None:
+        with self._read() as conn:
+            row = conn.execute(
+                f"SELECT {_OWNER_REVIEW_COLUMNS} FROM owner_reviews WHERE attempt_id=?",
+                (attempt_id,)).fetchone()
+            return None if row is None else _record(OwnerReview, row)
+
+    # --- security gate ----------------------------------------------------------
+
+    def add_security_review(self, attempt_id: str, *, rule_key: str, requirement_id: str,
+                            revision_id: str, binding_version: int, tool_policy_version: str,
+                            expires_at: float, created_at: float) -> SecurityReview:
+        _text(rule_key, "rule_key", 128)
+        _epoch(binding_version, "binding_version")
+        _digest(tool_policy_version, "tool_policy_version")
+        if type(expires_at) not in (int, float) or expires_at <= created_at:
+            raise ValidationError("Invalid security review expiry")
+        security_review_id = uuid4().hex
+        with self._write() as conn:
+            attempt = self._attempt_row(conn, attempt_id)
+            conn.execute(
+                "INSERT INTO security_reviews(security_review_id,attempt_id,project_id,rule_key,"
+                "input_hash,requirement_id,revision_id,binding_version,tool_policy_version,"
+                "decision,reason,expires_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,"
+                "'pending','',?,?,?)",
+                (security_review_id, attempt_id, attempt.project_id, rule_key, attempt.input_hash,
+                 requirement_id, revision_id, binding_version, tool_policy_version, expires_at,
+                 created_at, created_at))
+            return self._security_review(conn, security_review_id)
+
+    def _security_review(self, conn, security_review_id: str) -> SecurityReview:
+        return _one(conn, SecurityReview,
+                    f"SELECT {_SECURITY_REVIEW_COLUMNS} FROM security_reviews "
+                    "WHERE security_review_id=?", (security_review_id,))
+
+    def security_review_by_rule(self, attempt_id: str, rule_key: str) -> SecurityReview | None:
+        with self._read() as conn:
+            row = conn.execute(
+                f"SELECT {_SECURITY_REVIEW_COLUMNS} FROM security_reviews WHERE attempt_id=? "
+                "AND rule_key=?", (attempt_id, rule_key)).fetchone()
+            return None if row is None else _record(SecurityReview, row)
+
+    def list_security_reviews(self, project_id: str, attempt_id: str) -> list[SecurityReview]:
+        with self._read() as conn:
+            self.get_attempt(project_id, attempt_id)
+            return [_record(SecurityReview, row) for row in conn.execute(
+                f"SELECT {_SECURITY_REVIEW_COLUMNS} FROM security_reviews WHERE attempt_id=? "
+                "ORDER BY rule_key", (attempt_id,))]
+
+    def get_security_review(self, project_id: str, security_review_id: str) -> SecurityReview:
+        with self._read() as conn:
+            review = self._security_review(conn, security_review_id)
+            if review.project_id != project_id:
+                raise NotFound("Resource not found")
+            return review
+
+    def decide_security_review(self, security_review_id: str, *, decision: str,
+                               reviewer_user_id: str, reason: str, expected_version: int,
+                               updated_at: float) -> SecurityReview:
+        _choice(decision, ("approved", "rejected"), "decision")
+        with self._write() as conn:
+            review = self._security_review(conn, security_review_id)
+            _version(review.version, expected_version)
+            if review.decision != "pending":
+                raise InvalidState("Security review is already decided")
+            cursor = conn.execute(
+                "UPDATE security_reviews SET decision=?,reviewer_user_id=?,reason=?,"
+                "version=version+1,updated_at=? WHERE security_review_id=? AND version=?",
+                (decision, reviewer_user_id, reason, updated_at, security_review_id,
+                 review.version))
+            if cursor.rowcount != 1:
+                raise Conflict("Version changed")
+            return self._security_review(conn, security_review_id)
+
+    def get_security_grant(self, project_id: str, user_id: str,
+                           capability: str) -> SecurityGrant | None:
+        with self._read() as conn:
+            row = conn.execute(
+                f"SELECT {_SECURITY_GRANT_COLUMNS} FROM security_grants WHERE project_id=? "
+                "AND user_id=? AND capability=?", (project_id, user_id, capability)).fetchone()
+            return None if row is None else _record(SecurityGrant, row)
+
+    def upsert_security_grant(self, project_id: str, user_id: str, *, capability: str,
+                              granted_by: str, active: bool, created_at: float,
+                              expected_version: int | None = None) -> SecurityGrant:
+        _choice(capability, ("security:approve",), "capability")
+        with self._write() as conn:
+            current = self.get_security_grant(project_id, user_id, capability)
+            if current is None:
+                if expected_version is not None:
+                    raise Conflict("Version changed")
+                conn.execute(
+                    "INSERT INTO security_grants(project_id,user_id,capability,status,granted_by,"
+                    "created_at,updated_at) VALUES(?,?,?,'active',?,?,?)",
+                    (project_id, user_id, capability, granted_by, created_at, created_at))
+            else:
+                _version(current.version, expected_version if expected_version is not None
+                         else current.version)
+                conn.execute(
+                    "UPDATE security_grants SET status=?,granted_by=?,version=version+1,"
+                    "updated_at=? WHERE project_id=? AND user_id=? AND capability=?",
+                    ("active" if active else "revoked", granted_by, created_at, project_id,
+                     user_id, capability))
+            return _one(conn, SecurityGrant,
+                        f"SELECT {_SECURITY_GRANT_COLUMNS} FROM security_grants WHERE project_id=? "
+                        "AND user_id=? AND capability=?", (project_id, user_id, capability))
+
+    def list_security_grants(self, project_id: str) -> list[SecurityGrant]:
+        with self._read() as conn:
+            return [_record(SecurityGrant, row) for row in conn.execute(
+                f"SELECT {_SECURITY_GRANT_COLUMNS} FROM security_grants WHERE project_id=? "
+                "ORDER BY user_id", (project_id,))]
