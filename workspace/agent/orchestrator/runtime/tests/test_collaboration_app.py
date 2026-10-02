@@ -1802,3 +1802,79 @@ def test_cancelling_a_requirement_and_reconciling_its_attempt_over_http(api):
     assert [(entry["scope"], entry["used_units"], entry["remaining_units"])
             for entry in accounts] == [("requirement", 0, 10)]
 
+
+def test_the_requester_signs_for_the_requirement_delivery_over_http(api):
+    project, requirement_id, plan, attempt, token = machine_attempt(api)
+    pid = project["project_id"]
+    base = f"/machine/attempts/{attempt.attempt_id}"
+    headers = {"X-Instance-Token": token}
+    wid = plan["work_items"][0]["work_item_id"]
+    actions = f"/projects/{pid}/requirements/{requirement_id}/actions"
+    delivery = f"/projects/{pid}/requirements/{requirement_id}/delivery"
+    acceptance = f"/projects/{pid}/requirements/{requirement_id}/acceptance"
+
+    reported = checked(api.send(None, "POST", base + "/result",
+                                json={**machine_claims(attempt), "status": "submitted",
+                                      "summary": "完成", "usage_units": 2}, headers=headers))
+    version = reported["attempt"]["version"]
+    checked(api.send("member", "POST", delivery_path(pid, attempt.attempt_id),
+                     json={"decision": "confirmed", "expected_version": version}))
+    item = checked(api.send("member", "GET", plans_path(project, requirement_id)
+                            + f"/{plan['plan']['plan_id']}"))["work_items"][0]
+    checked(api.send("manager", "POST", f"/projects/{pid}/work-items/{wid}/accept",
+                     json={"decision": "accepted", "expected_version": item["version"]}))
+
+    requirement = checked(api.send("member", "GET",
+                                   f"/projects/{pid}/requirements/{requirement_id}"))
+    checked(api.send("member", "POST", actions,
+                     json={"action": "restart", "expected_version": requirement["version"]}), 422)
+    checked(api.send("member", "POST", actions,
+                     json={"action": "advance", "expected_version": requirement["version"] + 5}),
+              409)
+    checked(api.send("member", "POST", actions,
+                     json={"action": "advance", "expected_version": requirement["version"] + 5}),
+              409)
+    checked(api.send("outsider", "POST", actions,
+                     json={"action": "advance", "expected_version": requirement["version"]}), 404)
+    waiting = checked(api.send("member", "POST", actions,
+                               json={"action": "advance",
+                                     "expected_version": requirement["version"]}))
+    assert waiting["status"] == "awaiting_acceptance"
+    checked(api.send("member", "POST", actions,
+                     json={"action": "advance", "expected_version": waiting["version"]}))
+    checked(api.send("outsider", "GET", delivery), 404)
+    view = checked(api.send("member", "GET", delivery))
+    assert (view["requirement"]["status"], view["acceptances"]) == ("awaiting_acceptance", [])
+    assert [(entry["key"], entry["status"], entry["attempt_number"], entry["artifacts"])
+            for entry in view["delivery"]["items"]] == [("A", "accepted", 1, [])]
+    assert view["delivery"]["items"][0]["acceptance"] == [
+        {"item_id": "AC-001", "text": "第一条验收"}]
+    assert view["delivery"]["items"][0]["result_hash"] == reported["attempt"]["result_hash"]
+
+    checked(api.send("manager", "POST", acceptance,
+                     json={"decision": "accepted", "expected_version": waiting["version"]}), 403)
+    checked(api.send("outsider", "POST", acceptance,
+                     json={"decision": "accepted", "expected_version": waiting["version"]}), 404)
+    checked(api.send("member", "POST", acceptance,
+                     json={"decision": "signed_off", "expected_version": waiting["version"]}), 422)
+    checked(api.send("member", "POST", acceptance,
+                     json={"decision": "changes_requested", "reason": "整体不满意",
+                           "expected_version": waiting["version"]}), 409)
+    done = checked(api.send("member", "POST", acceptance,
+                            json={"decision": "accepted", "expected_version": waiting["version"],
+                                  "reason": "对照原文逐条可用"}))
+    assert done["status"] == "completed"
+    signed = checked(api.send("member", "GET", delivery))["acceptances"]
+    assert [(entry["decision"], entry["reason"], entry["reviewer_user_id"])
+            for entry in signed] == [("accepted", "对照原文逐条可用",
+                                      api.identities["member"]["user"]["user_id"])]
+    assert signed[0]["evidence_hash"] == view["delivery"]["evidence_hash"]
+    replay = checked(api.send("member", "POST", acceptance,
+                              json={"decision": "accepted", "expected_version": 1}))
+    assert (replay["status"], replay["version"]) == ("completed", done["version"])
+    assert len(checked(api.send("member", "GET", delivery))["acceptances"]) == 1
+    checked(api.send("member", "POST", actions,
+                     json={"action": "advance", "expected_version": done["version"]}), 409)
+    checked(api.send("member", "POST", actions,
+                     json={"action": "cancel", "expected_version": done["version"]}), 409)
+

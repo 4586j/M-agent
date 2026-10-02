@@ -11,7 +11,7 @@ import time
 
 from .auth import Access, Forbidden, record_audit
 from .budgets import BudgetService
-from .dispatch import TOPIC_ATTEMPT_REVOKED
+from .dispatch import TOPIC_ATTEMPT_REVOKED, _canonical
 from .models import (
     ATTEMPT_TERMINAL_STATUSES, AcceptanceReview, AgentProjectBinding, Attempt, Conflict,
     InvalidState, NotFound, OwnerReview, ProjectMember, Requirement, SecurityGrant,
@@ -442,4 +442,104 @@ class ReviewService:
                                                       updated_at=now)
         record_audit(access.conn, now, access.user.user_id, f"requirement.{status}",
                      requirement_id, project_id=project_id, target_version=updated.version)
+        return updated
+
+    def delivery_bundle(self, store: CollaborationStore, project_id: str,
+                        requirement_id: str) -> dict:
+        """What the requester is asked to sign for: each item with the attempt and files behind it.
+
+        The digest covers every accepted attempt, its result and its artifact hashes, so a
+        signature is bound to one concrete bundle instead of to the word "done".
+        """
+        plan = store.published_plan(project_id, requirement_id)
+        if plan is None:
+            raise InvalidState("Requirement has no published plan")
+        entries = []
+        for item in store.list_work_items(project_id, plan.plan_id):
+            delivered = max((entry for entry in store.list_attempts(project_id, item.work_item_id)
+                             if entry.status == "accepted"), key=lambda entry: entry.number,
+                            default=None)
+            entries.append({
+                "key": item.key, "work_item_id": item.work_item_id, "title": item.title,
+                "status": item.status,
+                "acceptance": [{"item_id": item_id, "text": text} for item_id, text in
+                               store.list_work_item_acceptance(item.work_item_id)],
+                "attempt_id": None if delivered is None else delivered.attempt_id,
+                "attempt_number": None if delivered is None else delivered.number,
+                "result_hash": None if delivered is None else delivered.result_hash,
+                "artifacts": [] if delivered is None else sorted(
+                    [{"name": artifact.name, "sha256": artifact.sha256,
+                      "size_bytes": artifact.size_bytes}
+                     for artifact in store.list_artifacts(project_id, delivered.attempt_id)],
+                    key=lambda entry: (entry["name"], entry["sha256"])),
+            })
+        entries.sort(key=lambda entry: entry["key"])
+        return {"plan_id": plan.plan_id, "revision_id": plan.revision_id,
+                "evidence_hash": hashlib.sha256(
+                    _canonical({"items": entries}).encode("utf-8")).hexdigest(),
+                "items": entries}
+
+    def advance_requirement(self, access: Access, *, project_id: str, requirement_id: str,
+                            expected_version: int) -> Requirement:
+        """Re-derive the requirement's own status from what its work items actually did."""
+        self._member(access, project_id)
+        requirement = access.store.get_requirement(project_id, requirement_id)
+        _version(requirement.version, expected_version)
+        if requirement.status not in ("executing", "rework", "awaiting_acceptance"):
+            raise InvalidState("Requirement is not delivering work")
+        statuses = {entry["status"] for entry in
+                    self.delivery_bundle(access.store, project_id, requirement_id)["items"]}
+        if statuses == {"accepted"}:
+            target = "awaiting_acceptance"
+        elif statuses & set(REWORKABLE_STATUSES):
+            target = "rework"
+        else:
+            target = "executing"
+        if target == requirement.status:
+            return requirement
+        now = self.clock()
+        updated = access.store.set_requirement_status(project_id, requirement_id, status=target,
+                                                     expected_version=requirement.version,
+                                                     updated_at=now)
+        record_audit(access.conn, now, access.user.user_id, f"requirement.{target}",
+                     requirement_id, project_id=project_id, target_version=updated.version)
+        return updated
+
+    def accept_requirement(self, access: Access, *, project_id: str, requirement_id: str,
+                           decision: str, expected_version: int, reason: str = "") -> Requirement:
+        """The requester signs for the whole requirement; nobody else can speak for them.
+
+        Returning a requirement is refused until there is a carrier for the extra work: every
+        item is already accepted, so a bare "not good enough" would park the requirement in a
+        state with no way to run again.
+        """
+        verdict = _choice(decision, ACCEPT_DECISIONS, "decision")
+        explanation = self._reason(reason)
+        self._member(access, project_id)
+        requirement = access.store.get_requirement(project_id, requirement_id)
+        if requirement.requester_id != access.user.user_id:
+            raise Forbidden("Only the requester can accept or return a requirement")
+        if requirement.status == "completed":
+            if verdict == "accepted":
+                return requirement
+            raise InvalidState("A completed requirement cannot be returned")
+        if verdict == "changes_requested":
+            raise InvalidState(
+                "Returning a whole requirement needs new work to carry it; not implemented yet")
+        if requirement.status != "awaiting_acceptance":
+            raise InvalidState("Requirement is not awaiting acceptance")
+        _version(requirement.version, expected_version)
+        bundle = self.delivery_bundle(access.store, project_id, requirement_id)
+        if any(entry["status"] != "accepted" for entry in bundle["items"]):
+            raise InvalidState("Every work item must be accepted before the requirement is")
+        now = self.clock()
+        updated = access.store.set_requirement_status(project_id, requirement_id,
+                                                      status="completed",
+                                                      expected_version=requirement.version,
+                                                      updated_at=now)
+        access.store.add_requirement_acceptance(
+            project_id, requirement_id, reviewer_user_id=access.user.user_id, decision=verdict,
+            evidence_hash=bundle["evidence_hash"], reason=explanation, created_at=now)
+        record_audit(access.conn, now, access.user.user_id, "requirement.completed", requirement_id,
+                     project_id=project_id, target_version=updated.version)
         return updated

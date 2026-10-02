@@ -15,8 +15,8 @@ from .models import (
     BudgetEntry, Conflict, ExecutionInstance, ExecutionNode, InvalidState, NotFound, OutboxEvent,
     OPEN_ATTEMPT_STATUSES, OwnerReview, Plan, POST_APPROVAL_STATUSES, Project, ProjectMember,
     Requirement,
-    RequirementMessage, RequirementReview, RequirementRevision, REPORT_STAGES,
-    RevisionAcceptanceItem,
+    RequirementAcceptance, RequirementMessage, RequirementReview, RequirementRevision,
+    REPORT_STAGES, RevisionAcceptanceItem,
     SecurityGrant, SecurityReview, User, ValidationError, WorkItem, WorkItemDependency,
 )
 
@@ -27,14 +27,19 @@ WORK_ITEM_STATUSES = (
     "pending_dependency", "ready", "waiting_agent", "running", "awaiting_owner_review",
     "submitted", "accepted", "changes_requested", "blocked", "failed", "cancelled",
 )
-# A requirement only moves through a named action, never by a free write. The statuses the
-# aggregation layer has not reached yet (integrating, awaiting_acceptance, rework, paused,
-# completed) are absent on purpose: asking for one is refused instead of faking a journey.
+# A requirement only moves through a named action, never by a free write. ``integrating`` and
+# ``paused`` are absent on purpose: no integration work item or pause rule is implemented yet,
+# so asking for them is refused instead of faking a journey.
 REQUIREMENT_TRANSITIONS: dict[str, tuple[str, ...]] = {
     "planning_blocked": ("approved", "planning", "planning_blocked"),
-    "executing": ("approved", "planning", "planning_blocked"),
-    "cancelling": ("approved", "planning", "planning_blocked", "executing", "cancelling"),
-    "cancelled": ("approved", "planning", "planning_blocked", "executing", "cancelling"),
+    "executing": ("approved", "planning", "planning_blocked", "rework"),
+    "rework": ("executing", "awaiting_acceptance", "rework"),
+    "awaiting_acceptance": ("executing", "rework"),
+    "completed": ("awaiting_acceptance",),
+    "cancelling": ("approved", "planning", "planning_blocked", "executing", "rework",
+                   "awaiting_acceptance", "cancelling"),
+    "cancelled": ("approved", "planning", "planning_blocked", "executing", "rework",
+                  "awaiting_acceptance", "cancelling"),
 }
 
 
@@ -166,6 +171,10 @@ _OWNER_REVIEW_COLUMNS = (
     "created_at"
 )
 _ACCEPTANCE_REVIEW_COLUMNS = _OWNER_REVIEW_COLUMNS
+_REQUIREMENT_ACCEPTANCE_COLUMNS = (
+    "acceptance_id,project_id,requirement_id,reviewer_user_id,decision,evidence_hash,reason,"
+    "created_at"
+)
 _SECURITY_REVIEW_COLUMNS = (
     "security_review_id,attempt_id,project_id,rule_key,input_hash,requirement_id,revision_id,"
     "binding_version,tool_policy_version,decision,reviewer_user_id,reason,expires_at,version,"
@@ -1495,6 +1504,34 @@ class CollaborationStore:
                 f"SELECT {_ACCEPTANCE_REVIEW_COLUMNS} FROM acceptance_reviews WHERE project_id=? "
                 "AND work_item_id=? AND decision='changes_requested' ORDER BY created_at,rowid",
                 (project_id, work_item_id))]
+
+    def add_requirement_acceptance(self, project_id: str, requirement_id: str, *,
+                                   reviewer_user_id: str, decision: str, evidence_hash: str,
+                                   reason: str, created_at: float) -> RequirementAcceptance:
+        """One line of the requester's own verdict on the whole requirement."""
+        _choice(decision, ("accepted", "changes_requested"), "decision")
+        _digest(evidence_hash, "evidence_hash")
+        acceptance_id = uuid4().hex
+        with self._write() as conn:
+            requirement = self._requirement(conn, project_id, requirement_id)
+            conn.execute(
+                "INSERT INTO requirement_acceptance(acceptance_id,project_id,requirement_id,"
+                "reviewer_user_id,decision,evidence_hash,reason,created_at) "
+                "VALUES(?,?,?,?,?,?,?,?)",
+                (acceptance_id, requirement.project_id, requirement_id, reviewer_user_id, decision,
+                 evidence_hash, reason, created_at))
+            return _one(conn, RequirementAcceptance,
+                        f"SELECT {_REQUIREMENT_ACCEPTANCE_COLUMNS} FROM requirement_acceptance "
+                        "WHERE acceptance_id=?", (acceptance_id,))
+
+    def list_requirement_acceptances(self, project_id: str,
+                                     requirement_id: str) -> list[RequirementAcceptance]:
+        """The requester's verdicts on this requirement, oldest round first."""
+        with self._read() as conn:
+            return [_record(RequirementAcceptance, row) for row in conn.execute(
+                f"SELECT {_REQUIREMENT_ACCEPTANCE_COLUMNS} FROM requirement_acceptance "
+                "WHERE project_id=? AND requirement_id=? ORDER BY created_at,rowid",
+                (project_id, requirement_id))]
 
     # --- security gate ----------------------------------------------------------
 

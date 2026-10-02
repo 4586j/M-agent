@@ -308,6 +308,55 @@ def test_v7_migration_failure_leaves_the_file_untouched(tmp_path, monkeypatch):
     assert CollaborationStore(Database(path)).get_user("old-user").version == 1
 
 
+def make_v7_database(path):
+    """A v7 file with one business verdict already stored, so v7 -> v8 is what gets tested."""
+    make_v6_database(path)
+    with closing(sqlite3.connect(path, isolation_level=None)) as conn:
+        conn.execute("PRAGMA foreign_keys = OFF")
+        conn.execute("BEGIN IMMEDIATE")
+        for statement in database_module._DELIVERY_SCHEMA:
+            conn.execute(statement)
+        conn.execute("INSERT INTO acceptance_reviews(review_id,attempt_id,project_id,"
+                     "work_item_id,reviewer_user_id,decision,result_hash,reason,created_at) "
+                     "VALUES('old-acceptance','old-attempt','old-project','old-item','old-user',"
+                     "'accepted',?,'已核对验收项',2000.0)", ("d" * 64,))
+        conn.execute("PRAGMA user_version=7")
+        conn.commit()
+
+
+def test_v7_database_upgrades_to_v8_preserving_the_business_verdict(tmp_path):
+    path = tmp_path / "v7.sqlite3"
+    make_v7_database(path)
+    database = Database(path)
+    with pytest.raises(database_module.SchemaVersionError):
+        with database.read():
+            pytest.fail("Migration must be explicit")
+    database.initialize()
+    with database.read() as conn:
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+        assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+        tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master "
+                                                "WHERE type='table'")}
+        stored = conn.execute("SELECT decision,reason FROM acceptance_reviews "
+                              "WHERE attempt_id='old-attempt'").fetchone()
+    assert (stored["decision"], stored["reason"]) == ("accepted", "已核对验收项")
+    assert "requirement_acceptance" in tables
+
+
+def test_v8_migration_failure_leaves_the_file_untouched(tmp_path, monkeypatch):
+    path = tmp_path / "v7.sqlite3"
+    make_v7_database(path)
+    before = path.read_bytes()
+    with monkeypatch.context() as patch:
+        patch.setattr(database_module, "_FINAL_ACCEPTANCE_SCHEMA",
+                      database_module._FINAL_ACCEPTANCE_SCHEMA[:1] + ("INVALID SQL",))
+        with pytest.raises(sqlite3.OperationalError):
+            Database(path).initialize()
+    assert path.read_bytes() == before
+    Database(path).initialize()
+    assert CollaborationStore(Database(path)).get_user("old-user").version == 1
+
+
 # --- instance registration ----------------------------------------------------
 
 def test_worker_url_is_registered_and_rejects_extra_callback_targets(team):
@@ -1892,7 +1941,27 @@ def reserved_plan(team, *items):
     team.budgets.reserve(team.store, project_id=requirement.project_id,
                          requirement_id=requirement.requirement_id, plan_id=plan.plan_id,
                          amount=plan.total_units, created_at=team.clock())
-    return requirement, plan, instance, token
+    team.store.set_requirement_status(requirement.project_id, requirement.requirement_id,
+                                      status="executing", expected_version=requirement.version,
+                                      updated_at=team.clock())
+    return (team.store.get_requirement(requirement.project_id, requirement.requirement_id),
+            plan, instance, token)
+
+
+def accept_item(team, project_id, item, token, *, attempt=None, summary="已按原文实现"):
+    """Drive one item through delivery, owner confirmation and business acceptance."""
+    attempt = attempt or team.make_dispatch(requires_real_data=False).dispatch(project_id,
+                                                                              item.work_item_id)
+    reported = deliver(team, token, attempt, summary)
+    with session(team, team.owner) as access:
+        team.reviews.confirm(access, project_id=project_id,
+                             attempt_id=reported.attempt.attempt_id, decision="confirmed",
+                             expected_version=reported.attempt.version)
+    delivered = team.store.get_work_item(project_id, item.work_item_id)
+    with session(team, team.reviewer) as access:
+        team.reviews.accept(access, project_id=project_id, work_item_id=item.work_item_id,
+                            decision="accepted", expected_version=delivered.version)
+    return team.store.get_attempt(project_id, reported.attempt.attempt_id)
 
 
 def test_cancelling_a_requirement_stops_in_flight_work_and_returns_the_unspent_share(team):
@@ -2052,9 +2121,13 @@ def test_requirement_cancellation_is_limited_and_refuses_to_reopen(team):
         team.store.set_requirement_status(project_id, requirement.requirement_id,
                                          status="executing", expected_version=stopped.version,
                                          updated_at=team.clock())
-    with pytest.raises(ValidationError):
+    with pytest.raises(InvalidState):
         team.store.set_requirement_status(project_id, requirement.requirement_id,
                                          status="completed", expected_version=stopped.version,
+                                         updated_at=team.clock())
+    with pytest.raises(ValidationError):
+        team.store.set_requirement_status(project_id, requirement.requirement_id,
+                                         status="archived", expected_version=stopped.version,
                                          updated_at=team.clock())
     fresh = approved_requirement(team)
     with session(team, team.requester) as access:
@@ -2073,4 +2146,148 @@ def test_requirement_cancellation_is_limited_and_refuses_to_reopen(team):
                                             requirement_id=draft.requirement_id,
                                             expected_version=draft.version)
     assert team.store.get_requirement(project_id, draft.requirement_id).status == "draft"
+
+
+def test_the_requirement_aggregates_to_acceptance_and_the_requester_signs(team):
+    requirement, plan, _instance, token = reserved_plan(
+        team, plan_item(team, "A", estimate=5),
+        plan_item(team, "B", estimate=3, acceptance=("AC-002",)))
+    project_id, requirement_id = requirement.project_id, requirement.requirement_id
+    item_a, item_b = work_item(team, plan, "A"), work_item(team, plan, "B")
+    attempt_a = accept_item(team, project_id, item_a, token)
+
+    with session(team, team.requester) as access:
+        unchanged = team.reviews.advance_requirement(access, project_id=project_id,
+                                                    requirement_id=requirement_id,
+                                                    expected_version=requirement.version)
+        with pytest.raises(InvalidState):
+            team.reviews.accept_requirement(access, project_id=project_id,
+                                            requirement_id=requirement_id, decision="accepted",
+                                            expected_version=requirement.version)
+    assert unchanged == requirement
+    accept_item(team, project_id, item_b, token)
+    with session(team, team.requester) as access:
+        waiting = team.reviews.advance_requirement(access, project_id=project_id,
+                                                   requirement_id=requirement_id,
+                                                   expected_version=unchanged.version)
+    assert waiting.status == "awaiting_acceptance"
+    with session(team, team.requester) as access:
+        bundle = team.reviews.delivery_bundle(access.store, project_id, requirement_id)
+    assert [entry["key"] for entry in bundle["items"]] == ["A", "B"]
+    attempt_b = team.store.list_attempts(project_id, item_b.work_item_id)[0]
+    assert [(entry["attempt_id"], entry["attempt_number"], entry["result_hash"],
+             entry["artifacts"]) for entry in bundle["items"]] == [
+        (attempt_a.attempt_id, 1, attempt_a.result_hash, []),
+        (attempt_b.attempt_id, 1, attempt_b.result_hash, [])]
+    assert [entry["acceptance"] for entry in bundle["items"]] == [
+        [{"item_id": "AC-001", "text": "第一条验收"}, {"item_id": "AC-002", "text": "第二条验收"}],
+        [{"item_id": "AC-002", "text": "第二条验收"}]]
+    assert len(bundle["evidence_hash"]) == 64
+
+    outsider = team.store.create_user("局外人")
+    with session(team, outsider) as access, pytest.raises(NotFound):
+        team.reviews.accept_requirement(access, project_id=project_id,
+                                        requirement_id=requirement_id, decision="accepted",
+                                        expected_version=waiting.version)
+    with session(team, team.reviewer) as access, pytest.raises(Forbidden):
+        team.reviews.accept_requirement(access, project_id=project_id,
+                                        requirement_id=requirement_id, decision="accepted",
+                                        expected_version=waiting.version)
+    with session(team, team.requester) as access, pytest.raises(Conflict):
+        team.reviews.accept_requirement(access, project_id=project_id,
+                                        requirement_id=requirement_id, decision="accepted",
+                                        expected_version=waiting.version + 2)
+    with session(team, team.requester) as access:
+        done = team.reviews.accept_requirement(access, project_id=project_id,
+                                               requirement_id=requirement_id, decision="accepted",
+                                               expected_version=waiting.version,
+                                               reason="对照原文逐条可用")
+        with pytest.raises(InvalidState):
+            team.reviews.advance_requirement(access, project_id=project_id,
+                                             requirement_id=requirement_id,
+                                             expected_version=done.version)
+        with pytest.raises(InvalidState):
+            team.reviews.cancel_requirement(access, project_id=project_id,
+                                            requirement_id=requirement_id,
+                                            expected_version=done.version)
+    assert (done.status, done.version) == ("completed", waiting.version + 1)
+    rows = team.store.list_requirement_acceptances(project_id, requirement_id)
+    assert [(row.decision, row.reviewer_user_id, row.reason) for row in rows] == [
+        ("accepted", team.requester.user_id, "对照原文逐条可用")]
+    assert rows[0].evidence_hash == bundle["evidence_hash"]
+    assert (rows[0].project_id, rows[0].requirement_id) == (project_id, requirement_id)
+    assert audited(team, requirement_id)[-1] == "requirement.completed"
+    with session(team, team.requester) as access:
+        assert team.reviews.accept_requirement(access, project_id=project_id,
+                                               requirement_id=requirement_id, decision="accepted",
+                                               expected_version=1) == done
+        with pytest.raises(ValidationError):
+            team.reviews.accept_requirement(access, project_id=project_id,
+                                           requirement_id=requirement_id, decision="approved",
+                                           expected_version=done.version)
+    assert len(team.store.list_requirement_acceptances(project_id, requirement_id)) == 1
+    with pytest.raises(sqlite3.IntegrityError):
+        with team.database.transaction() as conn:
+            conn.execute("UPDATE requirement_acceptance SET reason='事后改写' "
+                         "WHERE acceptance_id=?", (rows[0].acceptance_id,))
+    with pytest.raises(sqlite3.IntegrityError):
+        with team.database.transaction() as conn:
+            conn.execute("DELETE FROM requirement_acceptance WHERE acceptance_id=?",
+                         (rows[0].acceptance_id,))
+
+
+def test_a_requirement_return_needs_a_carrier_while_items_can_still_come_back(team):
+    requirement, plan, _instance, token = reserved_plan(
+        team, plan_item(team, "A", estimate=5), plan_item(team, "B", estimate=3))
+    project_id, requirement_id = requirement.project_id, requirement.requirement_id
+    item_a, item_b = work_item(team, plan, "A"), work_item(team, plan, "B")
+    accept_item(team, project_id, item_a, token)
+    first_b = team.make_dispatch(requires_real_data=False).dispatch(project_id,
+                                                                    item_b.work_item_id)
+    reported = deliver(team, token, first_b, "自认完成")
+    with session(team, team.owner) as access:
+        team.reviews.confirm(access, project_id=project_id, attempt_id=reported.attempt.attempt_id,
+                             decision="changes_requested", reason="第二条验收没做",
+                             expected_version=reported.attempt.version)
+    with session(team, team.requester) as access:
+        reworking = team.reviews.advance_requirement(access, project_id=project_id,
+                                                    requirement_id=requirement_id,
+                                                    expected_version=requirement.version)
+        # 需求级退回目前没有被承载的新工作：签字前全部工作项都已 accepted 时无处可返，
+        # 而在途退回由工作项自己承载；因此拒绝而不是把需求推进一个没有出口的退回态。
+        with pytest.raises(InvalidState):
+            team.reviews.accept_requirement(access, project_id=project_id,
+                                            requirement_id=requirement_id,
+                                            decision="changes_requested",
+                                            reason="整体不合意", expected_version=reworking.version)
+    assert reworking.status == "rework"
+    assert team.store.list_requirement_acceptances(project_id, requirement_id) == []
+    with session(team, team.reviewer) as access:
+        bundle = team.reviews.delivery_bundle(access.store, project_id, requirement_id)
+    assert [entry["status"] for entry in bundle["items"]] == ["accepted", "changes_requested"]
+
+    with session(team, team.reviewer) as access:
+        team.reviews.rework(access, project_id=project_id, work_item_id=item_b.work_item_id,
+                            expected_version=team.store.get_work_item(project_id,
+                                                                       item_b.work_item_id).version)
+    accept_item(team, project_id, item_b, token)
+    with session(team, team.requester) as access:
+        again = team.reviews.advance_requirement(access, project_id=project_id,
+                                                 requirement_id=requirement_id,
+                                                 expected_version=reworking.version)
+        signed = team.reviews.accept_requirement(access, project_id=project_id,
+                                                 requirement_id=requirement_id,
+                                                 decision="accepted",
+                                                 expected_version=again.version)
+    assert (again.status, signed.status) == ("awaiting_acceptance", "completed")
+    second_b = team.store.list_attempts(project_id, item_b.work_item_id)[-1]
+    with session(team, team.reviewer) as access:
+        final = team.reviews.delivery_bundle(access.store, project_id, requirement_id)
+    assert [(entry["attempt_number"], entry["artifacts"]) for entry in final["items"]] == [
+        (1, []), (2, [])]
+    assert (final["evidence_hash"] != bundle["evidence_hash"]
+            and second_b.result_hash is not None)
+    rows = team.store.list_requirement_acceptances(project_id, requirement_id)
+    assert [(row.decision, row.evidence_hash) for row in rows] == [
+        ("accepted", final["evidence_hash"])]
 

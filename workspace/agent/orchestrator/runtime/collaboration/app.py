@@ -262,7 +262,13 @@ class AcceptanceDecision(OwnerDecision):
 
 
 class RequirementAction(Input):
-    action: Literal["cancel"]
+    action: Literal["cancel", "advance"]
+    expected_version: Version
+    reason: Annotated[str, Field(max_length=2048)] = ""
+
+
+class RequirementAcceptanceCreate(Input):
+    decision: Literal["accepted", "changes_requested"]
     expected_version: Version
     reason: Annotated[str, Field(max_length=2048)] = ""
 
@@ -855,11 +861,35 @@ def create_app(config: AppConfig) -> FastAPI:
 
     @router.post("/projects/{pid}/requirements/{rid}/actions")
     def requirement_action(pid: str, rid: str, body: RequirementAction, request: Request):
-        """Controlled requirement moves: today only cancelling a requirement is offered."""
+        """Controlled requirement moves: re-derive progress from the work items, or cancel."""
         with _access(request, project_id=pid, write=True) as access:
-            requirement = app.state.reviews.cancel_requirement(
-                access, project_id=pid, requirement_id=rid, reason=body.reason,
-                expected_version=body.expected_version)
+            if body.action == "advance":
+                requirement = app.state.reviews.advance_requirement(
+                    access, project_id=pid, requirement_id=rid,
+                    expected_version=body.expected_version)
+            else:
+                requirement = app.state.reviews.cancel_requirement(
+                    access, project_id=pid, requirement_id=rid, reason=body.reason,
+                    expected_version=body.expected_version)
+            return asdict(requirement)
+
+    @router.get("/projects/{pid}/requirements/{rid}/delivery")
+    def requirement_delivery(pid: str, rid: str, request: Request):
+        """The bundle the requester signs for, plus every verdict already recorded on it."""
+        with _access(request, project_id=pid) as access:
+            requirement = access.store.get_requirement(pid, rid)
+            bundle = app.state.reviews.delivery_bundle(access.store, pid, rid)
+            return {"requirement": asdict(requirement), "delivery": bundle,
+                    "acceptances": [asdict(entry) for entry in
+                                    access.store.list_requirement_acceptances(pid, rid)]}
+
+    @router.post("/projects/{pid}/requirements/{rid}/acceptance")
+    def accept_requirement(pid: str, rid: str, body: RequirementAcceptanceCreate,
+                           request: Request):
+        with _access(request, project_id=pid, write=True) as access:
+            requirement = app.state.reviews.accept_requirement(
+                access, project_id=pid, requirement_id=rid, decision=body.decision,
+                reason=body.reason, expected_version=body.expected_version)
             return asdict(requirement)
 
     @router.post("/projects/{pid}/requirements/{rid}/plans", status_code=201)

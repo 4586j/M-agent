@@ -186,6 +186,18 @@ class RequirementReview:
 
 
 @dataclass(frozen=True)
+class RequirementAcceptance:
+    acceptance_id: str
+    project_id: str
+    requirement_id: str
+    reviewer_user_id: str
+    decision: str
+    evidence_hash: str
+    reason: str = ""
+    created_at: float = 0.0
+
+
+@dataclass(frozen=True)
 class RevisionAcceptanceItem:
     revision_id: str
     requirement_id: str

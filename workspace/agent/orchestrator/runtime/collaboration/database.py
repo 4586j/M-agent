@@ -8,7 +8,7 @@ from typing import Iterator
 from .models import SchemaVersionError
 
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 _SCHEMA_STATEMENTS = (
     """
@@ -866,6 +866,42 @@ _DELIVERY_SCHEMA = (
     """,
 )
 
+# The requester's own verdict on the whole requirement is a fourth decision, distinct from the
+# drafting review, the owner's confirmation and the business acceptance of one item. It binds to
+# a digest over the accepted attempts, so "accepted" can never mean "the workers said done".
+_FINAL_ACCEPTANCE_SCHEMA = (
+    """
+    CREATE TABLE requirement_acceptance (
+        acceptance_id TEXT NOT NULL PRIMARY KEY,
+        project_id TEXT NOT NULL,
+        requirement_id TEXT NOT NULL,
+        reviewer_user_id TEXT NOT NULL,
+        decision TEXT NOT NULL CHECK(decision IN ('accepted','changes_requested')),
+        evidence_hash TEXT NOT NULL CHECK(length(evidence_hash)=64),
+        reason TEXT NOT NULL DEFAULT '',
+        created_at REAL NOT NULL,
+        FOREIGN KEY (requirement_id, project_id) REFERENCES requirements(requirement_id, project_id),
+        FOREIGN KEY (project_id, reviewer_user_id) REFERENCES project_members(project_id, user_id)
+    )
+    """,
+    "CREATE INDEX requirement_acceptance_requirement ON requirement_acceptance(requirement_id,"
+    "created_at)",
+    """
+    CREATE TRIGGER requirement_acceptance_immutable
+    BEFORE UPDATE ON requirement_acceptance
+    BEGIN
+        SELECT RAISE(ABORT, 'requirement acceptance is immutable');
+    END
+    """,
+    """
+    CREATE TRIGGER requirement_acceptance_no_delete
+    BEFORE DELETE ON requirement_acceptance
+    BEGIN
+        SELECT RAISE(ABORT, 'requirement acceptance is immutable');
+    END
+    """,
+)
+
 
 def _check_schema_version(connection: sqlite3.Connection) -> None:
     version = connection.execute("PRAGMA user_version").fetchone()[0]
@@ -952,6 +988,11 @@ class Database:
                     for statement in _DELIVERY_SCHEMA:
                         connection.execute(statement)
                     version = 7
+                    migrated = True
+                if version == 7:
+                    for statement in _FINAL_ACCEPTANCE_SCHEMA:
+                        connection.execute(statement)
+                    version = 8
                     migrated = True
                 if migrated:
                     connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
