@@ -345,6 +345,19 @@ class OwnerReview:
 
 
 @dataclass(frozen=True)
+class AcceptanceReview:
+    review_id: str
+    attempt_id: str
+    project_id: str
+    work_item_id: str
+    reviewer_user_id: str
+    decision: str
+    result_hash: str
+    reason: str = ""
+    created_at: float = 0.0
+
+
+@dataclass(frozen=True)
 class SecurityReview:
     security_review_id: str
     attempt_id: str

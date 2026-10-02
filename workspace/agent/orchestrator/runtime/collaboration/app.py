@@ -911,10 +911,12 @@ def create_app(config: AppConfig) -> FastAPI:
         with _access(request, project_id=pid) as access:
             attempt = access.store.get_attempt(pid, aid)
             review = access.store.get_owner_review(aid)
+            accepted = access.store.get_acceptance_review(aid)
             problems = app.state.reviews.gate_problems(access.store, attempt,
                                                        now=app.state.reviews.clock())
             return {"attempt": _attempt_view(attempt),
                     "owner_review": None if review is None else asdict(review),
+                    "acceptance_review": None if accepted is None else asdict(accepted),
                     "security_reviews": [asdict(entry) for entry in
                                          access.store.list_security_reviews(pid, aid)],
                     "security_problems": problems,

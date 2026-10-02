@@ -8,7 +8,7 @@ from typing import Iterator
 from .models import SchemaVersionError
 
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 _SCHEMA_STATEMENTS = (
     """
@@ -827,6 +827,45 @@ _EXECUTION_SCHEMA = (
     """,
 )
 
+# The owner's confirmation ("this delivery is worth reading") and the reviewer's business
+# acceptance ("this delivery meets the acceptance items") are two judgements on one result.
+# Acceptance used to survive only as an audit action, so its reason could not be handed to the
+# next attempt; it now gets its own immutable row beside the confirmation.
+_DELIVERY_SCHEMA = (
+    """
+    CREATE TABLE acceptance_reviews (
+        review_id TEXT NOT NULL PRIMARY KEY,
+        attempt_id TEXT NOT NULL,
+        project_id TEXT NOT NULL,
+        work_item_id TEXT NOT NULL,
+        reviewer_user_id TEXT NOT NULL,
+        decision TEXT NOT NULL CHECK(decision IN ('accepted','changes_requested')),
+        result_hash TEXT NOT NULL CHECK(length(result_hash)=64),
+        reason TEXT NOT NULL DEFAULT '',
+        created_at REAL NOT NULL,
+        UNIQUE (attempt_id),
+        FOREIGN KEY (attempt_id, project_id) REFERENCES attempts(attempt_id, project_id),
+        FOREIGN KEY (work_item_id) REFERENCES work_items(work_item_id),
+        FOREIGN KEY (project_id, reviewer_user_id) REFERENCES project_members(project_id, user_id)
+    )
+    """,
+    "CREATE INDEX acceptance_reviews_work_item ON acceptance_reviews(work_item_id)",
+    """
+    CREATE TRIGGER acceptance_reviews_immutable
+    BEFORE UPDATE ON acceptance_reviews
+    BEGIN
+        SELECT RAISE(ABORT, 'acceptance reviews are immutable');
+    END
+    """,
+    """
+    CREATE TRIGGER acceptance_reviews_no_delete
+    BEFORE DELETE ON acceptance_reviews
+    BEGIN
+        SELECT RAISE(ABORT, 'acceptance reviews are immutable');
+    END
+    """,
+)
+
 
 def _check_schema_version(connection: sqlite3.Connection) -> None:
     version = connection.execute("PRAGMA user_version").fetchone()[0]
@@ -908,6 +947,11 @@ class Database:
                     for statement in _EXECUTION_SCHEMA:
                         connection.execute(statement)
                     version = 6
+                    migrated = True
+                if version == 6:
+                    for statement in _DELIVERY_SCHEMA:
+                        connection.execute(statement)
+                    version = 7
                     migrated = True
                 if migrated:
                     connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")

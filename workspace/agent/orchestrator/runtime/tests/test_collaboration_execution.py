@@ -255,6 +255,59 @@ def test_v6_migration_failure_leaves_the_file_untouched(tmp_path, monkeypatch):
     assert CollaborationStore(Database(path)).get_user("old-user").version == 1
 
 
+def make_v6_database(path):
+    """A v6 file with one reported attempt, so the v6 -> v7 step is what gets tested."""
+    make_v5_database(path)
+    with closing(sqlite3.connect(path, isolation_level=None)) as conn:
+        conn.execute("PRAGMA foreign_keys = OFF")
+        conn.execute("BEGIN IMMEDIATE")
+        for statement in database_module._EXECUTION_SCHEMA:
+            conn.execute(statement)
+        conn.execute("INSERT INTO attempts(attempt_id,project_id,work_item_id,plan_id,"
+                     "requirement_id,revision_id,revision_hash,instance_id,binding_id,"
+                     "binding_version,assignee_user_id,number,schema_version,input_hash,"
+                     "package_json,status,result_hash,lease_expires_at,created_at,updated_at) "
+                     "VALUES('old-attempt','old-project','old-item','old-plan','old-requirement',"
+                     "'old-revision',?,'old-instance','old-binding',1,'old-user',1,'package-v1',"
+                     "?,'old-package-json','submitted',?,2000.0,1.0,1.0)",
+                     ("a" * 64, "b" * 64, "c" * 64))
+        conn.execute("PRAGMA user_version=6")
+        conn.commit()
+
+
+def test_v6_database_upgrades_to_v7_preserving_the_reported_attempt(tmp_path):
+    path = tmp_path / "v6.sqlite3"
+    make_v6_database(path)
+    database = Database(path)
+    with pytest.raises(database_module.SchemaVersionError):
+        with database.read():
+            pytest.fail("Migration must be explicit")
+    database.initialize()
+    with database.read() as conn:
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+        assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+        tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master "
+                                                "WHERE type='table'")}
+        stored = conn.execute("SELECT status,result_hash FROM attempts "
+                              "WHERE attempt_id='old-attempt'").fetchone()
+    assert stored["status"] == "submitted" and len(stored["result_hash"]) == 64
+    assert "acceptance_reviews" in tables
+
+
+def test_v7_migration_failure_leaves_the_file_untouched(tmp_path, monkeypatch):
+    path = tmp_path / "v6.sqlite3"
+    make_v6_database(path)
+    before = path.read_bytes()
+    with monkeypatch.context() as patch:
+        patch.setattr(database_module, "_DELIVERY_SCHEMA",
+                      database_module._DELIVERY_SCHEMA[:1] + ("INVALID SQL",))
+        with pytest.raises(sqlite3.OperationalError):
+            Database(path).initialize()
+    assert path.read_bytes() == before
+    Database(path).initialize()
+    assert CollaborationStore(Database(path)).get_user("old-user").version == 1
+
+
 # --- instance registration ----------------------------------------------------
 
 def test_worker_url_is_registered_and_rejects_extra_callback_targets(team):
@@ -1719,4 +1772,112 @@ def test_rework_is_project_scoped_and_rejects_outsiders(team):
     with session(team, outsider) as access, pytest.raises(NotFound):
         team.reviews.rework(access, project_id=requirement.project_id,
                             work_item_id=item.work_item_id, expected_version=item.version + 1)
+
+
+def test_acceptance_verdict_is_written_once_and_cannot_be_rewritten(team):
+    pack = delivered(team, usage_units=2)
+    project_id = pack.requirement.project_id
+    with session(team, team.worker) as access:
+        confirmed, _owner_review = team.reviews.confirm(
+            access, project_id=project_id, attempt_id=pack.attempt.attempt_id,
+            decision="confirmed", expected_version=pack.attempt.version)
+    item = team.store.get_work_item(project_id, pack.item.work_item_id)
+    with session(team, team.requester) as access, pytest.raises(Forbidden):
+        team.reviews.accept(access, project_id=project_id,
+                            work_item_id=pack.item.work_item_id, decision="accepted",
+                            expected_version=item.version)
+    with session(team, team.reviewer) as access:
+        with pytest.raises(ValidationError):
+            team.reviews.accept(access, project_id=project_id,
+                                work_item_id=pack.item.work_item_id,
+                                decision="changes_requested", expected_version=item.version)
+        assert team.reviews.acceptance_review(
+            access, project_id=project_id, attempt_id=pack.attempt.attempt_id) is None
+        final = team.reviews.accept(access, project_id=project_id,
+                                    work_item_id=pack.item.work_item_id, decision="accepted",
+                                    expected_version=item.version)
+        verdict = team.reviews.acceptance_review(
+            access, project_id=project_id, attempt_id=pack.attempt.attempt_id)
+        assert team.reviews.accept(access, project_id=project_id,
+                                   work_item_id=pack.item.work_item_id, decision="accepted",
+                                   expected_version=final.version) == final
+    assert (final.status, verdict.decision) == ("accepted", "accepted")
+    assert (verdict.reviewer_user_id, verdict.project_id) == (team.reviewer.user_id, project_id)
+    assert (verdict.work_item_id, verdict.attempt_id) == (pack.item.work_item_id,
+                                                          pack.attempt.attempt_id)
+    assert verdict.result_hash == confirmed.result_hash == pack.attempt.result_hash
+    assert verdict.reason == ""
+    with team.database.read() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM acceptance_reviews").fetchone()[0] == 1
+    assert team.store.list_returned_acceptances(project_id, pack.item.work_item_id) == []
+    with pytest.raises(Conflict):
+        team.store.add_acceptance_review(pack.attempt.attempt_id,
+                                         reviewer_user_id=team.owner.user_id,
+                                         decision="changes_requested",
+                                         result_hash="e" * 64, reason="改判",
+                                         created_at=team.clock())
+    with pytest.raises(ValidationError):
+        team.store.add_acceptance_review("other-attempt", reviewer_user_id=team.owner.user_id,
+                                         decision="approved", result_hash="e" * 64, reason="",
+                                         created_at=team.clock())
+    with pytest.raises(sqlite3.IntegrityError):
+        with team.database.transaction() as conn:
+            conn.execute("UPDATE acceptance_reviews SET reason='事后改写' WHERE attempt_id=?",
+                         (pack.attempt.attempt_id,))
+    with pytest.raises(sqlite3.IntegrityError):
+        with team.database.transaction() as conn:
+            conn.execute("DELETE FROM acceptance_reviews WHERE attempt_id=?",
+                         (pack.attempt.attempt_id,))
+
+
+def test_an_acceptance_return_names_the_missed_item_for_the_next_attempt(team):
+    pack = delivered(team, usage_units=2)
+    project_id = pack.requirement.project_id
+    execution = team.make_execution()
+    with session(team, team.worker) as access:
+        confirmed, _review = team.reviews.confirm(
+            access, project_id=project_id, attempt_id=pack.attempt.attempt_id,
+            decision="confirmed", expected_version=pack.attempt.version)
+    item = team.store.get_work_item(project_id, pack.item.work_item_id)
+    with session(team, team.reviewer) as access:
+        returned = team.reviews.accept(access, project_id=project_id,
+                                       work_item_id=pack.item.work_item_id,
+                                       decision="changes_requested", reason="验收项二缺测试",
+                                       expected_version=item.version)
+        requeued = team.reviews.rework(access, project_id=project_id,
+                                       work_item_id=pack.item.work_item_id,
+                                       expected_version=returned.version)
+    assert (returned.status, requeued.status) == ("changes_requested", "ready")
+    assert team.store.get_attempt(project_id, pack.attempt.attempt_id) == confirmed
+
+    second = team.make_dispatch(requires_real_data=False).dispatch(project_id,
+                                                                   pack.item.work_item_id)
+    payload = json.loads(execution.package(pack.token, second.attempt_id)[0])
+    assert [(entry["kind"], entry["attempt_number"], entry["reason"], entry["reviewed_by"])
+            for entry in payload["rework"]] == [
+        ("acceptance", 1, "验收项二缺测试", team.reviewer.user_id)]
+    assert (second.number, second.input_hash != pack.attempt.input_hash) == (2, True)
+
+
+def test_a_failed_item_retries_with_the_package_already_frozen(team):
+    # 失败回传没有人工裁定可传达：重试任务包保持原样，已发放的安全放行继续有效。
+    requirement, _plan, item, _instance, token, attempt = live_attempt(team)
+    service = team.make_execution()
+    started = service.start(token, attempt.attempt_id, **claims(attempt))
+    service.report_result(token, attempt.attempt_id, status="failed", summary="依赖缺失",
+                          usage_units=1, **claims(started.attempt))
+    assert team.store.get_work_item(requirement.project_id,
+                                    item.work_item_id).status == "failed"
+    with session(team, team.reviewer) as access:
+        moved = team.store.get_work_item(requirement.project_id, item.work_item_id)
+        requeued = team.reviews.rework(access, project_id=requirement.project_id,
+                                       work_item_id=item.work_item_id,
+                                       expected_version=moved.version)
+    assert requeued.status == "ready"
+    retried = team.make_dispatch(requires_real_data=False).dispatch(requirement.project_id,
+                                                                    item.work_item_id)
+    assert (retried.number, retried.input_hash) == (2, attempt.input_hash)
+    assert json.loads(service.package(token, retried.attempt_id)[0])["rework"] == []
+    assert team.store.list_returned_acceptances(requirement.project_id,
+                                                item.work_item_id) == []
 

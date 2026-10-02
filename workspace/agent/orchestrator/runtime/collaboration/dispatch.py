@@ -76,6 +76,27 @@ class DispatchService:
                                  "artifacts": artifacts})
         return sorted(dependencies, key=lambda entry: entry["key"])
 
+    def _rework_notes(self, store, project_id: str, work_item_id: str) -> list[dict]:
+        """Every human return for this item, in the order the rounds actually happened.
+
+        Both the owner's confirmation and the business acceptance can send a delivery back,
+        and the person executing the next attempt has to see which of the two said what. The
+        attempt number orders the notes because a clock can hand two reviewers the same second.
+        """
+        notes = []
+        for kind, entries in (("owner_confirmation", store.list_returned_reviews(project_id,
+                                                                                work_item_id)),
+                              ("acceptance", store.list_returned_acceptances(project_id,
+                                                                             work_item_id))):
+            for entry in entries:
+                notes.append({"kind": kind, "attempt_id": entry.attempt_id,
+                              "attempt_number": store.get_attempt(project_id,
+                                                                   entry.attempt_id).number,
+                              "reason": entry.reason, "reviewed_by": entry.reviewer_user_id,
+                              "reviewed_at": entry.created_at})
+        return sorted(notes, key=lambda note: (note["reviewed_at"], note["attempt_number"],
+                                               note["kind"]))
+
     def package_core(self, store, project_id: str, work_item_id: str) -> tuple[str, str]:
         """Freeze the inputs of a dispatch; the digest covers everything but identity."""
         item, plan, requirement, revision, binding = self._state(store, project_id, work_item_id)
@@ -103,9 +124,7 @@ class DispatchService:
             "dependencies": self._dependencies(store, project_id, plan.plan_id, item.work_item_id),
             # What a human already sent back for this item: the next attempt is told which
             # acceptance item missed instead of being asked to guess from the same original.
-            "rework": [{"attempt_id": review.attempt_id, "reason": review.reason,
-                        "reviewed_by": review.reviewer_user_id, "reviewed_at": review.created_at}
-                       for review in store.list_returned_reviews(project_id, item.work_item_id)],
+            "rework": self._rework_notes(store, project_id, item.work_item_id),
             "policy": {
                 "binding_id": binding.binding_id, "binding_version": binding.version,
                 "duty": binding.duty, "persona_version": binding.persona_version,

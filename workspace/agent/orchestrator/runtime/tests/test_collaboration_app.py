@@ -1707,3 +1707,37 @@ def test_the_rework_route_returns_a_returned_item_and_informs_the_next_attempt(a
     assert (old["attempt"]["status"], old["owner_review"]["reason"]) == (
         "changes_requested", "第二条验收未满足")
 
+
+def test_a_business_return_is_kept_and_reaches_the_next_attempt(api):
+    seen = delivered(api)
+    pid = seen.project["project_id"]
+    wid = seen.plan["work_items"][0]["work_item_id"]
+    delivery = delivery_path(pid, seen.attempt.attempt_id)
+    accept = f"/projects/{pid}/work-items/{wid}/accept"
+    checked(api.send("member", "POST", delivery,
+                     json={"decision": "confirmed",
+                           "expected_version": seen.reported["version"]}))
+    assert checked(api.send("member", "GET", delivery))["acceptance_review"] is None
+    version = checked(api.send("manager", "GET", plans_path(seen.project, seen.requirement_id)
+                               + f"/{seen.plan['plan']['plan_id']}"))["work_items"][0]["version"]
+    returned = checked(api.send("manager", "POST", accept,
+                                json={"decision": "changes_requested", "reason": "验收项二缺测试",
+                                      "expected_version": version}))
+    assert (returned["status"], returned["version"]) == ("changes_requested", version + 1)
+
+    verdict = checked(api.send("member", "GET", delivery))["acceptance_review"]
+    assert (verdict["decision"], verdict["attempt_id"], verdict["result_hash"]) == (
+        "changes_requested", seen.attempt.attempt_id, seen.reported["result_hash"])
+    assert (verdict["project_id"], verdict["work_item_id"], verdict["reason"]) == (
+        pid, wid, "验收项二缺测试")
+    assert verdict["reviewer_user_id"] == api.identities["manager"]["user"]["user_id"]
+
+    queued = checked(api.send("manager", "POST", f"/projects/{pid}/work-items/{wid}/rework",
+                              json={"expected_version": returned["version"]}))
+    assert queued["status"] == "ready"
+    second = checked(api.send("manager", "POST", dispatch_path(pid, wid)))
+    payload = checked(api.send(None, "GET", f"/machine/attempts/{second['attempt_id']}/package",
+                               headers={"X-Instance-Token": seen.token}))
+    assert [(entry["kind"], entry["attempt_number"], entry["reason"])
+            for entry in payload["rework"]] == [("acceptance", 1, "验收项二缺测试")]
+

@@ -12,13 +12,18 @@ import time
 from .auth import Access, Forbidden, record_audit
 from .dispatch import TOPIC_ATTEMPT_REVOKED
 from .models import (
-    ATTEMPT_TERMINAL_STATUSES, AgentProjectBinding, Attempt, Conflict, InvalidState, NotFound,
-    OwnerReview, ProjectMember, SecurityGrant, SecurityReview, ValidationError, WorkItem,
+    ATTEMPT_TERMINAL_STATUSES, AcceptanceReview, AgentProjectBinding, Attempt, Conflict,
+    InvalidState, NotFound, OwnerReview, ProjectMember, SecurityGrant, SecurityReview,
+    ValidationError, WorkItem,
 )
 from .store import CollaborationStore, _choice, _text, _version
 
 CAPABILITY = "security:approve"
 CONFIRM_DECISIONS = ("confirmed", "changes_requested")
+ACCEPT_DECISIONS = ("accepted", "changes_requested")
+# Both of these send a work item back to the queue: a returned delivery carries its note to
+# the next attempt, while a failed one is retried with the very same frozen inputs.
+REWORKABLE_STATUSES = ("changes_requested", "failed")
 SECURITY_DECISIONS = ("approved", "rejected")
 MAX_REASON_CHARS = 2048
 MAX_RULE_KEY_CHARS = 128
@@ -231,8 +236,12 @@ class ReviewService:
 
     def accept(self, access: Access, *, project_id: str, work_item_id: str, decision: str,
                expected_version: int, reason: str = "") -> WorkItem:
-        """Business verdict on a confirmed delivery; only accepted output feeds downstream."""
-        verdict = _choice(decision, ("accepted", "changes_requested"), "decision")
+        """Business verdict on a confirmed delivery; only accepted output feeds downstream.
+
+        The verdict is kept per attempt as immutable evidence, because a returned delivery has
+        to tell the next attempt which acceptance item missed, not merely that it changed.
+        """
+        verdict = _choice(decision, ACCEPT_DECISIONS, "decision")
         explanation = self._reason(reason)
         if verdict == "changes_requested" and not explanation.strip():
             raise ValidationError("A returned delivery must name the acceptance item it missed")
@@ -243,26 +252,40 @@ class ReviewService:
             raise InvalidState("Work item is not awaiting acceptance")
         _version(item.version, expected_version)
         now = self.clock()
+        delivered = max((entry for entry in access.store.list_attempts(project_id, work_item_id)
+                         if entry.status == "accepted"), key=lambda entry: entry.number,
+                        default=None)
         updated = access.store.advance_work_item(work_item_id, status=verdict,
                                                  expected_version=expected_version,
                                                  updated_at=now)
+        if delivered is not None and delivered.result_hash is not None:
+            access.store.add_acceptance_review(
+                delivered.attempt_id, reviewer_user_id=access.user.user_id, decision=verdict,
+                result_hash=delivered.result_hash, reason=explanation, created_at=now)
         record_audit(access.conn, now, access.user.user_id, f"work_item.{verdict}",
                      work_item_id, project_id=project_id, target_version=updated.version)
         return updated
 
+    def acceptance_review(self, access: Access, *, project_id: str,
+                          attempt_id: str) -> AcceptanceReview | None:
+        self._delivery(access, project_id, attempt_id)
+        return access.store.get_acceptance_review(attempt_id)
+
     def rework(self, access: Access, *, project_id: str, work_item_id: str,
                expected_version: int) -> WorkItem:
-        """Put a returned work item back in the queue; the returned result stays as evidence.
+        """Put a returned or failed work item back in the queue; every result stays as evidence.
 
         Only a manager re-opens execution rights, and only while no attempt of the item is
-        still open, so a rework can never run two attempts of one item side by side.
+        still open, so a rework can never run two attempts of one item side by side. A failed
+        attempt is retried on unchanged inputs, so its digest and any security pass for it
+        stay valid; only a human return adds a note and therefore a new input digest.
         """
         member = self._member(access, project_id)
         if member.access_role not in MANAGER_ROLES:
             raise Forbidden("Only a project manager can re-queue a returned work item")
         item = access.store.get_work_item(project_id, work_item_id)
-        if item.status != "changes_requested":
-            raise InvalidState("Only a returned work item can be re-queued")
+        if item.status not in REWORKABLE_STATUSES:
+            raise InvalidState("Only a returned or failed work item can be re-queued")
         _version(item.version, expected_version)
         if access.store.open_attempt(work_item_id) is not None:
             raise InvalidState("An attempt of this work item is still open")

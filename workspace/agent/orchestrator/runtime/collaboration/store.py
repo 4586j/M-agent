@@ -10,8 +10,8 @@ from uuid import uuid4
 
 from .database import Database
 from .models import (
-    Agent, AgentProjectBinding, ATTEMPT_STATUSES, Attempt, AttemptArtifact, AttemptReport,
-    BudgetAccount,
+    Agent, AgentProjectBinding, ATTEMPT_STATUSES, AcceptanceReview, Attempt, AttemptArtifact,
+    AttemptReport, BudgetAccount,
     BudgetEntry, Conflict, ExecutionInstance, ExecutionNode, InvalidState, NotFound, OutboxEvent,
     OPEN_ATTEMPT_STATUSES, OwnerReview, Plan, POST_APPROVAL_STATUSES, Project, ProjectMember,
     Requirement,
@@ -156,6 +156,7 @@ _OWNER_REVIEW_COLUMNS = (
     "review_id,attempt_id,project_id,work_item_id,reviewer_user_id,decision,result_hash,reason,"
     "created_at"
 )
+_ACCEPTANCE_REVIEW_COLUMNS = _OWNER_REVIEW_COLUMNS
 _SECURITY_REVIEW_COLUMNS = (
     "security_review_id,attempt_id,project_id,rule_key,input_hash,requirement_id,revision_id,"
     "binding_version,tool_policy_version,decision,reviewer_user_id,reason,expires_at,version,"
@@ -1446,6 +1447,40 @@ class CollaborationStore:
         with self._read() as conn:
             return [_record(OwnerReview, row) for row in conn.execute(
                 f"SELECT {_OWNER_REVIEW_COLUMNS} FROM owner_reviews WHERE project_id=? "
+                "AND work_item_id=? AND decision='changes_requested' ORDER BY created_at,rowid",
+                (project_id, work_item_id))]
+
+    def add_acceptance_review(self, attempt_id: str, *, reviewer_user_id: str, decision: str,
+                              result_hash: str, reason: str,
+                              created_at: float) -> AcceptanceReview:
+        _choice(decision, ("accepted", "changes_requested"), "decision")
+        _digest(result_hash, "result_hash")
+        review_id = uuid4().hex
+        with self._write() as conn:
+            attempt = self._attempt_row(conn, attempt_id)
+            conn.execute(
+                "INSERT INTO acceptance_reviews(review_id,attempt_id,project_id,work_item_id,"
+                "reviewer_user_id,decision,result_hash,reason,created_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?)",
+                (review_id, attempt_id, attempt.project_id, attempt.work_item_id, reviewer_user_id,
+                 decision, result_hash, reason, created_at))
+            return _one(conn, AcceptanceReview,
+                        f"SELECT {_ACCEPTANCE_REVIEW_COLUMNS} FROM acceptance_reviews "
+                        "WHERE review_id=?", (review_id,))
+
+    def get_acceptance_review(self, attempt_id: str) -> AcceptanceReview | None:
+        with self._read() as conn:
+            row = conn.execute(
+                f"SELECT {_ACCEPTANCE_REVIEW_COLUMNS} FROM acceptance_reviews WHERE attempt_id=?",
+                (attempt_id,)).fetchone()
+            return None if row is None else _record(AcceptanceReview, row)
+
+    def list_returned_acceptances(self, project_id: str,
+                                  work_item_id: str) -> list[AcceptanceReview]:
+        """Acceptance verdicts that sent this work item back, oldest fix note first."""
+        with self._read() as conn:
+            return [_record(AcceptanceReview, row) for row in conn.execute(
+                f"SELECT {_ACCEPTANCE_REVIEW_COLUMNS} FROM acceptance_reviews WHERE project_id=? "
                 "AND work_item_id=? AND decision='changes_requested' ORDER BY created_at,rowid",
                 (project_id, work_item_id))]
 
