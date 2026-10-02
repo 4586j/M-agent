@@ -1310,6 +1310,22 @@ class CollaborationStore:
                 (control_epoch, instance_id, *OPEN_ATTEMPT_STATUSES))
             return cursor.rowcount
 
+    def revoke_attempt_execution_right(self, attempt_id: str, *, expected_version: int,
+                                       updated_at: float) -> Attempt:
+        """Move one open attempt past its instance epoch so later reports only leave evidence."""
+        with self._write() as conn:
+            attempt = self._attempt_row(conn, attempt_id)
+            _version(attempt.version, expected_version)
+            if attempt.status not in OPEN_ATTEMPT_STATUSES:
+                raise InvalidState("Attempt is no longer open")
+            cursor = conn.execute(
+                "UPDATE attempts SET control_epoch=control_epoch+1,version=version+1,"
+                "updated_at=? WHERE attempt_id=? AND version=?",
+                (updated_at, attempt_id, attempt.version))
+            if cursor.rowcount != 1:
+                raise Conflict("Version changed")
+            return self._attempt_row(conn, attempt_id)
+
     # --- callback reports -------------------------------------------------------
 
     def record_attempt_report(self, attempt_id: str, *, stage: str, lease_epoch: int,

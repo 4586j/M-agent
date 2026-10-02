@@ -18,6 +18,7 @@ from .store import CollaborationStore
 
 PACKAGE_SCHEMA_VERSION = "collab-package-v1"
 TOPIC_ATTEMPT_ASSIGNED = "attempt.assigned"
+TOPIC_ATTEMPT_REVOKED = "attempt.revoked"
 DISPATCHABLE_STATUSES = ("ready", "waiting_agent")
 REPORT_STAGES_ALLOWED = ("ack", "start", "lease", "artifact", "result", "cancel")
 

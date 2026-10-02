@@ -15,10 +15,11 @@ import time
 from typing import Any
 
 from .auth import record_audit, token_digest
+from .budgets import BudgetService
 from .instances import InstanceService
 from .models import (
-    AgentProjectBinding, Attempt, AttemptArtifact, Conflict,
-    ExecutionInstance, InvalidState, NotFound, OPEN_ATTEMPT_STATUSES, ValidationError,
+    AgentProjectBinding, Attempt, AttemptArtifact, Conflict, ExecutionInstance, InvalidState,
+    NotFound, OPEN_ATTEMPT_STATUSES, SecurityReview, ValidationError,
 )
 from .store import CollaborationStore, _digest, _epoch, _text
 
@@ -94,13 +95,14 @@ class ExecutionService:
     """Serves one attempt only to the live instance that still holds its execution right."""
 
     def __init__(self, database, *, instances: InstanceService, clock=time.time,
-                 lease_ttl: float = 120.0):
+                 lease_ttl: float = 120.0, budgets: BudgetService | None = None):
         if type(lease_ttl) not in (int, float) or not 1 <= lease_ttl <= 86400:
             raise ValidationError("Invalid lease lifetime")
         self.database = database
         self.instances = instances
         self.clock = clock
         self.lease_ttl = float(lease_ttl)
+        self.budgets = budgets if budgets is not None else BudgetService(clock=clock)
 
     # --- pull paths ------------------------------------------------------------
 
@@ -149,6 +151,14 @@ class ExecutionService:
             if _digest_of(content) != artifact.sha256 or len(content) != artifact.size_bytes:
                 raise Conflict("Artifact content does not match its recorded digest")
             return content, artifact
+
+    def security_reviews(self, instance_token: str | None,
+                         attempt_id: str) -> list[SecurityReview]:
+        """The gate records of this attempt; a pending hit means the worker must pause."""
+        with self.database.read() as conn:
+            store = CollaborationStore(self.database, connection=conn)
+            _instance, _binding, attempt = self._owned(store, instance_token, attempt_id)
+            return store.list_security_reviews(attempt.project_id, attempt.attempt_id)
 
     def held_attempts(self, instance_token: str | None) -> list[Attempt]:
         """Reconciliation view: what this instance was told to run, newest first."""
@@ -259,6 +269,8 @@ class ExecutionService:
             if item.status == "running":
                 store.advance_work_item(item.work_item_id, status=planned.work_item,
                                         expected_version=item.version, updated_at=now)
+        if planned.advance is not None and stage in ("result", "cancel"):
+            self._settle(store, current, stage, now)
         artifact = planned.record
         if planned.artifact is not None:
             artifact = store.add_attempt_artifact(current.attempt_id, created_at=now,
@@ -272,6 +284,24 @@ class ExecutionService:
         record_audit(conn, now, None, f"attempt.{stage}", current.attempt_id,
                      project_id=current.project_id, target_version=current.version)
         return Call(planned.outcome, current, artifact)
+
+    def _settle(self, store: CollaborationStore, attempt: Attempt, stage: str,
+                now: float) -> None:
+        """Move one attempt's share of the plan reservation; the attempt key makes it once-only."""
+        item = store.get_work_item(attempt.project_id, attempt.work_item_id)
+        # The plan reserved each item's estimate once, so only the first attempt spends that share.
+        reserved = item.estimated_units if attempt.number == 1 else 0
+        if stage == "result":
+            self.budgets.settle(store, project_id=attempt.project_id,
+                                requirement_id=attempt.requirement_id,
+                                attempt_id=attempt.attempt_id, reserved_units=reserved,
+                                actual_units=attempt.usage_units, created_at=now)
+        elif reserved:
+            # The worker confirmed it stopped before reporting any result: give the share back.
+            self.budgets.release(store, project_id=attempt.project_id,
+                                 requirement_id=attempt.requirement_id,
+                                 attempt_id=attempt.attempt_id, reserved_units=reserved,
+                                 created_at=now)
 
     def _record_rejection(self, attempt_id: str, stage: str, callback: Callback,
                           payload: dict, failure: _Failure) -> None:

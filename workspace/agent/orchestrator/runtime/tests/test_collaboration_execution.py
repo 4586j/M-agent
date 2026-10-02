@@ -8,6 +8,7 @@ import secrets
 import sqlite3
 import sys
 from contextlib import closing, contextmanager
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -16,10 +17,10 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from collaboration import database as database_module
-from collaboration.auth import Access, Unauthorized
+from collaboration.auth import Access, Forbidden, Unauthorized
 from collaboration.budgets import BudgetService
 from collaboration.database import Database, SCHEMA_VERSION
-from collaboration.dispatch import DispatchService, TOPIC_ATTEMPT_ASSIGNED
+from collaboration.dispatch import DispatchService, TOPIC_ATTEMPT_ASSIGNED, TOPIC_ATTEMPT_REVOKED
 from collaboration.execution import ExecutionService, decode_artifact
 from collaboration.instances import AdmissionDenied, InstanceService
 from collaboration.scheduler import OutboxDispatcher, QueueService, Scheduler
@@ -27,6 +28,7 @@ from collaboration.models import (
     Conflict, InvalidState, NotFound, SchemaVersionError, ValidationError,
 )
 from collaboration.requirements import RequirementService
+from collaboration.reviews import ReviewService, tool_policy_digest
 from collaboration.store import CollaborationStore
 
 
@@ -71,6 +73,7 @@ def team(tmp_path):
     return SimpleNamespace(
         database=database, store=store, clock=clock, budgets=BudgetService(clock=clock),
         requirements=RequirementService(clock=clock), instances=instances,
+        reviews=ReviewService(clock=clock),
         make_dispatch=lambda **kwargs: DispatchService(database, instances=instances,
                                                        clock=clock, **kwargs),
         make_execution=lambda **kwargs: ExecutionService(database, instances=instances,
@@ -117,14 +120,14 @@ def plan_item(team, key="A", *, acceptance=("AC-001", "AC-002"), estimate=4, dep
 
 
 def published_plan(team, requirement, *items):
+    candidates = list(items) or [plan_item(team)]
     return team.store.create_plan(
         requirement.project_id, requirement.requirement_id,
         revision_id=requirement.approved_revision_id,
         revision_hash=requirement.approved_revision_hash, status="published",
-        report=json.dumps({"problems": [], "item_count": len(items)}),
-        total_units=sum(item["estimated_units"] for item in items),
-        created_by=team.reviewer.user_id, created_at=team.clock(),
-        items=list(items) or [plan_item(team)])
+        report=json.dumps({"problems": [], "item_count": len(candidates)}),
+        total_units=sum(item["estimated_units"] for item in candidates),
+        created_by=team.reviewer.user_id, created_at=team.clock(), items=candidates)
 
 
 def work_item(team, plan, key="A"):
@@ -1220,3 +1223,381 @@ def test_decode_artifact_bounds_the_encoded_body():
     for rejected in ("not base64!!", "AAAA\nAAAA", "A" * (4 * ((32 * 1024 * 1024 + 2) // 3) + 9)):
         with pytest.raises(ValidationError):
             decode_artifact(rejected)
+
+
+# --- human decisions over delivered work --------------------------------------
+
+def delivered(team, *, usage_units=3, lease_ttl=120.0, reserve=False):
+    """One reported result plus the live services a responsible human decides through."""
+    requirement, plan, item, instance, token, attempt = live_attempt(
+        team, lease_ttl=lease_ttl)
+    execution = team.make_execution(budgets=team.budgets, lease_ttl=lease_ttl)
+    if reserve:
+        team.budgets.reserve(team.store, project_id=requirement.project_id,
+                             requirement_id=requirement.requirement_id, plan_id=plan.plan_id,
+                             amount=plan.total_units, created_at=team.clock())
+    started = execution.start(token, attempt.attempt_id, **claims(attempt))
+    call = execution.report_result(token, attempt.attempt_id, status="submitted", summary="完成",
+                                   usage_units=usage_units, **claims(started.attempt))
+    return SimpleNamespace(requirement=requirement, plan=plan, item=item, instance=instance,
+                           token=token, execution=execution, attempt=call.attempt)
+
+
+def booked(team, scope, ref_id):
+    return [(entry.kind, entry.delta_units)
+            for entry in team.store.list_budget_entries(scope, ref_id)]
+
+
+def test_owner_confirmation_and_business_acceptance_are_written_once(team):
+    pack = delivered(team, usage_units=3)
+    project_id = pack.requirement.project_id
+    with session(team, team.requester) as access:
+        with pytest.raises(Forbidden):
+            team.reviews.confirm(access, project_id=project_id, attempt_id=pack.attempt.attempt_id,
+                                 decision="confirmed", expected_version=pack.attempt.version)
+    with session(team, team.worker) as access:
+        accepted, review = team.reviews.confirm(
+            access, project_id=project_id, attempt_id=pack.attempt.attempt_id,
+            decision="confirmed", expected_version=pack.attempt.version)
+    assert (accepted.status, review.decision, review.reviewer_user_id) == (
+        "accepted", "confirmed", team.worker.user_id)
+    assert accepted.result_hash == pack.attempt.result_hash == review.result_hash
+    with session(team, team.worker) as access:
+        replay, same = team.reviews.confirm(
+            access, project_id=project_id, attempt_id=pack.attempt.attempt_id,
+            decision="confirmed", expected_version=accepted.version)
+        assert (replay.version, same.review_id) == (accepted.version, review.review_id)
+        assert team.reviews.owner_review(access, project_id=project_id,
+                                         attempt_id=pack.attempt.attempt_id) == review
+    with session(team, team.owner) as access:
+        with pytest.raises(Conflict):
+            team.reviews.confirm(access, project_id=project_id, attempt_id=pack.attempt.attempt_id,
+                                 decision="changes_requested", reason="换一种说法",
+                                 expected_version=accepted.version)
+    submitted = team.store.get_work_item(project_id, pack.item.work_item_id)
+    assert submitted.status == "submitted"
+    with session(team, team.reviewer) as access:
+        with pytest.raises(ValidationError):
+            team.reviews.accept(access, project_id=project_id, work_item_id=pack.item.work_item_id,
+                                decision="changes_requested", expected_version=submitted.version)
+        with pytest.raises(Conflict):
+            team.reviews.accept(access, project_id=project_id, work_item_id=pack.item.work_item_id,
+                                decision="accepted", expected_version=submitted.version + 1)
+        final = team.reviews.accept(access, project_id=project_id,
+                                    work_item_id=pack.item.work_item_id, decision="accepted",
+                                    expected_version=submitted.version)
+        assert team.reviews.accept(access, project_id=project_id,
+                                   work_item_id=pack.item.work_item_id, decision="accepted",
+                                   expected_version=final.version) == final
+        with pytest.raises(InvalidState):
+            team.reviews.cancel(access, project_id=project_id,
+                                work_item_id=pack.item.work_item_id,
+                                expected_version=final.version)
+    assert final.status == "accepted"
+    assert audited(team, pack.attempt.attempt_id)[-1] == "attempt.confirmed"
+    assert "work_item.accepted" in audited(team, pack.item.work_item_id)
+
+
+def test_returned_delivery_names_the_acceptance_item_it_missed(team):
+    pack = delivered(team, usage_units=2)
+    project_id = pack.requirement.project_id
+    with session(team, team.owner) as access:
+        returned, review = team.reviews.confirm(
+            access, project_id=project_id, attempt_id=pack.attempt.attempt_id,
+            decision="changes_requested", expected_version=pack.attempt.version,
+            reason="第二条验收没有实现")
+    assert (returned.status, review.decision) == ("changes_requested", "changes_requested")
+    assert team.store.get_work_item(project_id, pack.item.work_item_id).status == \
+        "changes_requested"
+    assert audited(team, pack.attempt.attempt_id)[-1] == "attempt.changes_requested"
+
+
+def test_decisions_refuse_work_that_is_not_delivered(team):
+    requirement, _plan, item, _instance, _token, attempt = live_attempt(team)
+    project_id = requirement.project_id
+    with session(team, team.owner) as access:
+        with pytest.raises(ValidationError):
+            team.reviews.confirm(access, project_id=project_id, attempt_id=attempt.attempt_id,
+                                 decision="approved", expected_version=attempt.version)
+        with pytest.raises(ValidationError):
+            team.reviews.confirm(access, project_id=project_id, attempt_id=attempt.attempt_id,
+                                 decision="changes_requested", expected_version=attempt.version)
+        with pytest.raises(InvalidState):
+            team.reviews.confirm(access, project_id=project_id, attempt_id=attempt.attempt_id,
+                                 decision="confirmed", expected_version=attempt.version)
+        with pytest.raises(InvalidState):
+            team.reviews.accept(access, project_id=project_id, work_item_id=item.work_item_id,
+                                decision="accepted", expected_version=item.version)
+    assert team.store.get_attempt(project_id, attempt.attempt_id).status == "assigned"
+    assert team.store.get_work_item(project_id, item.work_item_id).status == "running"
+
+
+def test_security_gate_blocks_confirmation_until_a_delegated_reviewer_passes(team):
+    pack = delivered(team)
+    project_id = pack.requirement.project_id
+    attempt = pack.attempt
+    with session(team, team.reviewer) as access:
+        with pytest.raises(Forbidden):
+            team.reviews.set_grant(access, project_id=project_id, user_id=access.user.user_id,
+                                   active=True)
+    with session(team, team.owner) as access:
+        review = team.reviews.record_rule(access, project_id=project_id,
+                                          attempt_id=attempt.attempt_id,
+                                          rule_key="dangerous_command")
+        assert team.reviews.record_rule(access, project_id=project_id,
+                                        attempt_id=attempt.attempt_id,
+                                        rule_key="dangerous_command") == review
+    assert (review.decision, review.input_hash, review.binding_version) == (
+        "pending", attempt.input_hash, attempt.binding_version)
+    assert review.tool_policy_version == tool_policy_digest(team.binding)
+    assert team.reviews.gate_problems(team.store, attempt, now=team.clock()) == [
+        "pending:dangerous_command"]
+    with session(team, team.owner) as access:
+        with pytest.raises(InvalidState):
+            team.reviews.confirm(access, project_id=project_id, attempt_id=attempt.attempt_id,
+                                 decision="confirmed", expected_version=attempt.version)
+    with session(team, team.reviewer) as access:
+        with pytest.raises(Forbidden):
+            team.reviews.decide_security(access, project_id=project_id,
+                                         security_review_id=review.security_review_id,
+                                         decision="approved", reason="已核对命令",
+                                         expected_version=review.version)
+    with session(team, team.owner) as access:
+        grant = team.reviews.set_grant(access, project_id=project_id,
+                                       user_id=team.reviewer.user_id, active=True)
+    assert grant.status == "active"
+    with session(team, team.reviewer) as access:
+        passed = team.reviews.decide_security(
+            access, project_id=project_id, security_review_id=review.security_review_id,
+            decision="approved", reason="命令只在隔离账户内执行", expected_version=review.version)
+    assert (passed.decision, passed.reviewer_user_id) == ("approved", team.reviewer.user_id)
+    assert team.reviews.gate_problems(team.store, attempt, now=team.clock()) == []
+    with session(team, team.reviewer) as access:
+        with pytest.raises(InvalidState):
+            team.reviews.decide_security(access, project_id=project_id,
+                                         security_review_id=review.security_review_id,
+                                         decision="rejected", reason="改主意",
+                                         expected_version=passed.version)
+        structural = team.reviews.record_rule(access, project_id=project_id,
+                                              attempt_id=attempt.attempt_id, rule_key="identity")
+        with pytest.raises(Forbidden):
+            team.reviews.decide_security(access, project_id=project_id,
+                                         security_review_id=structural.security_review_id,
+                                         decision="approved", reason="想放行身份规则",
+                                         expected_version=structural.version)
+        with pytest.raises(ValidationError):
+            team.reviews.decide_security(access, project_id=project_id,
+                                         security_review_id=structural.security_review_id,
+                                         decision="rejected", reason="   ",
+                                         expected_version=structural.version)
+        rejected = team.reviews.decide_security(
+            access, project_id=project_id, security_review_id=structural.security_review_id,
+            decision="rejected", reason="身份边界不能由人放行", expected_version=structural.version)
+    assert rejected.decision == "rejected"
+    assert team.reviews.gate_problems(team.store, attempt, now=team.clock()) == [
+        "rejected:identity"]
+    with session(team, team.owner) as access:
+        with pytest.raises(InvalidState):
+            team.reviews.confirm(access, project_id=project_id, attempt_id=attempt.attempt_id,
+                                 decision="confirmed", expected_version=attempt.version)
+    team.clock.advance(86400)
+    assert team.reviews.gate_problems(team.store, attempt, now=team.clock()) == [
+        "expired:dangerous_command", "rejected:identity"]
+    assert team.store.get_owner_review(attempt.attempt_id) is None
+
+
+def test_a_reviewer_can_pass_only_the_listed_rules_and_only_before_expiry(team):
+    pack = delivered(team)
+    project_id = pack.requirement.project_id
+    with pytest.raises(ValidationError):
+        ReviewService(clock=team.clock, review_ttl=5)
+    with pytest.raises(ValidationError):
+        ReviewService(clock=team.clock, review_ttl="60")
+    narrow = ReviewService(clock=team.clock, passable_rules=("external_side_effect",))
+    with session(team, team.owner) as access:
+        held = narrow.record_rule(access, project_id=project_id,
+                                  attempt_id=pack.attempt.attempt_id, rule_key="dangerous_command")
+        with pytest.raises(Forbidden):
+            narrow.decide_security(access, project_id=project_id,
+                                   security_review_id=held.security_review_id,
+                                   decision="approved", reason="白名单里没有这条",
+                                   expected_version=held.version)
+        soon = narrow.record_rule(access, project_id=project_id, attempt_id=pack.attempt.attempt_id,
+                                  rule_key="external_side_effect")
+        team.clock.advance(narrow.review_ttl + 1)
+        with pytest.raises(InvalidState):
+            narrow.decide_security(access, project_id=project_id,
+                                   security_review_id=soon.security_review_id,
+                                   decision="approved", reason="过期后不再放行",
+                                   expected_version=soon.version)
+    assert team.reviews.gate_problems(team.store, pack.attempt, now=team.clock()) == [
+        "expired:dangerous_command", "expired:external_side_effect"]
+
+
+def test_a_gate_record_that_drifted_from_the_frozen_attempt_lifts_nothing(team):
+    pack = delivered(team)
+    project_id = pack.requirement.project_id
+    with team.database.transaction() as conn:
+        conn.execute(
+            "INSERT INTO security_reviews(security_review_id,attempt_id,project_id,rule_key,"
+            "input_hash,requirement_id,revision_id,binding_version,tool_policy_version,"
+            "decision,reviewer_user_id,reason,expires_at,created_at,updated_at) "
+            "VALUES('drifted',?,?,'external_side_effect',?,?,?,?,?,'approved',?,'越权放行',"
+            "1e12,?,?)",
+            (pack.attempt.attempt_id, project_id, pack.attempt.input_hash,
+             pack.attempt.requirement_id, pack.attempt.revision_id, pack.attempt.binding_version,
+             "0" * 64, team.reviewer.user_id, team.clock(), team.clock()))
+    assert team.reviews.gate_problems(team.store, pack.attempt, now=team.clock()) == [
+        "stale:external_side_effect"]
+    with session(team, team.owner) as access:
+        with pytest.raises(InvalidState):
+            team.reviews.confirm(access, project_id=project_id,
+                                 attempt_id=pack.attempt.attempt_id, decision="confirmed",
+                                 expected_version=pack.attempt.version)
+        assert team.reviews.record_rule(access, project_id=project_id,
+                                        attempt_id=pack.attempt.attempt_id,
+                                        rule_key="external_side_effect").tool_policy_version \
+            == "0" * 64
+
+
+def test_tool_policy_digest_binds_a_pass_to_the_frozen_surface(team):
+    digest = tool_policy_digest(team.binding)
+    assert digest == tool_policy_digest(replace(team.binding,
+                                                allowed_tools=("Edit", "Read")))
+    assert digest != tool_policy_digest(replace(team.binding, duty="实现与复核"))
+    assert digest != tool_policy_digest(replace(team.binding, workspace_ref="workspace-x"))
+    assert digest != tool_policy_digest(replace(team.binding, version=team.binding.version + 1))
+
+
+def test_result_callback_settles_the_reserved_share_once(team):
+    pack = delivered(team, usage_units=3, reserve=True)
+    project_id = pack.requirement.project_id
+    assert booked(team, "project", project_id) == [("reserve", 4), ("settle", -1)]
+    assert booked(team, "requirement", pack.requirement.requirement_id) == [
+        ("reserve", 4), ("settle", -1)]
+    assert booked(team, "global", "") == [("reserve", 4), ("settle", -1)]
+    repeated = pack.execution.report_result(pack.token, pack.attempt.attempt_id,
+                                            status="submitted", summary="完成", usage_units=3,
+                                            **claims(pack.attempt))
+    assert (repeated.outcome, booked(team, "project", project_id)) == (
+        "duplicate", [("reserve", 4), ("settle", -1)])
+
+
+def test_confirmed_stop_releases_the_share_and_a_retry_pays_its_own(team):
+    requirement, plan, item, _instance, token, attempt = live_attempt(team, lease_ttl=60)
+    project_id = requirement.project_id
+    execution = team.make_execution(budgets=team.budgets, lease_ttl=60)
+    team.budgets.reserve(team.store, project_id=project_id,
+                         requirement_id=requirement.requirement_id, plan_id=plan.plan_id,
+                         amount=plan.total_units, created_at=team.clock())
+    started = execution.start(token, attempt.attempt_id, **claims(attempt))
+    cancelled = execution.cancel(token, attempt.attempt_id, **claims(started.attempt))
+    assert cancelled.attempt.status == "cancelled"
+    assert booked(team, "project", project_id) == [("reserve", 4), ("release", -4)]
+    second = team.make_dispatch(requires_real_data=False).dispatch(project_id, item.work_item_id)
+    assert (second.number, second.attempt_id != attempt.attempt_id) == (2, True)
+    running = execution.start(token, second.attempt_id, **claims(second))
+    execution.report_result(token, second.attempt_id, status="submitted", summary="完成",
+                            usage_units=2, **claims(running.attempt))
+    assert booked(team, "project", project_id) == [
+        ("reserve", 4), ("release", -4), ("settle", 2)]
+
+
+def test_human_withdrawal_revokes_execution_rights_without_faking_a_stop(team):
+    requirement, plan, item, instance, token, attempt = live_attempt(team, lease_ttl=60)
+    project_id = requirement.project_id
+    execution = team.make_execution(budgets=team.budgets, lease_ttl=60)
+    team.budgets.reserve(team.store, project_id=project_id,
+                         requirement_id=requirement.requirement_id, plan_id=plan.plan_id,
+                         amount=plan.total_units, created_at=team.clock())
+    started = execution.start(token, attempt.attempt_id, **claims(attempt))
+    with session(team, team.requester) as access:
+        with pytest.raises(Forbidden):
+            team.reviews.cancel(access, project_id=project_id, work_item_id=item.work_item_id,
+                                expected_version=item.version)
+    running = team.store.get_work_item(project_id, item.work_item_id)
+    with session(team, team.reviewer) as access:
+        cancelled = team.reviews.cancel(access, project_id=project_id,
+                                        work_item_id=item.work_item_id,
+                                        expected_version=running.version, reason="需求变更")
+        assert team.reviews.cancel(access, project_id=project_id, work_item_id=item.work_item_id,
+                                   expected_version=cancelled.version) == cancelled
+    assert cancelled.status == "cancelled"
+    frozen = team.store.get_attempt(project_id, attempt.attempt_id)
+    assert (frozen.status, frozen.control_epoch) == ("reconciliation_required", 2)
+    assert team.store.get_instance(project_id, instance.instance_id).control_epoch == 1
+    assert booked(team, "project", project_id) == [("reserve", 4)]
+    with pytest.raises(Conflict):
+        execution.report_result(token, attempt.attempt_id, status="submitted", summary="迟到的结果",
+                                usage_units=1, **claims(frozen))
+    with pytest.raises(Conflict):
+        execution.cancel(token, attempt.attempt_id, **claims(frozen))
+    with pytest.raises(Conflict):
+        execution.renew_lease(token, attempt.attempt_id, **claims(started.attempt))
+    assert booked(team, "project", project_id) == [("reserve", 4)]
+    assert team.store.get_work_item(project_id, item.work_item_id).status == "cancelled"
+    assert stored_reports(team, project_id, attempt.attempt_id)[-4:] == [
+        ("cancel", True, "execution right revoked by human"),
+        ("result", False, "execution right revoked"),
+        ("cancel", False, "execution right revoked"),
+        ("lease", False, "stale control epoch")]
+    revoked = events(team, project_id, TOPIC_ATTEMPT_REVOKED)
+    assert len(revoked) == 1
+    assert json.loads(revoked[0].payload) == {
+        "attempt_id": attempt.attempt_id, "work_item_id": item.work_item_id,
+        "instance_id": instance.instance_id, "input_hash": attempt.input_hash,
+        "control_epoch": 2}
+    assert "work_item.cancelled" in audited(team, item.work_item_id)
+
+
+def test_withdrawal_of_a_delivered_result_keeps_its_share_spent_and_unconfirmed(team):
+    pack = delivered(team, usage_units=3, reserve=True)
+    project_id = pack.requirement.project_id
+    item = team.store.get_work_item(project_id, pack.item.work_item_id)
+    with session(team, team.owner) as access:
+        cancelled = team.reviews.cancel(access, project_id=project_id,
+                                       work_item_id=pack.item.work_item_id,
+                                       expected_version=item.version, reason="需求作废")
+    assert cancelled.status == "cancelled"
+    closed = team.store.get_attempt(project_id, pack.attempt.attempt_id)
+    assert (closed.status, closed.control_epoch) == ("cancelled", 1)
+    with pytest.raises(InvalidState):
+        team.store.revoke_attempt_execution_right(pack.attempt.attempt_id,
+                                                  expected_version=closed.version,
+                                                  updated_at=team.clock())
+    # The reported usage stands: withdrawal closes the item, it does not re-open the books.
+    assert booked(team, "project", project_id) == [("reserve", 4), ("settle", -1)]
+    assert stored_reports(team, project_id, pack.attempt.attempt_id)[-1] == (
+        "cancel", True, "delivered result withdrawn by human")
+    with session(team, team.owner) as access:
+        assert team.reviews.owner_review(access, project_id=project_id,
+                                         attempt_id=pack.attempt.attempt_id) is None
+
+
+def test_withdrawal_wakes_the_worker_advisory_without_forcing_a_stop(team):
+    requirement = approved_requirement(team)
+    plan = published_plan(team, requirement)
+    item = work_item(team, plan)
+    pushes = []
+    dispatch_service = team.make_dispatch(requires_real_data=False,
+                                          push=lambda url, body: pushes.append((url, body)))
+    instance, _token = claimed_instance(team, worker_url="http://127.0.0.1:9/worker")
+    attempt = dispatch_service.dispatch(requirement.project_id, item.work_item_id)
+    assert attempt.instance_id == instance.instance_id
+    running = team.store.get_work_item(requirement.project_id, item.work_item_id)
+    with session(team, team.owner) as access:
+        team.reviews.cancel(access, project_id=requirement.project_id,
+                            work_item_id=item.work_item_id, expected_version=running.version,
+                            reason="需求变更")
+    scheduler = Scheduler(team.database, planning=None,
+                          queue=QueueService(team.database, clock=team.clock),
+                          dispatch=dispatch_service, clock=team.clock)
+    assert TOPIC_ATTEMPT_REVOKED in scheduler.dispatcher.handlers
+    delivery = scheduler.tick(project_id=requirement.project_id)
+    assert delivery["delivered"] == 2
+    assert {body["control_epoch"] for _url, body in pushes} == {1, 2}
+    assert {body["attempt_id"] for _url, body in pushes} == {attempt.attempt_id}
+    assert {url for url, _body in pushes} == {"http://127.0.0.1:9/worker"}
+    assert team.store.get_work_item(requirement.project_id,
+                                    item.work_item_id).status == "cancelled"
+

@@ -5,7 +5,7 @@ import json
 import time
 
 from .auth import record_audit
-from .dispatch import DISPATCHABLE_STATUSES, TOPIC_ATTEMPT_ASSIGNED
+from .dispatch import DISPATCHABLE_STATUSES, TOPIC_ATTEMPT_ASSIGNED, TOPIC_ATTEMPT_REVOKED
 from .instances import AdmissionDenied
 from .models import Conflict, InvalidState, NotFound
 from .store import CollaborationStore, WORK_ITEM_QUEUE_STATUSES
@@ -141,7 +141,9 @@ class Scheduler:
         self.dispatcher.register(TOPIC_REQUIREMENT_APPROVED, self._on_approved)
         self.dispatcher.register(TOPIC_PLAN_PUBLISHED, self._on_published)
         if dispatch is not None:
+            # A revocation wakes the worker the same advisory way so it re-reads and stops.
             self.dispatcher.register(TOPIC_ATTEMPT_ASSIGNED, dispatch.wake)
+            self.dispatcher.register(TOPIC_ATTEMPT_REVOKED, dispatch.wake)
 
     def _on_approved(self, event) -> None:
         payload = json.loads(event.payload)

@@ -28,6 +28,7 @@ from .instances import InstanceService
 from .models import Conflict, InvalidState, NotFound, Unavailable, ValidationError
 from .planning import PlanService, plan_document
 from .requirements import RequirementService
+from .reviews import ReviewService
 from .scheduler import QueueService, Scheduler
 from .store import CollaborationStore
 
@@ -70,6 +71,7 @@ class AppConfig:
     public_origin: str = "http://127.0.0.1:7400"
     session_ttl: int = 28800
     lease_ttl: int = 120
+    auto_dispatch: bool = False
 
     def __post_init__(self):
         canonical, _, _ = _origin(self.public_origin)
@@ -77,6 +79,8 @@ class AppConfig:
             raise ValueError("session_ttl must be between 60 and 86400 seconds")
         if type(self.lease_ttl) is not int or not 30 <= self.lease_ttl <= 86400:
             raise ValueError("lease_ttl must be between 30 and 86400 seconds")
+        if type(self.auto_dispatch) is not bool:
+            raise ValueError("auto_dispatch must be a boolean")
         object.__setattr__(self, "data_dir", Path(self.data_dir))
         object.__setattr__(self, "public_origin", canonical)
 
@@ -247,6 +251,35 @@ class BudgetLimit(Input):
     expected_version: Version | None = None
 
 
+class OwnerDecision(Input):
+    decision: Literal["confirmed", "changes_requested"]
+    expected_version: Version
+    reason: Annotated[str, Field(max_length=2048)] = ""
+
+
+class AcceptanceDecision(OwnerDecision):
+    decision: Literal["accepted", "changes_requested"]
+
+
+class WorkItemCancel(ExpectedVersion):
+    reason: Annotated[str, Field(max_length=2048)] = ""
+
+
+class SecurityRuleCreate(Input):
+    rule_key: Annotated[str, Field(min_length=1, max_length=128)]
+
+
+class SecurityDecision(Input):
+    decision: Literal["approved", "rejected"]
+    reason: Annotated[str, Field(min_length=1, max_length=2048)]
+    expected_version: Version
+
+
+class SecurityGrantUpdate(Input):
+    active: bool
+    expected_version: Version | None = None
+
+
 _ERRORS = {
     401: "Unauthorized", 403: "Forbidden", 404: "Not found", 405: "Method not allowed",
     409: "Conflict", 422: "Invalid request", 429: "Too many requests",
@@ -370,9 +403,12 @@ def create_app(config: AppConfig) -> FastAPI:
             database, instances=app.state.instances, lease_ttl=config.lease_ttl,
             push=lambda url, payload: _wake(waker, url, payload))
         app.state.execution = ExecutionService(database, instances=app.state.instances,
-                                               lease_ttl=config.lease_ttl)
+                                               lease_ttl=config.lease_ttl,
+                                               budgets=app.state.budgets)
+        app.state.reviews = ReviewService()
         app.state.scheduler = Scheduler(database, planning=app.state.planning,
-                                        queue=app.state.queue, dispatch=app.state.dispatch)
+                                        queue=app.state.queue, dispatch=app.state.dispatch,
+                                        auto_dispatch=config.auto_dispatch)
         try:
             yield
         finally:
@@ -716,6 +752,12 @@ def create_app(config: AppConfig) -> FastAPI:
                                           reason=body.reason, **_claims(body))
         return _call_view(call)
 
+    @router.get("/machine/attempts/{attempt_id}/security-reviews")
+    def machine_security_reviews(attempt_id: str, request: Request):
+        listed = app.state.execution.security_reviews(
+            request.headers.get("X-Instance-Token"), attempt_id)
+        return [asdict(entry) for entry in listed]
+
     @router.post("/projects/{pid}/requirements", status_code=201)
     def create_requirement(pid: str, body: RequirementCreate, request: Request):
         with _access(request, project_id=pid, write=True) as access:
@@ -824,6 +866,78 @@ def create_app(config: AppConfig) -> FastAPI:
             return {"plan": plan_document(plan),
                     "work_items": [asdict(item) for item in items],
                     "dependencies": [asdict(dependency) for dependency in dependencies]}
+
+    @router.post("/projects/{pid}/work-items/{wid}/dispatch")
+    def dispatch_work_item(pid: str, wid: str, request: Request):
+        """Ask for one attempt of this work item; a repeated call replays the open attempt."""
+        # Dispatch opens its own transactions, so authorization must release the write lock.
+        actor_id = _authorized_actor(request, project_id=pid, roles=MANAGERS)
+        return _attempt_view(app.state.dispatch.dispatch(pid, wid, actor_id=actor_id))
+
+    @router.post("/projects/{pid}/work-items/{wid}/accept")
+    def accept_work_item(pid: str, wid: str, body: AcceptanceDecision, request: Request):
+        with _access(request, project_id=pid, roles=MANAGERS, write=True) as access:
+            item = app.state.reviews.accept(access, project_id=pid, work_item_id=wid,
+                                            decision=body.decision, reason=body.reason,
+                                            expected_version=body.expected_version)
+            return asdict(item)
+
+    @router.post("/projects/{pid}/work-items/{wid}/cancel")
+    def cancel_work_item(pid: str, wid: str, body: WorkItemCancel, request: Request):
+        with _access(request, project_id=pid, write=True) as access:
+            item = app.state.reviews.cancel(access, project_id=pid, work_item_id=wid,
+                                           reason=body.reason,
+                                           expected_version=body.expected_version)
+            return asdict(item)
+
+    @router.post("/projects/{pid}/attempts/{aid}/reviews")
+    def confirm_delivery(pid: str, aid: str, body: OwnerDecision, request: Request):
+        with _access(request, project_id=pid, write=True) as access:
+            attempt, review = app.state.reviews.confirm(access, project_id=pid, attempt_id=aid,
+                                                        decision=body.decision, reason=body.reason,
+                                                        expected_version=body.expected_version)
+            return {"attempt": _attempt_view(attempt), "review": asdict(review)}
+
+    @router.get("/projects/{pid}/attempts/{aid}/reviews")
+    def delivery_view(pid: str, aid: str, request: Request):
+        with _access(request, project_id=pid) as access:
+            attempt = access.store.get_attempt(pid, aid)
+            review = access.store.get_owner_review(aid)
+            problems = app.state.reviews.gate_problems(access.store, attempt,
+                                                       now=app.state.reviews.clock())
+            return {"attempt": _attempt_view(attempt),
+                    "owner_review": None if review is None else asdict(review),
+                    "security_reviews": [asdict(entry) for entry in
+                                         access.store.list_security_reviews(pid, aid)],
+                    "security_problems": problems,
+                    "acceptance_items": [{"item_id": item_id, "text": text} for item_id, text in
+                                         access.store.list_work_item_acceptance(
+                                             attempt.work_item_id)]}
+
+    @router.post("/projects/{pid}/attempts/{aid}/security-reviews", status_code=201)
+    def record_security_rule(pid: str, aid: str, body: SecurityRuleCreate, request: Request):
+        with _access(request, project_id=pid, roles=MANAGERS, write=True) as access:
+            return asdict(app.state.reviews.record_rule(access, project_id=pid, attempt_id=aid,
+                                                        rule_key=body.rule_key))
+
+    @router.post("/projects/{pid}/security-reviews/{srid}/decide")
+    def decide_security_review(pid: str, srid: str, body: SecurityDecision, request: Request):
+        with _access(request, project_id=pid, write=True) as access:
+            return asdict(app.state.reviews.decide_security(
+                access, project_id=pid, security_review_id=srid, decision=body.decision,
+                reason=body.reason, expected_version=body.expected_version))
+
+    @router.get("/projects/{pid}/security-grants")
+    def list_security_grants(pid: str, request: Request):
+        with _access(request, project_id=pid, roles=MANAGERS) as access:
+            return [asdict(grant) for grant in access.store.list_security_grants(pid)]
+
+    @router.put("/projects/{pid}/security-grants/{uid}")
+    def set_security_grant(pid: str, uid: str, body: SecurityGrantUpdate, request: Request):
+        with _access(request, project_id=pid, roles=("owner",), write=True) as access:
+            return asdict(app.state.reviews.set_grant(access, project_id=pid, user_id=uid,
+                                                      active=body.active,
+                                                      expected_version=body.expected_version))
 
     @router.post("/projects/{pid}/scheduler/tick")
     def scheduler_tick(pid: str, request: Request):

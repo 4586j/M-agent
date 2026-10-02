@@ -11,6 +11,7 @@ import sqlite3
 import subprocess
 import sys
 import time
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -1204,12 +1205,13 @@ def machine_claims(source):
 
 
 def machine_attempt(api, *, worker_url=None):
-    """Approved requirement, published plan, live claimed instance and one dispatched attempt."""
+    """Approved requirement, published plan, verified instance and one dispatched attempt."""
     project, member, binding, requirement_id = approval_setup(api)
     pid = project["project_id"]
     wire_planner(api, binding, member["user_id"])
     plan = checked(api.send("manager", "POST", plans_path(project, requirement_id)), 201)
     node, node_token = api.client.app.state.instances.enroll_node("machine-node")
+    path = f"/projects/{pid}/agent-bindings/{binding['binding_id']}/instances"
     created = checked(api.send("owner", "POST",
                                f"/projects/{pid}/agent-bindings/{binding['binding_id']}/instances",
                                json={"node_id": node.node_id, "worker_url": worker_url}), 201)
@@ -1217,8 +1219,14 @@ def machine_attempt(api, *, worker_url=None):
     token = claimed["instance_token"]
     checked(api.send(None, "POST", "/machine/instances/heartbeat",
                      headers={"X-Instance-Token": token}))
-    attempt = api.client.app.state.dispatch.dispatch(
-        pid, plan["work_items"][0]["work_item_id"], requires_real_data=False)
+    checked(api.send("owner", "POST", f"{path}/{created['instance_id']}/verify",
+                     json={"expected_version": claimed["version"]}))
+    view = checked(api.send("manager", "POST",
+                            dispatch_path(pid, plan["work_items"][0]["work_item_id"])))
+    assert (view["status"], view["number"]) == ("assigned", 1)
+    with api.database.read() as conn:
+        attempt = CollaborationStore(api.database, connection=conn).get_attempt(
+            pid, view["attempt_id"])
     return project, requirement_id, plan, attempt, token
 
 
@@ -1226,6 +1234,10 @@ def work_item_statuses(api, project, requirement_id, plan, actor="member"):
     detail = checked(api.send(actor, "GET",
                               plans_path(project, requirement_id) + f"/{plan['plan']['plan_id']}"))
     return [entry["status"] for entry in detail["work_items"]]
+
+
+def dispatch_path(project_id, work_item_id):
+    return f"/projects/{project_id}/work-items/{work_item_id}/dispatch"
 
 
 def test_machine_protocol_pulls_and_reports_over_http(api):
@@ -1368,6 +1380,277 @@ def test_machine_cancel_closes_the_attempt_and_a_late_report_is_refused(api):
     assert api.send(None, "GET", base + "/package", headers=headers).status_code == 200
     assert api.send(None, "GET", base + "/requirement",
                     headers=headers).content == "# 需求原文".encode("utf-8")
+
+
+# --- T07d: human decisions over HTTP -------------------------------------------
+
+def delivered(api, *, usage_units=3):
+    """One machine-reported result on a dispatched attempt, ready for a human decision."""
+    project, requirement_id, plan, attempt, token = machine_attempt(api)
+    headers = {"X-Instance-Token": token}
+    base = f"/machine/attempts/{attempt.attempt_id}"
+    started = checked(api.send(None, "POST", base + "/start", json=machine_claims(attempt),
+                               headers=headers))
+    claims = {**machine_claims(started["attempt"]), "status": "submitted", "summary": "完成",
+              "usage_units": usage_units}
+    reported = checked(api.send(None, "POST", base + "/result", json=claims, headers=headers))
+    return SimpleNamespace(project=project, requirement_id=requirement_id, plan=plan,
+                           attempt=attempt, token=token, base=base, claims=claims,
+                           reported=reported["attempt"])
+
+
+def delivery_path(project_id, attempt_id):
+    return f"/projects/{project_id}/attempts/{attempt_id}/reviews"
+
+
+def security_review_path(project_id, attempt_id):
+    return f"/projects/{project_id}/attempts/{attempt_id}/security-reviews"
+
+
+def security_decide_path(project_id, security_review_id):
+    return f"/projects/{project_id}/security-reviews/{security_review_id}/decide"
+
+
+def test_dispatch_route_needs_a_manager_and_a_verified_live_instance(api):
+    project, member, binding, requirement_id = approval_setup(api)
+    pid = project["project_id"]
+    wire_planner(api, binding, member["user_id"])
+    plan = checked(api.send("manager", "POST", plans_path(project, requirement_id)), 201)
+    work_item_id = plan["work_items"][0]["work_item_id"]
+    path = dispatch_path(pid, work_item_id)
+    checked(api.send("member", "POST", path), 403)
+    checked(api.send("outsider", "POST", path), 404)
+    checked(api.send("manager", "POST", path, headers={"X-CSRF-Token": None}), 403)
+    checked(api.send("manager", "POST", dispatch_path(pid, "0" * 32)), 404)
+    checked(api.send("manager", "POST", path), 409)  # AdmissionDenied: no live instance
+
+    node, node_token = api.client.app.state.instances.enroll_node("dispatch-node")
+    instances = f"/projects/{pid}/agent-bindings/{binding['binding_id']}/instances"
+    for url in ("ftp://127.0.0.1:9/worker", "http://admin@127.0.0.1:9/worker",
+                "http://127.0.0.1:9/worker?token=x", "http://127.0.0.1:9/worker#frag",
+                "http://127.0.0.1:9/worker path", "https://127.0.0.1:9\\worker"):
+        checked(api.send("owner", "POST", instances,
+                         json={"node_id": node.node_id, "worker_url": url}), 422)
+    created = checked(api.send("owner", "POST", instances, json={
+        "node_id": node.node_id, "worker_url": "http://127.0.0.1:9/worker"}), 201)
+    assert created["worker_url"] == "http://127.0.0.1:9/worker"
+    claimed = checked(machine_claim(api, node_token, created["claim_token"]), 201)
+    checked(api.send(None, "POST", "/machine/instances/heartbeat",
+                     headers={"X-Instance-Token": claimed["instance_token"]}))
+    checked(api.send("manager", "POST", path), 409)  # real data needs verified isolation
+    verified = checked(api.send("owner", "POST", f"{instances}/{created['instance_id']}/verify",
+                                json={"expected_version": claimed["version"]}))
+    assert verified["isolation_verified"] == 1
+    view = checked(api.send("manager", "POST", path))
+    assert (view["status"], view["number"], view["control_epoch"], view["lease_epoch"]) == (
+        "assigned", 1, 1, 1)
+    assert (view["work_item_id"], view["requirement_id"]) == (work_item_id, requirement_id)
+    assert len(view["input_hash"]) == 64
+    assert "revision_hash" not in json.dumps(view) and "package_json" not in json.dumps(view)
+    assert checked(api.send("manager", "POST", path)) == view  # replay, not a second attempt
+    assert work_item_statuses(api, project, requirement_id, plan) == ["running"]
+    held = checked(api.send(None, "GET", "/machine/instances/me/attempts",
+                            headers={"X-Instance-Token": claimed["instance_token"]}))
+    assert [entry["attempt_id"] for entry in held] == [view["attempt_id"]]
+
+
+def test_owner_confirmation_security_pass_and_acceptance_round_trip(api):
+    seen = delivered(api)
+    pid = seen.project["project_id"]
+    work_item_id = seen.plan["work_items"][0]["work_item_id"]
+    delivery = delivery_path(pid, seen.attempt.attempt_id)
+    checked(api.send("manager", "PUT", f"/projects/{pid}/budget", json={"limit_units": 10}))
+    assert checked(api.send(None, "POST", seen.base + "/result", json=seen.claims,
+                            headers={"X-Instance-Token": seen.token}))["outcome"] == "duplicate"
+    assert api.send(None, "GET", f"{seen.base}/security-reviews",
+                    headers={"X-Instance-Token": seen.token}).json() == []
+    checked(api.send("outsider", "GET", delivery), 404)
+    view = checked(api.send("member", "GET", delivery))
+    assert (view["attempt"]["status"], view["owner_review"], view["security_reviews"],
+            view["security_problems"]) == ("submitted", None, [], [])
+    assert [entry["text"] for entry in view["acceptance_items"]] == ["第一条验收"]
+    assert work_item_statuses(api, seen.project, seen.requirement_id,
+                              seen.plan) == ["awaiting_owner_review"]
+    version = view["attempt"]["version"]
+    checked(api.send("member", "POST", delivery,
+                     json={"decision": "changes_requested", "expected_version": version}), 422)
+    checked(api.send("outsider", "POST", delivery,
+                     json={"decision": "confirmed", "expected_version": version}), 404)
+    checked(api.send("member", "POST", delivery, json={"decision": "confirmed",
+                                                       "expected_version": version},
+                     headers={"X-CSRF-Token": None}), 403)
+
+    rules = security_review_path(pid, seen.attempt.attempt_id)
+    checked(api.send("member", "POST", rules, json={"rule_key": "dangerous_command"}), 403)
+    record = checked(api.send("manager", "POST", rules, json={"rule_key": "dangerous_command"}), 201)
+    assert (record["rule_key"], record["decision"], record["reviewer_user_id"],
+            record["input_hash"]) == ("dangerous_command", "pending", None,
+                                      seen.attempt.input_hash)
+    assert checked(api.send("manager", "POST", rules,
+                            json={"rule_key": "dangerous_command"}),
+                   201)["security_review_id"] == record["security_review_id"]
+    assert checked(api.send("member", "GET", delivery))["security_problems"] == [
+        "pending:dangerous_command"]
+    checked(api.send("member", "POST", delivery, json={"decision": "confirmed",
+                                                        "expected_version": version}), 409)
+    decide = security_decide_path(pid, record["security_review_id"])
+    checked(api.send("outsider", "POST", decide, json={"decision": "approved", "reason": "可接受",
+                                                       "expected_version": 1}), 404)
+    checked(api.send("manager", "POST", decide, json={"decision": "approved", "reason": "可接受",
+                                                      "expected_version": 1}), 403)
+    listed = checked(api.send(None, "GET", f"{seen.base}/security-reviews",
+                              headers={"X-Instance-Token": seen.token}))
+    assert [(entry["rule_key"], entry["decision"]) for entry in listed] == [
+        ("dangerous_command", "pending")]
+    checked(api.send(None, "GET", f"{seen.base}/security-reviews"), 401)
+    other = api.project(name="Project B")
+    api.member(other)
+    other_node, other_token = api.client.app.state.instances.enroll_node("foreign-node")
+    other_instance = checked(api.send("owner", "POST",
+        f"/projects/{other['project_id']}/agent-bindings/"
+        f"{api.binding(other, api.agent())['binding_id']}/instances",
+        json={"node_id": other_node.node_id}), 201)
+    foreign_claim = checked(machine_claim(api, other_token, other_instance["claim_token"]), 201)
+    checked(api.send(None, "GET", f"{seen.base}/security-reviews",
+                     headers={"X-Instance-Token": foreign_claim["instance_token"]}), 404)
+
+    grants = f"/projects/{pid}/security-grants"
+    manager_uid = api.identities["manager"]["user"]["user_id"]
+    checked(api.send("member", "GET", grants), 403)
+    assert checked(api.send("manager", "GET", grants)) == []
+    checked(api.send("manager", "PUT", f"{grants}/{manager_uid}", json={"active": True}), 403)
+    checked(api.send("outsider", "PUT", f"{grants}/{manager_uid}", json={"active": True}), 404)
+    checked(api.send("owner", "PUT", f"{grants}/{'0' * 32}", json={"active": True}), 404)
+    grant = checked(api.send("owner", "PUT", f"{grants}/{manager_uid}", json={"active": True}))
+    assert (grant["capability"], grant["status"], grant["granted_by"],
+            grant["version"]) == ("security:approve", "active",
+                                 api.identities["owner"]["user"]["user_id"], 1)
+    assert checked(api.send("manager", "GET", grants)) == [grant]
+    decided = checked(api.send("manager", "POST", decide, json={"decision": "approved",
+                                                                "reason": "命令只在沙箱内执行",
+                                                                "expected_version": 1}))
+    assert (decided["decision"], decided["reviewer_user_id"],
+            decided["version"]) == ("approved", manager_uid, 2)
+    checked(api.send("manager", "POST", decide, json={"decision": "rejected", "reason": "改判",
+                                                      "expected_version": 1}), 409)
+    assert checked(api.send("member", "GET", delivery))["security_problems"] == []
+
+    checked(api.send("member", "POST", delivery, json={"decision": "confirmed",
+                                                       "expected_version": version + 1}), 409)
+    confirmed = checked(api.send("member", "POST", delivery, json={"decision": "confirmed",
+                                                                   "expected_version": version}))
+    assert (confirmed["attempt"]["status"],
+            confirmed["review"]["decision"]) == ("accepted", "confirmed")
+    assert (confirmed["review"]["result_hash"], confirmed["review"]["project_id"]) == (
+        confirmed["attempt"]["result_hash"], pid)
+    replay = checked(api.send("member", "POST", delivery, json={"decision": "confirmed",
+                                                                "expected_version": 1}))
+    assert (replay["attempt"]["status"],
+            replay["review"]["review_id"]) == ("accepted", confirmed["review"]["review_id"])
+    checked(api.send("member", "POST", delivery, json={"decision": "changes_requested",
+                                                       "reason": "另一个决定",
+                                                       "expected_version": version}), 409)
+
+    accept = f"/projects/{pid}/work-items/{work_item_id}/accept"
+    checked(api.send("outsider", "POST", accept, json={"decision": "accepted",
+                                                        "expected_version": 1}), 404)
+    checked(api.send("member", "POST", accept, json={"decision": "accepted",
+                                                     "expected_version": 1}), 403)
+    item = checked(api.send("member", "GET", plans_path(seen.project, seen.requirement_id) +
+                            f"/{seen.plan['plan']['plan_id']}"))["work_items"][0]
+    checked(api.send("manager", "POST", accept, json={"decision": "changes_requested",
+                                                      "expected_version": item["version"]}), 422)
+    checked(api.send("manager", "POST", accept, json={"decision": "accepted",
+                                                      "expected_version": item["version"] + 5}), 409)
+    accepted = checked(api.send("manager", "POST", accept,
+                                json={"decision": "accepted",
+                                      "expected_version": item["version"]}))
+    assert (accepted["status"], accepted["version"]) == ("accepted", item["version"] + 1)
+    assert checked(api.send("manager", "POST", accept,
+                            json={"decision": "accepted", "expected_version": 1}))["status"] == \
+        "accepted"
+    assert work_item_statuses(api, seen.project, seen.requirement_id,
+                             seen.plan) == ["accepted"]
+    accounts = checked(api.send("member", "GET", f"/projects/{pid}/budget"))["accounts"]
+    assert [(entry["scope"], entry["limit_units"], entry["used_units"],
+             entry["remaining_units"]) for entry in accounts] == [("project", 10, 3, 7)]
+
+
+def test_unliftable_and_rejected_security_rules_keep_blocking_confirmation(api):
+    seen = delivered(api, usage_units=2)
+    pid = seen.project["project_id"]
+    delivery = delivery_path(pid, seen.attempt.attempt_id)
+    version = checked(api.send("member", "GET", delivery))["attempt"]["version"]
+    owner_uid = api.identities["owner"]["user"]["user_id"]
+    rules = security_review_path(pid, seen.attempt.attempt_id)
+    checked(api.send("manager", "POST", rules, json={"rule_key": ""}), 422)
+    identity = checked(api.send("manager", "POST", rules, json={"rule_key": "identity"}), 201)
+    effect = checked(api.send("manager", "POST", rules,
+                              json={"rule_key": "external_side_effect"}), 201)
+    checked(api.send("owner", "POST", security_decide_path(pid, identity["security_review_id"]),
+                     json={"decision": "approved", "reason": "看起来安全",
+                           "expected_version": 1}), 403)
+    checked(api.send("owner", "POST", security_decide_path(pid, identity["security_review_id"]),
+                     json={"decision": "approved", "reason": "  ", "expected_version": 1}), 422)
+    rejected = checked(api.send("owner", "POST",
+                                security_decide_path(pid, effect["security_review_id"]),
+                                json={"decision": "rejected", "reason": "会改写宿主文件",
+                                      "expected_version": 1}))
+    assert (rejected["decision"], rejected["reviewer_user_id"],
+            rejected["version"]) == ("rejected", owner_uid, 2)
+    assert sorted(checked(api.send("member", "GET", delivery))["security_problems"]) == [
+        "pending:identity", "rejected:external_side_effect"]
+    checked(api.send("member", "POST", delivery, json={"decision": "confirmed",
+                                                        "expected_version": version}), 409)
+    assert sorted((entry["rule_key"], entry["decision"]) for entry in
+                  checked(api.send(None, "GET", f"{seen.base}/security-reviews",
+                                   headers={"X-Instance-Token": seen.token}))) == [
+        ("external_side_effect", "rejected"), ("identity", "pending")]
+    api.client.app.state.reviews.clock = lambda: time.time() + 90000
+    assert sorted(checked(api.send("member", "GET", delivery))["security_problems"]) == [
+        "expired:identity", "rejected:external_side_effect"]
+    checked(api.send("member", "POST", delivery, json={"decision": "confirmed",
+                                                       "expected_version": version}), 409)
+
+
+def test_human_withdrawal_over_http_revokes_execution_rights_without_faking_a_stop(api):
+    project, requirement_id, plan, attempt, token = machine_attempt(api)
+    pid = project["project_id"]
+    headers = {"X-Instance-Token": token}
+    base = f"/machine/attempts/{attempt.attempt_id}"
+    started = checked(api.send(None, "POST", base + "/start", json=machine_claims(attempt),
+                               headers=headers))
+    work_item_id = plan["work_items"][0]["work_item_id"]
+    cancel = f"/projects/{pid}/work-items/{work_item_id}/cancel"
+    item = checked(api.send("member", "GET", plans_path(project, requirement_id) +
+                            f"/{plan['plan']['plan_id']}"))["work_items"][0]
+    checked(api.send("outsider", "POST", cancel,
+                     json={"expected_version": item["version"], "reason": "撤回"}), 404)
+    checked(api.send("member", "POST", cancel, json={"expected_version": 1}),
+            409)  # a stale version cannot withdraw anyone's work
+    cancelled = checked(api.send("member", "POST", cancel,
+                                 json={"expected_version": item["version"], "reason": "人工撤回"}))
+    assert (cancelled["status"], cancelled["version"]) == ("cancelled", item["version"] + 1)
+    assert work_item_statuses(api, project, requirement_id, plan) == ["cancelled"]
+    held = checked(api.send(None, "GET", "/machine/instances/me/attempts", headers=headers))
+    assert [(entry["status"], entry["control_epoch"]) for entry in held] == [
+        ("reconciliation_required", 2)]
+    late = machine_claims(started["attempt"])
+    checked(api.send(None, "POST", base + "/result", json={**late, "status": "submitted",
+                                                            "summary": "迟到的结果"},
+                     headers=headers), 409)
+    checked(api.send(None, "POST", base + "/lease", json=late, headers=headers), 409)
+    assert api.send(None, "GET", base + "/package", headers=headers).status_code == 200
+    events = {event["topic"]: event for event in
+              checked(api.send("manager", "GET", f"/projects/{pid}/outbox"))}
+    revoked = events["attempt.revoked"]
+    assert revoked["delivered_at"] is None
+    assert revoked["payload"] == {"attempt_id": attempt.attempt_id, "work_item_id": work_item_id,
+                                  "instance_id": attempt.instance_id,
+                                  "input_hash": attempt.input_hash, "control_epoch": 2}
+    assert checked(api.send("member", "POST", cancel,
+                            json={"expected_version": 1, "reason": "人工撤回"}))["status"] == \
+        "cancelled"
 
 
 def test_wake_helper_posts_advisory_payload_and_flags_failures():
