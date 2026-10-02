@@ -101,6 +101,11 @@ class DispatchService:
                                for entry in store.list_work_item_acceptance(item.work_item_id)],
             },
             "dependencies": self._dependencies(store, project_id, plan.plan_id, item.work_item_id),
+            # What a human already sent back for this item: the next attempt is told which
+            # acceptance item missed instead of being asked to guess from the same original.
+            "rework": [{"attempt_id": review.attempt_id, "reason": review.reason,
+                        "reviewed_by": review.reviewer_user_id, "reviewed_at": review.created_at}
+                       for review in store.list_returned_reviews(project_id, item.work_item_id)],
             "policy": {
                 "binding_id": binding.binding_id, "binding_version": binding.version,
                 "duty": binding.duty, "persona_version": binding.persona_version,

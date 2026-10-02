@@ -882,6 +882,14 @@ def create_app(config: AppConfig) -> FastAPI:
                                             expected_version=body.expected_version)
             return asdict(item)
 
+    @router.post("/projects/{pid}/work-items/{wid}/rework")
+    def rework_work_item(pid: str, wid: str, body: ExpectedVersion, request: Request):
+        """Re-queue a returned work item so a new attempt may be dispatched for it."""
+        with _access(request, project_id=pid, roles=MANAGERS, write=True) as access:
+            item = app.state.reviews.rework(access, project_id=pid, work_item_id=wid,
+                                            expected_version=body.expected_version)
+            return asdict(item)
+
     @router.post("/projects/{pid}/work-items/{wid}/cancel")
     def cancel_work_item(pid: str, wid: str, body: WorkItemCancel, request: Request):
         with _access(request, project_id=pid, write=True) as access:

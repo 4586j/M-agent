@@ -45,7 +45,7 @@ from collaboration.store import CollaborationStore
 from collaboration_client import digest_of
 from collaboration_journal import PAUSED_GATE, REPORTED, ExecutionJournal
 
-ITEM_KEYS = ("A", "B", "C", "D", "E", "F")
+ITEM_KEYS = ("A", "B", "C", "D", "E", "F", "G")
 PASSWORD = "loop-only-password-2026"
 ORIGINAL = "\n".join((
     "# 需求原文",
@@ -510,6 +510,45 @@ def test_a_revoked_attempt_rejects_a_late_result_over_the_socket(rig, machine):
     bundle.push(bundle.hint(current, TOPIC_ATTEMPT_REVOKED))
     wait_local(bundle, attempt.attempt_id, "reconciling")
     assert stored(rig, attempt.attempt_id).status == "reconciliation_required"
+
+
+def test_a_returned_attempt_is_requeued_and_the_next_attempt_is_told_what_missed(rig, machine):
+    bundle = machine(name="rework")
+    item = rig.items["G"]
+    first = rig.dispatch.dispatch(rig.project.project_id, item.work_item_id)
+    bundle.notify(first)
+    delivered = wait_status(rig, first.attempt_id, "submitted")
+
+    # 负责人退回并点名验收项，负责人之外的 manager 才有权重新打开执行权。
+    with human(rig, rig.executor) as access:
+        rig.reviews.confirm(access, project_id=rig.project.project_id,
+                            attempt_id=first.attempt_id, decision="changes_requested",
+                            reason="第二条验收未满足", expected_version=delivered.version)
+    with human(rig, rig.owner) as access:
+        rig.reviews.rework(access, project_id=rig.project.project_id,
+                           work_item_id=item.work_item_id,
+                           expected_version=rig.store.get_work_item(
+                               rig.project.project_id, item.work_item_id).version)
+
+    second = rig.dispatch.dispatch(rig.project.project_id, item.work_item_id)
+    assert (second.number, second.attempt_id != first.attempt_id) == (2, True)
+    bundle.notify(second)
+    wait_status(rig, second.attempt_id, "submitted")
+
+    body = rig.store.get_artifact_content(
+        rig.project.project_id,
+        rig.store.list_artifacts(rig.project.project_id, second.attempt_id)[0].artifact_id
+    ).decode("utf-8")
+    assert "rework_notes: 1" in body and "第二条验收未满足" in body
+    assert second.input_hash != first.input_hash
+    frozen = (bundle.state_dir / "work" / second.attempt_id
+              / f"package-{second.input_hash[:16]}.json").read_text(encoding="utf-8")
+    assert "第二条验收未满足" in frozen and second.package_json == frozen
+
+    # 上一轮的结果仍是独立证据，不被新一轮覆盖。
+    kept = stored(rig, first.attempt_id)
+    assert (kept.status, kept.result_hash, kept.usage_units) == (
+        "changes_requested", delivered.result_hash, 1)
 
 
 def test_another_projects_instance_cannot_reach_these_inputs(rig, machine):

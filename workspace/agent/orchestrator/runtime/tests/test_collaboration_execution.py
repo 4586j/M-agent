@@ -1601,3 +1601,122 @@ def test_withdrawal_wakes_the_worker_advisory_without_forcing_a_stop(team):
     assert team.store.get_work_item(requirement.project_id,
                                     item.work_item_id).status == "cancelled"
 
+
+# --- rework after a returned delivery ----------------------------------------------
+
+def deliver(team, token, attempt, summary):
+    """Drive one attempt through the machine protocol to a reported result."""
+    service = team.make_execution()
+    acked = service.ack(token, attempt.attempt_id, **claims(attempt))
+    started = service.start(token, attempt.attempt_id, trace_id=f"trace-{attempt.number}",
+                           **claims(acked.attempt))
+    return service.report_result(token, attempt.attempt_id, status="submitted", summary=summary,
+                                 usage_units=1, **claims(started.attempt))
+
+
+def test_a_returned_item_is_requeued_and_its_rework_reaches_the_next_attempt(team):
+    requirement, _plan, item, _instance, token, first = live_attempt(team)
+    service = team.make_execution()
+    assert json.loads(service.package(token, first.attempt_id)[0])["rework"] == []
+
+    reported = deliver(team, token, first, "自认完成")
+    with session(team, team.worker) as access:
+        returned, review = team.reviews.confirm(
+            access, project_id=requirement.project_id, attempt_id=reported.attempt.attempt_id,
+            decision="changes_requested", reason="第二条验收未满足",
+            expected_version=reported.attempt.version)
+    assert (returned.status, returned.result_hash) == (
+        "changes_requested", reported.attempt.result_hash)
+    assert review.reason == "第二条验收未满足"
+    stale = team.store.get_work_item(requirement.project_id, item.work_item_id)
+    assert stale.status == "changes_requested"
+
+    # 负责人自己不能重新打开执行权，版本过期也不行。
+    with session(team, team.worker) as access, pytest.raises(Forbidden):
+        team.reviews.rework(access, project_id=requirement.project_id,
+                            work_item_id=item.work_item_id, expected_version=stale.version)
+    with session(team, team.reviewer) as access, pytest.raises(Conflict):
+        team.reviews.rework(access, project_id=requirement.project_id,
+                            work_item_id=item.work_item_id, expected_version=stale.version + 1)
+    with session(team, team.reviewer) as access:
+        requeued = team.reviews.rework(access, project_id=requirement.project_id,
+                                       work_item_id=item.work_item_id,
+                                       expected_version=stale.version)
+    assert (requeued.status, requeued.version) == ("ready", stale.version + 1)
+    assert "work_item.requeued" in audited(team, item.work_item_id)
+
+    second = team.make_dispatch(requires_real_data=False).dispatch(requirement.project_id,
+                                                                   item.work_item_id)
+    payload = json.loads(service.package(token, second.attempt_id)[0])
+    assert (second.number, second.attempt_id != first.attempt_id) == (2, True)
+    assert second.input_hash != first.input_hash
+    assert [(entry["attempt_id"], entry["reason"], entry["reviewed_by"])
+            for entry in payload["rework"]] == [
+        (first.attempt_id, "第二条验收未满足", team.worker.user_id)]
+    assert payload["documents"][0]["content_hash"] == first.revision_hash
+
+    # 旧结果保持原样，新尝试没有历史裁定。
+    kept = team.store.get_attempt(requirement.project_id, first.attempt_id)
+    assert (kept.status, kept.usage_units) == ("changes_requested", 1)
+    assert team.store.get_owner_review(second.attempt_id) is None
+
+    again = deliver(team, token, second, "再交一次")
+    with session(team, team.worker) as access:
+        team.reviews.confirm(access, project_id=requirement.project_id,
+                             attempt_id=again.attempt.attempt_id, decision="changes_requested",
+                             reason="第三条验收仍缺证据", expected_version=again.attempt.version)
+    with session(team, team.reviewer) as access:
+        team.reviews.rework(access, project_id=requirement.project_id,
+                            work_item_id=item.work_item_id,
+                            expected_version=team.store.get_work_item(
+                                requirement.project_id, item.work_item_id).version)
+    third = team.make_dispatch(requires_real_data=False).dispatch(requirement.project_id,
+                                                                  item.work_item_id)
+    assert [entry["reason"] for entry in
+            json.loads(service.package(token, third.attempt_id)[0])["rework"]] == [
+        "第二条验收未满足", "第三条验收仍缺证据"]
+
+
+def test_rework_needs_a_returned_item_without_an_open_attempt(team):
+    requirement, _plan, _item, _instance, token, attempt = live_attempt(team)
+    # 派发把工作项推进到 running，这里的版本才是撤回与返工要对齐的那一格。
+    item = team.store.get_work_item(requirement.project_id, _item.work_item_id)
+
+    # 正在执行的尝试没被退回，工作项也就不能被重排队。
+    with session(team, team.reviewer) as access, pytest.raises(InvalidState):
+        team.reviews.rework(access, project_id=requirement.project_id,
+                            work_item_id=item.work_item_id, expected_version=item.version)
+
+    moved = team.store.advance_work_item(item.work_item_id, status="changes_requested",
+                                         expected_version=item.version, updated_at=team.clock())
+    with session(team, team.reviewer) as access, pytest.raises(InvalidState):
+        team.reviews.rework(access, project_id=requirement.project_id,
+                            work_item_id=item.work_item_id, expected_version=moved.version)
+
+    # 尝试一旦结算（这里由负责人撤销），返工才拿到干净的执行权。
+    team.store.advance_attempt(attempt.attempt_id, status="cancelled",
+                               expected_version=attempt.version, updated_at=team.clock())
+    with session(team, team.reviewer) as access:
+        requeued = team.reviews.rework(access, project_id=requirement.project_id,
+                                       work_item_id=item.work_item_id,
+                                       expected_version=moved.version)
+    assert requeued.status == "ready"
+    with session(team, team.reviewer) as access, pytest.raises(InvalidState):
+        team.reviews.rework(access, project_id=requirement.project_id,
+                            work_item_id=item.work_item_id, expected_version=requeued.version)
+    assert team.store.get_work_item(requirement.project_id, item.work_item_id).status == "ready"
+
+
+def test_rework_is_project_scoped_and_rejects_outsiders(team):
+    requirement, _plan, _item, _instance, _token, _attempt = live_attempt(team)
+    item = team.store.get_work_item(requirement.project_id, _item.work_item_id)
+    team.store.advance_work_item(item.work_item_id, status="changes_requested",
+                                 expected_version=item.version, updated_at=team.clock())
+    with session(team, team.owner) as access, pytest.raises(NotFound):
+        team.reviews.rework(access, project_id=team.project_b.project_id,
+                            work_item_id=item.work_item_id, expected_version=item.version + 1)
+    outsider = team.store.create_user("局外人")
+    with session(team, outsider) as access, pytest.raises(NotFound):
+        team.reviews.rework(access, project_id=requirement.project_id,
+                            work_item_id=item.work_item_id, expected_version=item.version + 1)
+

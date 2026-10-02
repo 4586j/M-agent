@@ -1440,6 +1440,15 @@ class CollaborationStore:
                 (attempt_id,)).fetchone()
             return None if row is None else _record(OwnerReview, row)
 
+    def list_returned_reviews(self, project_id: str,
+                              work_item_id: str) -> list[OwnerReview]:
+        """Owner decisions that sent this work item back; the next attempt has to see them."""
+        with self._read() as conn:
+            return [_record(OwnerReview, row) for row in conn.execute(
+                f"SELECT {_OWNER_REVIEW_COLUMNS} FROM owner_reviews WHERE project_id=? "
+                "AND work_item_id=? AND decision='changes_requested' ORDER BY created_at,rowid",
+                (project_id, work_item_id))]
+
     # --- security gate ----------------------------------------------------------
 
     def add_security_review(self, attempt_id: str, *, rule_key: str, requirement_id: str,

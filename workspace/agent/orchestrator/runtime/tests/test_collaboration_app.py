@@ -1667,3 +1667,43 @@ def test_wake_helper_posts_advisory_payload_and_flags_failures():
             _wake(client, "https://worker.invalid/asleep", {"attempt_id": "b"})
     assert seen == [("https://worker.invalid/awake", "1", {"attempt_id": "a"}),
                     ("https://worker.invalid/asleep", "1", {"attempt_id": "b"})]
+
+
+def test_the_rework_route_returns_a_returned_item_and_informs_the_next_attempt(api):
+    seen = delivered(api)
+    pid = seen.project["project_id"]
+    wid = seen.plan["work_items"][0]["work_item_id"]
+    rework = f"/projects/{pid}/work-items/{wid}/rework"
+    returned = checked(api.send("member", "POST", delivery_path(pid, seen.attempt.attempt_id),
+                                json={"decision": "changes_requested", "reason": "第二条验收未满足",
+                                      "expected_version": seen.reported["version"]}))
+    assert returned["attempt"]["status"] == "changes_requested"
+    version = checked(api.send("manager", "GET", plans_path(seen.project, seen.requirement_id)
+                               + f"/{seen.plan['plan']['plan_id']}"))["work_items"][0]["version"]
+    assert work_item_statuses(api, seen.project, seen.requirement_id,
+                              seen.plan) == ["changes_requested"]
+
+    checked(api.send("outsider", "POST", rework, json={"expected_version": version}), 404)
+    checked(api.send("member", "POST", rework, json={"expected_version": version}), 403)
+    checked(api.send("manager", "POST", f"/projects/{pid}/work-items/{'0' * 32}/rework",
+                     json={"expected_version": version}), 404)
+    checked(api.send("manager", "POST", rework, json={"expected_version": version + 1}), 409)
+    queued = checked(api.send("manager", "POST", rework, json={"expected_version": version}))
+    assert (queued["status"], queued["version"]) == ("ready", version + 1)    # 已经回到队列的工作项不再被返工，重复请求不会把版本推第二格。
+    checked(api.send("manager", "POST", rework, json={"expected_version": version + 1}), 409)
+
+    second = checked(api.send("manager", "POST", dispatch_path(pid, wid)))
+    assert (second["number"], second["attempt_id"] != seen.attempt.attempt_id) == (2, True)
+    payload = checked(api.send(None, "GET", f"/machine/attempts/{second['attempt_id']}/package",
+                               headers={"X-Instance-Token": seen.token}))
+    assert [(entry["reason"], entry["attempt_id"], entry["reviewed_by"])
+            for entry in payload["rework"]] == [
+        ("第二条验收未满足", seen.attempt.attempt_id,
+         api.identities["member"]["user"]["user_id"])]
+    assert payload["subtask"]["acceptance"] == json.loads(
+        seen.attempt.package_json)["subtask"]["acceptance"]
+    assert seen.attempt.input_hash != second["input_hash"]
+    old = checked(api.send("manager", "GET", delivery_path(pid, seen.attempt.attempt_id)))
+    assert (old["attempt"]["status"], old["owner_review"]["reason"]) == (
+        "changes_requested", "第二条验收未满足")
+

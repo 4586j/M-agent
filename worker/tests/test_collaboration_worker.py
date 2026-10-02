@@ -439,7 +439,24 @@ def test_an_approved_gate_record_lets_the_attempt_run_and_deliver_the_original(t
     name, content = worker.client.artifacts[0]
     assert name == "simulated-output.md"
     assert f"requirement_characters: {len(ORIGINAL)}".encode("utf-8") in content
+    assert b"rework_notes: 0" in content
     assert worker.journal.get(ATTEMPT).state == REPORTED
+    worker.journal.close()
+
+
+def test_the_rework_notes_frozen_into_the_package_reach_the_runner(tmp_path):
+    package = stub_package(stub_held(b""), rework=[
+        {"attempt_id": REQUIREMENT, "reason": "第二条验收未满足", "reviewed_by": "u-1",
+         "reviewed_at": 1.0},
+        {"attempt_id": WORK_ITEM, "reason": "缺少回归证据", "reviewed_by": "u-2",
+         "reviewed_at": 2.0}])
+    held = stub_held(digest_of(package))
+    worker = stub_worker(tmp_path, held=held, package=package)
+    assert drive(worker, held) == FINISHED
+    content = worker.client.artifacts[0][1]
+    assert b"rework_notes: 2" in content
+    assert "第二条验收未满足".encode("utf-8") in content
+    assert "缺少回归证据".encode("utf-8") in content
     worker.journal.close()
 
 

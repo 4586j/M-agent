@@ -128,6 +128,7 @@ class FakeRunner:
         if request.cancel.wait(self.delay):
             return RunOutcome(status="failed", summary="模拟执行被取消")
         subtask = request.package.get("subtask") or {}
+        notes = request.package.get("rework") or ()
         body = "\n".join((
             "simulated: true",
             f"attempt_id: {request.attempt_id}",
@@ -136,6 +137,8 @@ class FakeRunner:
             f"requirement_characters: {len(request.requirement_text)}",
             f"subtask_key: {subtask.get('key')}",
             f"subtask_objective: {subtask.get('objective')}",
+            f"rework_notes: {len(notes)}",
+            f"rework_reasons: {'; '.join(str(entry.get('reason')) for entry in notes)}",
         ))
         return RunOutcome(status="submitted", summary=f"模拟执行完成：{subtask.get('key')}",
                           produced=(Produced(name="simulated-output.md",

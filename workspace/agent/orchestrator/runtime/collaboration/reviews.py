@@ -250,6 +250,30 @@ class ReviewService:
                      work_item_id, project_id=project_id, target_version=updated.version)
         return updated
 
+    def rework(self, access: Access, *, project_id: str, work_item_id: str,
+               expected_version: int) -> WorkItem:
+        """Put a returned work item back in the queue; the returned result stays as evidence.
+
+        Only a manager re-opens execution rights, and only while no attempt of the item is
+        still open, so a rework can never run two attempts of one item side by side.
+        """
+        member = self._member(access, project_id)
+        if member.access_role not in MANAGER_ROLES:
+            raise Forbidden("Only a project manager can re-queue a returned work item")
+        item = access.store.get_work_item(project_id, work_item_id)
+        if item.status != "changes_requested":
+            raise InvalidState("Only a returned work item can be re-queued")
+        _version(item.version, expected_version)
+        if access.store.open_attempt(work_item_id) is not None:
+            raise InvalidState("An attempt of this work item is still open")
+        now = self.clock()
+        updated = access.store.advance_work_item(work_item_id, status="ready",
+                                                 expected_version=expected_version,
+                                                 updated_at=now)
+        record_audit(access.conn, now, access.user.user_id, "work_item.requeued", work_item_id,
+                     project_id=project_id, target_version=updated.version)
+        return updated
+
     def cancel(self, access: Access, *, project_id: str, work_item_id: str, expected_version: int,
                reason: str = "") -> WorkItem:
         """Withdraw a work item: take back execution rights, keep every side effect as evidence.
