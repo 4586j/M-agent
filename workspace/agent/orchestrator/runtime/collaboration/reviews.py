@@ -10,13 +10,14 @@ import json
 import time
 
 from .auth import Access, Forbidden, record_audit
+from .budgets import BudgetService
 from .dispatch import TOPIC_ATTEMPT_REVOKED
 from .models import (
     ATTEMPT_TERMINAL_STATUSES, AcceptanceReview, AgentProjectBinding, Attempt, Conflict,
-    InvalidState, NotFound, OwnerReview, ProjectMember, SecurityGrant, SecurityReview,
-    ValidationError, WorkItem,
+    InvalidState, NotFound, OwnerReview, ProjectMember, Requirement, SecurityGrant,
+    SecurityReview, ValidationError, WorkItem,
 )
-from .store import CollaborationStore, _choice, _text, _version
+from .store import REQUIREMENT_TRANSITIONS, CollaborationStore, _choice, _text, _version
 
 CAPABILITY = "security:approve"
 CONFIRM_DECISIONS = ("confirmed", "changes_requested")
@@ -51,11 +52,12 @@ class ReviewService:
     """Owner confirmation, business acceptance, security gate and withdrawal."""
 
     def __init__(self, *, clock=time.time, passable_rules: tuple[str, ...] = PASSABLE_RULES,
-                 review_ttl: float = DEFAULT_REVIEW_TTL):
+                 budgets: BudgetService | None = None, review_ttl: float = DEFAULT_REVIEW_TTL):
         if type(review_ttl) not in (int, float) or not 60 <= review_ttl <= 604800:
             raise ValidationError("Invalid security review lifetime")
         self.clock = clock
         self.passable_rules = tuple(passable_rules)
+        self.budgets = budgets if budgets is not None else BudgetService(clock=clock)
         self.review_ttl = float(review_ttl)
 
     @staticmethod
@@ -312,9 +314,15 @@ class ReviewService:
         if item.status == "accepted":
             raise InvalidState("Accepted work cannot be cancelled")
         _version(item.version, expected_version)
-        now = self.clock()
-        revoked = None
-        for attempt in access.store.list_attempts(project_id, work_item_id):
+        updated, _in_flight = self._withdraw(access, project_id, item, explanation=explanation,
+                                             now=self.clock())
+        return updated
+
+    def _withdraw(self, access: Access, project_id: str, item: WorkItem, *, explanation: str,
+                  now: float) -> tuple[WorkItem, int]:
+        """Close one item and its unfinished attempts; count the ones still running."""
+        in_flight = 0
+        for attempt in access.store.list_attempts(project_id, item.work_item_id):
             if attempt.status in ATTEMPT_TERMINAL_STATUSES:
                 continue
             if attempt.status == "submitted":
@@ -328,7 +336,13 @@ class ReviewService:
                                                        updated_at=now)
                 current = access.store.revoke_attempt_execution_right(
                     current.attempt_id, expected_version=current.version, updated_at=now)
-                revoked = current
+                in_flight += 1
+                # Advisory only: the worker learns to stop on its next pull, and a lost wake-up
+                # cannot advance anything because the attempt's rights are already revoked.
+                access.store.enqueue_event(project_id, TOPIC_ATTEMPT_REVOKED, {
+                    "attempt_id": current.attempt_id, "work_item_id": item.work_item_id,
+                    "instance_id": current.instance_id, "input_hash": current.input_hash,
+                    "control_epoch": current.control_epoch}, now)
             closure = ("delivered result withdrawn by human" if current.status == "cancelled"
                        else "execution right revoked by human")
             access.store.record_attempt_report(
@@ -337,16 +351,95 @@ class ReviewService:
                 payload=json.dumps({"reason": explanation, "actor_user_id": access.user.user_id},
                                    ensure_ascii=False, sort_keys=True), accepted=True,
                 reason=closure, created_at=now)
-        updated = access.store.advance_work_item(work_item_id, status="cancelled",
-                                                 expected_version=expected_version,
-                                                 updated_at=now)
-        if revoked is not None:
-            # Advisory only: the worker learns to stop on its next pull, and a lost wake-up
-            # cannot advance anything because the attempt's rights are already revoked.
-            access.store.enqueue_event(project_id, TOPIC_ATTEMPT_REVOKED, {
-                "attempt_id": revoked.attempt_id, "work_item_id": work_item_id,
-                "instance_id": revoked.instance_id, "input_hash": revoked.input_hash,
-                "control_epoch": revoked.control_epoch}, now)
-        record_audit(access.conn, now, access.user.user_id, "work_item.cancelled", work_item_id,
-                     project_id=project_id, target_version=updated.version)
+        updated = access.store.advance_work_item(item.work_item_id, status="cancelled",
+                                                 expected_version=item.version, updated_at=now)
+        record_audit(access.conn, now, access.user.user_id, "work_item.cancelled",
+                     item.work_item_id, project_id=project_id, target_version=updated.version)
+        return updated, in_flight
+
+    def reconcile_attempt(self, access: Access, *, project_id: str, attempt_id: str,
+                          outcome: str, expected_version: int, reason: str = "") -> Attempt:
+        """Close an attempt a withdrawal left unconfirmed, with what a human actually checked.
+
+        Revoking execution rights deliberately refuses any further report from the worker, so
+        ``reconciliation_required`` can only be settled by the person who looked: ``cancelled``
+        gives the reserved share back, ``failed`` keeps it charged as the cost of a run that did
+        touch the outside world.
+        """
+        choice = _choice(outcome, ("cancelled", "failed"), "outcome")
+        explanation = self._reason(reason)
+        if not explanation.strip():
+            raise ValidationError("Reconciling an attempt must record what was checked")
+        member = self._member(access, project_id)
+        attempt = access.store.get_attempt(project_id, attempt_id)
+        if (member.access_role not in MANAGER_ROLES
+                and attempt.assignee_user_id != access.user.user_id):
+            raise Forbidden("Only a project manager or the responsible member can reconcile")
+        if attempt.status in ATTEMPT_TERMINAL_STATUSES:
+            raise InvalidState("Attempt is already settled")
+        _version(attempt.version, expected_version)
+        now = self.clock()
+        item = access.store.get_work_item(project_id, attempt.work_item_id)
+        updated = access.store.advance_attempt(attempt.attempt_id, status=choice,
+                                              expected_version=attempt.version, updated_at=now)
+        access.store.record_attempt_report(
+            attempt.attempt_id, stage="cancel", lease_epoch=updated.lease_epoch,
+            control_epoch=updated.control_epoch, input_hash=updated.input_hash,
+            payload=json.dumps({"reason": explanation, "actor_user_id": access.user.user_id,
+                                "outcome": choice}, ensure_ascii=False, sort_keys=True),
+            accepted=True, reason="reconciled by human", created_at=now)
+        if choice == "cancelled" and updated.number == 1 and item.estimated_units:
+            self.budgets.release(access.store, project_id=project_id,
+                                 requirement_id=attempt.requirement_id,
+                                 attempt_id=attempt.attempt_id,
+                                 reserved_units=item.estimated_units, created_at=now)
+        record_audit(access.conn, now, access.user.user_id, f"attempt.reconciled.{choice}",
+                     attempt.attempt_id, project_id=project_id, target_version=updated.version)
+        return updated
+
+    def cancel_requirement(self, access: Access, *, project_id: str, requirement_id: str,
+                           expected_version: int, reason: str = "") -> Requirement:
+        """Stop a whole requirement: withdraw every unfinished item and return what was never spent.
+
+        The requester or a project manager cancels. Delivered evidence stays as it is: accepted
+        work, confirmations and settlements are not rewritten, because abandoning a requirement
+        does not undo the rounds that already happened. If any execution is still unconfirmed,
+        the requirement parks in ``cancelling`` instead of claiming a clean stop; calling this
+        again after that attempt reconciles moves it on to ``cancelled``.
+        """
+        explanation = self._reason(reason)
+        member = self._member(access, project_id)
+        requirement = access.store.get_requirement(project_id, requirement_id)
+        if (member.access_role not in MANAGER_ROLES
+                and requirement.requester_id != access.user.user_id):
+            raise Forbidden("Only the requester or a project manager can cancel a requirement")
+        if requirement.status == "cancelled":
+            return requirement
+        if requirement.status not in REQUIREMENT_TRANSITIONS["cancelled"]:
+            raise InvalidState("This requirement cannot be cancelled")
+        _version(requirement.version, expected_version)
+        now = self.clock()
+        plan = access.store.published_plan(project_id, requirement_id)
+        in_flight = 0
+        unspent_units = 0
+        if plan is not None:
+            for item in access.store.list_work_items(project_id, plan.plan_id):
+                if item.status in ("accepted", "cancelled"):
+                    if not access.store.list_attempts(project_id, item.work_item_id):
+                        unspent_units += item.estimated_units
+                    continue
+                _item, running = self._withdraw(access, project_id, item,
+                                                explanation=explanation, now=now)
+                in_flight += running
+                if not access.store.list_attempts(project_id, item.work_item_id):
+                    unspent_units += item.estimated_units
+            self.budgets.release_plan(access.store, project_id=project_id,
+                                      requirement_id=requirement_id, plan_id=plan.plan_id,
+                                      amount=unspent_units, created_at=now)
+        status = "cancelling" if in_flight else "cancelled"
+        updated = access.store.set_requirement_status(project_id, requirement_id, status=status,
+                                                      expected_version=requirement.version,
+                                                      updated_at=now)
+        record_audit(access.conn, now, access.user.user_id, f"requirement.{status}",
+                     requirement_id, project_id=project_id, target_version=updated.version)
         return updated

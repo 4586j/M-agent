@@ -1741,3 +1741,64 @@ def test_a_business_return_is_kept_and_reaches_the_next_attempt(api):
     assert [(entry["kind"], entry["attempt_number"], entry["reason"])
             for entry in payload["rework"]] == [("acceptance", 1, "验收项二缺测试")]
 
+
+def test_cancelling_a_requirement_and_reconciling_its_attempt_over_http(api):
+    project, requirement_id, plan, attempt, token = machine_attempt(api)
+    pid = project["project_id"]
+    base = f"/machine/attempts/{attempt.attempt_id}"
+    headers = {"X-Instance-Token": token}
+    checked(api.send("manager", "PUT", f"/projects/{pid}/requirements/{requirement_id}/budget",
+                     json={"limit_units": 10}))
+    started = checked(api.send(None, "POST", base + "/start", json=machine_claims(attempt),
+                               headers=headers))
+    actions = f"/projects/{pid}/requirements/{requirement_id}/actions"
+    version = checked(api.send("member", "GET",
+                               f"/projects/{pid}/requirements/{requirement_id}"))["version"]
+
+    checked(api.send("outsider", "POST", actions,
+                     json={"action": "cancel", "expected_version": version}), 404)
+    checked(api.send("owner", "POST", actions,
+                     json={"action": "pause", "expected_version": version}), 422)
+    checked(api.send("manager", "POST", actions,
+                     json={"action": "cancel", "expected_version": version + 3}), 409)
+    checked(api.send("member", "POST", actions, json={"action": "cancel",
+                                                      "expected_version": version},
+                     headers={"X-CSRF-Token": None}), 403)
+    stopping = checked(api.send("member", "POST", actions,
+                                json={"action": "cancel", "expected_version": version,
+                                      "reason": "需求方不再要了"}))
+    assert stopping["status"] == "cancelling"
+    assert work_item_statuses(api, project, requirement_id, plan) == ["cancelled"]
+    live = checked(api.send("manager", "GET", delivery_path(pid, attempt.attempt_id)))["attempt"]
+    assert (live["status"], live["control_epoch"]) == ("reconciliation_required",
+                                                      attempt.control_epoch + 1)
+
+    # 撤销后 Worker 的停止确认只留证据：需求停在 cancelling，直到有人核对。
+    checked(api.send(None, "POST", base + "/cancel",
+                     json={**machine_claims(live), "reason": "已停止"}, headers=headers), 409)
+    reconcile = f"/projects/{pid}/attempts/{attempt.attempt_id}/reconcile"
+    checked(api.send("outsider", "POST", reconcile,
+                     json={"outcome": "cancelled", "reason": "局外人核对",
+                           "expected_version": live["version"]}), 404)
+    checked(api.send("member", "POST", reconcile,
+                     json={"outcome": "cancelled", "reason": " ",
+                           "expected_version": live["version"]}), 422)
+    checked(api.send("member", "POST", f"/projects/{pid}/attempts/{'0' * 32}/reconcile",
+                     json={"outcome": "cancelled", "reason": "查无此尝试",
+                           "expected_version": 1}), 404)
+    checked(api.send("manager", "POST", reconcile,
+                     json={"outcome": "cancelled", "reason": "看日志",
+                           "expected_version": live["version"] + 7}), 409)
+    settled = checked(api.send("manager", "POST", reconcile,
+                               json={"outcome": "cancelled",
+                                     "reason": "核对 Worker 日志：进程已终止且未产生副作用",
+                                     "expected_version": live["version"]}))
+    assert settled["status"] == "cancelled"
+    closed = checked(api.send("member", "POST", actions,
+                              json={"action": "cancel", "expected_version": stopping["version"],
+                                    "reason": "需求方不再要了"}))
+    assert (closed["status"], closed["version"]) == ("cancelled", stopping["version"] + 1)
+    accounts = checked(api.send("member", "GET", f"/projects/{pid}/budget"))["accounts"]
+    assert [(entry["scope"], entry["used_units"], entry["remaining_units"])
+            for entry in accounts] == [("requirement", 0, 10)]
+

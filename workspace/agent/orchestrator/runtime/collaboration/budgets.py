@@ -74,6 +74,20 @@ class BudgetService:
                       ref_type="attempt", ref_key=attempt_id, kind="release",
                       delta_units=-reserved_units, created_at=created_at)
 
+    def release_plan(self, store, *, project_id: str, requirement_id: str, plan_id: str,
+                     amount: int, created_at: float) -> None:
+        """Give back the share of a plan reservation no attempt could ever spend.
+
+        Keyed by the plan, so cancelling the same requirement twice returns nothing twice.
+        Items that did run keep their own settle/release entries: this only returns estimates
+        of work that was never dispatched.
+        """
+        if type(amount) is not int or amount < 0:
+            raise ValidationError("Invalid plan release amount")
+        self._entries(store, project_id=project_id, requirement_id=requirement_id,
+                      ref_type="plan", ref_key=plan_id, kind="release",
+                      delta_units=-amount, created_at=created_at)
+
     @classmethod
     def account_payload(cls, store, account) -> dict:
         used = cls._used(store, account.scope, account.ref_id)

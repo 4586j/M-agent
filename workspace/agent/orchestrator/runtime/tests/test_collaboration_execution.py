@@ -1881,3 +1881,196 @@ def test_a_failed_item_retries_with_the_package_already_frozen(team):
     assert team.store.list_returned_acceptances(requirement.project_id,
                                                 item.work_item_id) == []
 
+
+# --- requirement level cancellation ----------------------------------------------
+
+def reserved_plan(team, *items):
+    """An approved requirement with a published, reserved plan and one live instance."""
+    requirement = approved_requirement(team)
+    plan = published_plan(team, requirement, *items)
+    instance, token = claimed_instance(team)
+    team.budgets.reserve(team.store, project_id=requirement.project_id,
+                         requirement_id=requirement.requirement_id, plan_id=plan.plan_id,
+                         amount=plan.total_units, created_at=team.clock())
+    return requirement, plan, instance, token
+
+
+def test_cancelling_a_requirement_stops_in_flight_work_and_returns_the_unspent_share(team):
+    outsider = team.store.create_user("局外人")
+    requirement, plan, _instance, token = reserved_plan(
+        team, plan_item(team, "A", estimate=5), plan_item(team, "B", estimate=3))
+    item_a = work_item(team, plan, "A")
+    item_b = work_item(team, plan, "B")
+    dispatch = team.make_dispatch(requires_real_data=False)
+    attempt = dispatch.dispatch(requirement.project_id, item_a.work_item_id)
+    execution = team.make_execution()
+    execution.start(token, attempt.attempt_id, **claims(attempt))
+
+    with session(team, team.requester) as access:
+        stopping = team.reviews.cancel_requirement(
+            access, project_id=requirement.project_id, requirement_id=requirement.requirement_id,
+            expected_version=requirement.version, reason="需求方不再要了")
+    project_id = requirement.project_id
+    # 没有收到停止确认，就不能声称外面世界没被动过：需求停在 cancelling，A 的份额仍挂着账。
+    assert stopping.status == "cancelling"
+    live = team.store.get_attempt(project_id, attempt.attempt_id)
+    assert (live.status, live.control_epoch) == ("reconciliation_required",
+                                                attempt.control_epoch + 1)
+    assert [team.store.get_work_item(project_id, item.work_item_id).status
+            for item in (item_a, item_b)] == ["cancelled", "cancelled"]
+    assert [event.payload for event in events(team, project_id,
+                                              TOPIC_ATTEMPT_REVOKED)] == [
+        json.dumps({"attempt_id": attempt.attempt_id, "work_item_id": item_a.work_item_id,
+                    "instance_id": attempt.instance_id, "input_hash": attempt.input_hash,
+                    "control_epoch": live.control_epoch}, ensure_ascii=False, sort_keys=True)]
+    assert booked(team, "requirement", requirement.requirement_id) == [("reserve", 8),
+                                                                       ("release", -3)]
+    with session(team, team.reviewer) as access, pytest.raises(InvalidState):
+        team.reviews.rework(access, project_id=project_id, work_item_id=item_b.work_item_id,
+                            expected_version=team.store.get_work_item(
+                                project_id, item_b.work_item_id).version)
+    with pytest.raises(InvalidState):
+        dispatch.dispatch(project_id, item_b.work_item_id)
+    # 被撤销的尝试仍是 A 唯一的未结算尝试：重复派发只会拿回同一条已失效的尝试，不会开新执行。
+    again = dispatch.dispatch(project_id, item_a.work_item_id)
+    assert (again.attempt_id, again.number, again.control_epoch) == (
+        attempt.attempt_id, 1, live.control_epoch)
+    assert team.store.get_work_item(project_id, item_a.work_item_id).status == "cancelled"
+
+    # 撤销之后 Worker 的停止确认只留证据、不改状态：这条尝试要由核对过的人收口。
+    with pytest.raises(Conflict):
+        execution.cancel(token, attempt.attempt_id, **claims(live))
+    assert stored_reports(team, project_id, attempt.attempt_id)[-1][:2] == ("cancel", False)
+    with session(team, outsider) as access, pytest.raises(NotFound):
+        team.reviews.reconcile_attempt(access, project_id=project_id,
+                                       attempt_id=attempt.attempt_id, outcome="cancelled",
+                                       reason="局外人核对", expected_version=live.version)
+    with session(team, team.requester) as access, pytest.raises(Forbidden):
+        team.reviews.reconcile_attempt(access, project_id=project_id,
+                                       attempt_id=attempt.attempt_id, outcome="cancelled",
+                                       reason="非负责人核对", expected_version=live.version)
+    with session(team, team.reviewer) as access:
+        with pytest.raises(ValidationError):
+            team.reviews.reconcile_attempt(access, project_id=project_id,
+                                           attempt_id=attempt.attempt_id, outcome="cancelled",
+                                           reason="  ", expected_version=live.version)
+        with pytest.raises(Conflict):
+            team.reviews.reconcile_attempt(access, project_id=project_id,
+                                           attempt_id=attempt.attempt_id, outcome="cancelled",
+                                           reason="看日志", expected_version=live.version + 2)
+        settled = team.reviews.reconcile_attempt(
+            access, project_id=project_id, attempt_id=attempt.attempt_id, outcome="cancelled",
+            reason="核对 Worker 日志：进程已终止且未产生副作用", expected_version=live.version)
+    assert settled.status == "cancelled"
+    assert team.store.get_work_item(project_id, item_a.work_item_id).status == "cancelled"
+    with session(team, team.reviewer) as access, pytest.raises(InvalidState):
+        team.reviews.reconcile_attempt(access, project_id=project_id,
+                                       attempt_id=attempt.attempt_id, outcome="failed",
+                                       reason="重复对账", expected_version=settled.version)
+    # 对账完成后 A 的份额退回，再点一次取消才把需求收口。
+    assert booked(team, "requirement", requirement.requirement_id) == [
+        ("reserve", 8), ("release", -3), ("release", -5)]
+    with session(team, team.requester) as access:
+        closed = team.reviews.cancel_requirement(
+            access, project_id=project_id, requirement_id=requirement.requirement_id,
+            expected_version=stopping.version, reason="需求方不再要了")
+    assert (closed.status, closed.version) == ("cancelled", stopping.version + 1)
+    assert booked(team, "requirement", requirement.requirement_id) == [
+        ("reserve", 8), ("release", -3), ("release", -5)]
+    assert audited(team, requirement.requirement_id)[-2:] == ["requirement.cancelling",
+                                                              "requirement.cancelled"]
+
+
+def test_cancelling_keeps_accepted_delivery_and_charges_only_real_usage(team):
+    requirement, plan, _instance, token = reserved_plan(
+        team, plan_item(team, "A", estimate=5), plan_item(team, "B", estimate=3))
+    item_a = work_item(team, plan, "A")
+    project_id = requirement.project_id
+    attempt = team.make_dispatch(requires_real_data=False).dispatch(project_id,
+                                                                    item_a.work_item_id)
+    reported = deliver(team, token, attempt, "已按原文实现")
+    with session(team, team.owner) as access:
+        confirmed_attempt, _review = team.reviews.confirm(
+            access, project_id=project_id, attempt_id=reported.attempt.attempt_id,
+            decision="confirmed", expected_version=reported.attempt.version)
+    submitted = team.store.get_work_item(project_id, item_a.work_item_id)
+    with session(team, team.owner) as access:
+        accepted_item = team.reviews.accept(access, project_id=project_id,
+                                            work_item_id=item_a.work_item_id,
+                                            decision="accepted",
+                                            expected_version=submitted.version)
+    verdict = team.store.get_acceptance_review(reported.attempt.attempt_id)
+
+    with session(team, team.requester) as access:
+        closed = team.reviews.cancel_requirement(
+            access, project_id=project_id, requirement_id=requirement.requirement_id,
+            expected_version=requirement.version)
+    # 放弃需求不撤销已经发生的交付：产物、裁定与真实用量都留在原地，未派发的那份预留回到额度。
+    assert closed.status == "cancelled"
+    kept = team.store.get_attempt(project_id, reported.attempt.attempt_id)
+    assert (kept.status, kept.result_hash, kept.usage_units) == (
+        "accepted", confirmed_attempt.result_hash, 1)
+    assert team.store.get_work_item(project_id, item_a.work_item_id) == accepted_item
+    assert team.store.get_owner_review(kept.attempt_id).review_id is not None
+    assert team.store.get_acceptance_review(kept.attempt_id) == verdict
+    assert booked(team, "requirement", requirement.requirement_id) == [
+        ("reserve", 8), ("settle", -4), ("release", -3)]
+    assert booked(team, "project", project_id) == [("reserve", 8), ("settle", -4),
+                                                   ("release", -3)]
+    with session(team, team.requester) as access:
+        assert team.reviews.cancel_requirement(access, project_id=project_id,
+                                              requirement_id=requirement.requirement_id,
+                                              expected_version=1, reason="再点一次") == closed
+    assert booked(team, "requirement", requirement.requirement_id) == [
+        ("reserve", 8), ("settle", -4), ("release", -3)]
+
+
+def test_requirement_cancellation_is_limited_and_refuses_to_reopen(team):
+    requirement, plan, _instance, _token = reserved_plan(team)
+    outsider = team.store.create_user("局外人")
+    project_id = requirement.project_id
+    with session(team, outsider) as access, pytest.raises(NotFound):
+        team.reviews.cancel_requirement(access, project_id=project_id,
+                                       requirement_id=requirement.requirement_id,
+                                       expected_version=requirement.version)
+    with session(team, team.worker) as access, pytest.raises(Forbidden):
+        team.reviews.cancel_requirement(access, project_id=project_id,
+                                       requirement_id=requirement.requirement_id,
+                                       expected_version=requirement.version)
+    with session(team, team.requester) as access, pytest.raises(Conflict):
+        team.reviews.cancel_requirement(access, project_id=project_id,
+                                       requirement_id=requirement.requirement_id,
+                                       expected_version=requirement.version + 3)
+    with session(team, team.reviewer) as access:
+        stopped = team.reviews.cancel_requirement(access, project_id=project_id,
+                                                 requirement_id=requirement.requirement_id,
+                                                 expected_version=requirement.version)
+    assert (stopped.status, stopped.version) == ("cancelled", requirement.version + 1)
+    assert booked(team, "requirement", requirement.requirement_id) == [("reserve", 4),
+                                                                      ("release", -4)]
+    with pytest.raises(InvalidState):
+        team.store.set_requirement_status(project_id, requirement.requirement_id,
+                                         status="executing", expected_version=stopped.version,
+                                         updated_at=team.clock())
+    with pytest.raises(ValidationError):
+        team.store.set_requirement_status(project_id, requirement.requirement_id,
+                                         status="completed", expected_version=stopped.version,
+                                         updated_at=team.clock())
+    fresh = approved_requirement(team)
+    with session(team, team.requester) as access:
+        never_planned = team.reviews.cancel_requirement(
+            access, project_id=project_id, requirement_id=fresh.requirement_id,
+            expected_version=fresh.version)
+    assert never_planned.status == "cancelled"
+    assert booked(team, "requirement", fresh.requirement_id) == []
+    with session(team, team.requester) as access:
+        draft = team.requirements.create_requirement(access, project_id=project_id,
+                                                     title="还在起草", content="# 草稿原文",
+                                                     acceptance_items=["第一条验收"])
+        # 起草阶段还没有派发权可收，取消请求被拒而不是先把草稿写成“已取消”。
+        with pytest.raises(InvalidState):
+            team.reviews.cancel_requirement(access, project_id=project_id,
+                                            requirement_id=draft.requirement_id,
+                                            expected_version=draft.version)
+    assert team.store.get_requirement(project_id, draft.requirement_id).status == "draft"
+

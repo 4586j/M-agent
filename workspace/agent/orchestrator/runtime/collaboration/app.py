@@ -261,6 +261,18 @@ class AcceptanceDecision(OwnerDecision):
     decision: Literal["accepted", "changes_requested"]
 
 
+class RequirementAction(Input):
+    action: Literal["cancel"]
+    expected_version: Version
+    reason: Annotated[str, Field(max_length=2048)] = ""
+
+
+class AttemptReconcile(Input):
+    outcome: Literal["cancelled", "failed"]
+    reason: Annotated[str, Field(min_length=1, max_length=2048)]
+    expected_version: Version
+
+
 class WorkItemCancel(ExpectedVersion):
     reason: Annotated[str, Field(max_length=2048)] = ""
 
@@ -405,7 +417,7 @@ def create_app(config: AppConfig) -> FastAPI:
         app.state.execution = ExecutionService(database, instances=app.state.instances,
                                                lease_ttl=config.lease_ttl,
                                                budgets=app.state.budgets)
-        app.state.reviews = ReviewService()
+        app.state.reviews = ReviewService(budgets=app.state.budgets)
         app.state.scheduler = Scheduler(database, planning=app.state.planning,
                                         queue=app.state.queue, dispatch=app.state.dispatch,
                                         auto_dispatch=config.auto_dispatch)
@@ -841,6 +853,15 @@ def create_app(config: AppConfig) -> FastAPI:
             return [asdict(review) for review in app.state.requirements.list_reviews(
                 access, project_id=pid, requirement_id=rid)]
 
+    @router.post("/projects/{pid}/requirements/{rid}/actions")
+    def requirement_action(pid: str, rid: str, body: RequirementAction, request: Request):
+        """Controlled requirement moves: today only cancelling a requirement is offered."""
+        with _access(request, project_id=pid, write=True) as access:
+            requirement = app.state.reviews.cancel_requirement(
+                access, project_id=pid, requirement_id=rid, reason=body.reason,
+                expected_version=body.expected_version)
+            return asdict(requirement)
+
     @router.post("/projects/{pid}/requirements/{rid}/plans", status_code=201)
     def generate_plan(pid: str, rid: str, request: Request):
         actor_id = _authorized_actor(request, project_id=pid, roles=MANAGERS)
@@ -905,6 +926,15 @@ def create_app(config: AppConfig) -> FastAPI:
                                                         decision=body.decision, reason=body.reason,
                                                         expected_version=body.expected_version)
             return {"attempt": _attempt_view(attempt), "review": asdict(review)}
+
+    @router.post("/projects/{pid}/attempts/{aid}/reconcile")
+    def reconcile_attempt(pid: str, aid: str, body: AttemptReconcile, request: Request):
+        """Settle an attempt whose stop was never confirmed, using what a human verified."""
+        with _access(request, project_id=pid, write=True) as access:
+            attempt = app.state.reviews.reconcile_attempt(
+                access, project_id=pid, attempt_id=aid, outcome=body.outcome,
+                reason=body.reason, expected_version=body.expected_version)
+            return _attempt_view(attempt)
 
     @router.get("/projects/{pid}/attempts/{aid}/reviews")
     def delivery_view(pid: str, aid: str, request: Request):

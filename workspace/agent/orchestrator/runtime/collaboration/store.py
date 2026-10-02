@@ -27,6 +27,15 @@ WORK_ITEM_STATUSES = (
     "pending_dependency", "ready", "waiting_agent", "running", "awaiting_owner_review",
     "submitted", "accepted", "changes_requested", "blocked", "failed", "cancelled",
 )
+# A requirement only moves through a named action, never by a free write. The statuses the
+# aggregation layer has not reached yet (integrating, awaiting_acceptance, rework, paused,
+# completed) are absent on purpose: asking for one is refused instead of faking a journey.
+REQUIREMENT_TRANSITIONS: dict[str, tuple[str, ...]] = {
+    "planning_blocked": ("approved", "planning", "planning_blocked"),
+    "executing": ("approved", "planning", "planning_blocked"),
+    "cancelling": ("approved", "planning", "planning_blocked", "executing", "cancelling"),
+    "cancelled": ("approved", "planning", "planning_blocked", "executing", "cancelling"),
+}
 
 
 def _text(value: str, field: str, limit: int = 512) -> str:
@@ -684,9 +693,12 @@ class CollaborationStore:
 
     def set_requirement_status(self, project_id: str, requirement_id: str, *, status: str,
                                expected_version: int, updated_at: float) -> Requirement:
-        _choice(status, ("planning_blocked", "executing"), "status")
+        _choice(status, tuple(REQUIREMENT_TRANSITIONS), "status")
         with self._write() as conn:
             requirement = self._requirement(conn, project_id, requirement_id)
+            if requirement.status not in REQUIREMENT_TRANSITIONS[status]:
+                raise InvalidState(
+                    f"Requirement cannot move from {requirement.status} to {status}")
             _version(requirement.version, expected_version)
             conn.execute(
                 "UPDATE requirements SET status=?,version=version+1,updated_at=? WHERE requirement_id=?",
