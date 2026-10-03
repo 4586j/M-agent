@@ -24,6 +24,7 @@ button.soft { border-color: #b9c3d0; background: #f2f5f9; color: #33404f; }
 .evidence { border-left: 3px solid #d8dee7; padding-left: 10px; margin-top: 8px; }
 .original { background: #f6f8fa; border: 1px solid #d8dee7; border-radius: 6px;
   padding: 10px 12px; white-space: pre-wrap; word-break: break-word; }
+.draft { width: 100%; box-sizing: border-box; margin-top: 6px; }
 dl { margin: 6px 0; }
 dt { font-weight: 600; margin-top: 8px; }
 dd { margin: 0 0 4px 16px; color: #33404f; overflow-wrap: anywhere; }

@@ -15,12 +15,22 @@ const DECISIONS = {
   rework_queue: {title: "重新排队", field: null, reason: false, choices: []},
   worker_attention: {title: "执行机失联（租约已过期）", field: null, reason: true, choices: [],
                      hint: "写下你看到的实情（可留空）",
-                     look: "instances", lookLabel: "查看执行机", submitLabel: "撤销执行权"},
+                     look: "instances", lookLabel: "查看执行机", submitLabel: "撤销执行权",
+                     shown: renderInstance},
+  requirement_review: {title: "需求评审（人工确认这一版原文）", field: "action", reason: true,
+                       hint: "驳回时写下要改哪里",
+                       choices: [["approve", "批准这一版"], ["reject", "驳回"]],
+                       extra: {revision_id: "review_revision_id"},
+                       look: "revision", lookLabel: "查看送审原文", shown: showRevision},
+  requirement_returned: {title: "需求被打回，改稿后重送", field: null, reason: false, choices: [],
+                         look: "revision", lookLabel: "查看当前原文", shown: showRevision,
+                         edit: true},
 };
 
 let csrf = null;
 let me = null;
 let role = null;
+let roster = [];
 let projectNames = {};
 let controller = new AbortController();
 
@@ -97,14 +107,17 @@ async function refresh() {
   const projectId = fields.project.value;
   const requirementId = fields.requirement.value;
   role = null;
+  roster = [];
   fields.todos.replaceChildren();
   fields.detail.replaceChildren();
   text(fields.todoCount, "");
+  say("");
   if (!projectId) {
-    return;
+    return true;
   }
   try {
     role = (await get(`/projects/${projectId}`)).access_role;
+    roster = await get(`/projects/${projectId}/members`);
     const inbox = await get("/inbox");
     const todos = inbox.filter(item => DECISIONS[item.item_type]);
     for (const entry of todos) {
@@ -118,11 +131,14 @@ async function refresh() {
     if (requirementId) {
       await renderRequirement(projectId, requirementId);
     }
-    say("");
+    return true;
   } catch (error) {
-    if (error.name !== "AbortError") {
-      say(error.message, "error");
+    if (error.name === "AbortError") {
+      // 被更晚的一次刷新取代：这一轮不算失败，也不报错误。
+      return true;
     }
+    say(error.message, "error");
+    return false;
   }
 }
 
@@ -149,17 +165,18 @@ function renderTodo(entry) {
   facts.hidden = true;
   const form = add(row, "div", "form-row");
   if (spec.look) {
-    const peek = add(form, "button", null, spec.lookLabel);
+    const peek = add(form, "button", "soft", spec.lookLabel);
     peek.type = "button";
     peek.addEventListener("click", async () => {
       try {
         const rows = await get(entry.links[spec.look]);
+        const list = Array.isArray(rows) ? rows : [rows];
         facts.replaceChildren();
-        if (!rows.length) {
+        if (!list.length) {
           add(facts, "dd", null, "这个执行身份还没有认领到任何实例。");
         }
-        for (const instance of rows) {
-          renderInstance(facts, instance);
+        for (const item of list) {
+          spec.shown(facts, item);
         }
         facts.hidden = false;
       } catch (error) {
@@ -169,7 +186,24 @@ function renderTodo(entry) {
       }
     });
   }
+  if (spec.edit) {
+    renderDraft(row, form, entry);
+  } else {
+    renderChoice(form, entry, spec);
+  }
+  if (entry.unread) {
+    ackButton(form, entry);
+  }
+}
+
+function showRevision(parent, revision) {
+  add(parent, "dd", null, `第 ${revision.number} 版 · 摘要 ${revision.content_hash}`);
+  add(parent, "pre", "original", revision.content);
+}
+
+function renderChoice(form, entry, spec) {
   let choice;
+  let reason;
   if (spec.choices.length) {
     choice = add(form, "select");
     for (const [value, label] of spec.choices) {
@@ -179,7 +213,6 @@ function renderTodo(entry) {
       choice.appendChild(option);
     }
   }
-  let reason;
   if (spec.reason) {
     reason = add(form, "input");
     reason.placeholder = spec.hint || "写下理由（退回时必填）";
@@ -196,10 +229,12 @@ function renderTodo(entry) {
     if (reason) {
       body.reason = reason.value;
     }
+    for (const [name, field] of Object.entries(spec.extra || {})) {
+      body[name] = entry[field];
+    }
     try {
       await post(entry.href, body);
-      say(`${spec.title}已记录。`, "ok");
-      await load();
+      await report(`${spec.title}已记录。`);
     } catch (error) {
       button.disabled = false;
       if (error.name !== "AbortError") {
@@ -207,24 +242,81 @@ function renderTodo(entry) {
       }
     }
   });
-  if (entry.unread) {
-    // 读过不等于裁定：标记之后这条待办仍然挂着，直到写下决定。
-    const seen = add(form, "button", "soft", "标记已读");
-    seen.type = "button";
-    seen.addEventListener("click", async () => {
-      seen.disabled = true;
-      try {
-        await post("/inbox/ack", {item_key: entry.key});
-        say("已记下你看过了这条待办；裁定仍然挂着。", "ok");
-        await load();
-      } catch (error) {
-        seen.disabled = false;
-        if (error.name !== "AbortError") {
-          say(`标记已读失败：${error.message}`, "error");
-        }
-      }
-    });
+}
+
+function renderDraft(row, form, entry) {
+  const editor = document.createElement("textarea");
+  editor.className = "draft";
+  editor.rows = 8;
+  editor.placeholder = "改后的需求原文：整篇贴回来，服务端存的是完整原文";
+  row.insertBefore(editor, form);
+  const path = `/projects/${entry.project_id}/requirements/${entry.requirement_id}`;
+  draftButton(form, "把当前原文载入编辑框", "soft", async () => {
+    const revision = await get(entry.links.revision);
+    editor.value = revision.content;
+    say("当前原文已载入编辑框。", "ok");
+  });
+  draftButton(form, "保存为新修订", null, async () => {
+    await post(`${path}/revisions`, {content: editor.value,
+                                      expected_version: entry.expected_version});
+    await report("新修订已保存；再选一位审核人点「重新送审」。");
+  });
+  // 驳回会把审核人清空，所以重送必须重新点名：这一步没有可继承的默认值。
+  const reviewer = add(form, "select");
+  const blank = add(reviewer, "option", null, "选择审核人");
+  blank.value = "";
+  for (const member of roster.filter(item => item.status === "active")) {
+    const option = document.createElement("option");
+    option.value = member.user_id;
+    option.textContent = `${member.display_name}（${member.access_role}）`;
+    reviewer.appendChild(option);
   }
+  draftButton(form, "重新送审", null, async () => {
+    if (!reviewer.value) {
+      say("先选一位审核人，再送审。", "error");
+      return;
+    }
+    await post(entry.href, {action: "request", revision_id: entry.current_revision_id,
+                            reviewer_user_id: reviewer.value,
+                            expected_version: entry.expected_version});
+    await report("已重新送审，等审核人裁定这一版。");
+  });
+}
+
+function draftButton(form, label, kind, run) {
+  const button = add(form, "button", kind, label);
+  button.type = "button";
+  button.addEventListener("click", async () => {
+    button.disabled = true;
+    try {
+      await run();
+    } catch (error) {
+      if (error.name !== "AbortError") {
+        say(`${label}失败：${error.message}`, "error");
+      }
+    } finally {
+      // 写成功时整行会被重建，这里只是让「没发出去」的那次点击还能再点一次。
+      button.disabled = false;
+    }
+  });
+}
+
+function ackButton(form, entry) {
+  // 读过不等于裁定：标记之后这条待办仍然挂着，直到写下决定。
+  const seen = add(form, "button", "soft", "标记已读");
+  seen.type = "button";
+  seen.addEventListener("click", async () => {
+    seen.disabled = true;
+    try {
+      await post("/inbox/ack", {item_key: entry.key});
+      await report("已记下你看过了这条待办；裁定仍然挂着。");
+    } catch (error) {
+      seen.disabled = false;
+      if (error.name !== "AbortError") {
+        say(`标记已读失败：${error.message}`, "error");
+      }
+    }
+  });
 }
 
 async function renderRequirement(projectId, requirementId) {
@@ -244,8 +336,7 @@ async function renderRequirement(projectId, requirementId) {
       try {
         await post(`/projects/${projectId}/requirements/${requirementId}/actions`,
                    {action: "advance", expected_version: requirement.version});
-        say("需求状态已按工作项事实重算。", "ok");
-        await load();
+        await report("需求状态已按工作项事实重算。");
       } catch (error) {
         advance.disabled = false;
         if (error.name !== "AbortError") {
@@ -270,9 +361,8 @@ async function renderRequirement(projectId, requirementId) {
         const moved = await post(`/projects/${projectId}/requirements/${requirementId}/actions`,
                                  {action: "cancel", expected_version: requirement.version,
                                   reason: reason.value});
-        say(moved.status === "cancelled" ? "需求已取消。"
-                                        : "需求进入取消流程；停止未确认的执行会生成对账待办。", "ok");
-        await load();
+        await report(moved.status === "cancelled" ? "需求已取消。"
+                                                  : "需求进入取消流程；停止未确认的执行会生成对账待办。");
       } catch (error) {
         cancel.disabled = false;
         if (error.name !== "AbortError") {
@@ -316,7 +406,6 @@ async function renderWorkItems(block, projectId, requirementId) {
     add(block, "dd", null, "还没有已发布的计划，界面不代为拆解需求。");
     return;
   }
-  const roster = await get(`/projects/${projectId}/members`);
   const people = {};
   for (const member of roster) {
     people[member.user_id] = member.display_name;
@@ -341,8 +430,7 @@ async function renderWorkItems(block, projectId, requirementId) {
       tick.disabled = true;
       try {
         const moved = await post(`/projects/${projectId}/scheduler/tick`, {});
-        say(`队列已重算，${moved.work_items_changed} 个工作项状态变化。`, "ok");
-        await load();
+        await report(`队列已重算，${moved.work_items_changed} 个工作项状态变化。`);
       } catch (error) {
         tick.disabled = false;
         if (error.name !== "AbortError") {
@@ -366,8 +454,7 @@ async function renderWorkItems(block, projectId, requirementId) {
         button.disabled = true;
         try {
           await post(`/projects/${projectId}/work-items/${item.work_item_id}/dispatch`, {});
-          say("已为该工作项派发一次尝试。", "ok");
-          await load();
+          await report("已为该工作项派发一次尝试。");
         } catch (error) {
           button.disabled = false;
           if (error.name !== "AbortError") {
@@ -389,8 +476,7 @@ async function renderWorkItems(block, projectId, requirementId) {
         try {
           await post(`/projects/${projectId}/work-items/${item.work_item_id}/cancel`,
                      {expected_version: item.version, reason: reason.value});
-          say("执行权已撤销；若停止未被确认，会转为一条对账待办。", "ok");
-          await load();
+          await report("执行权已撤销；若停止未被确认，会转为一条对账待办。");
         } catch (error) {
           button.disabled = false;
           if (error.name !== "AbortError") {
@@ -400,6 +486,26 @@ async function renderWorkItems(block, projectId, requirementId) {
       });
     }
   }
+}
+
+async function report(message) {
+  // 先刷新再报结果：刷新会重写整块面板，反过来的话这句提示一闪就没了。
+  // 刷新失败也不能把已经写进去的裁定说成没写，所以两句一起留下。
+  let kind = "ok";
+  let detail = "";
+  try {
+    if (!await load()) {
+      kind = "";
+      detail = "（刷新失败，请按刷新重试）";
+    }
+  } catch (error) {
+    if (error.name === "AbortError") {
+      return;
+    }
+    kind = "";
+    detail = `（刷新失败：${error.message}）`;
+  }
+  say(message + detail, kind);
 }
 
 async function loadProjects() {
@@ -417,14 +523,14 @@ async function loadProjects() {
   if ([...fields.project.options].some(option => option.value === kept)) {
     fields.project.value = kept;
   }
-  await loadRequirements();
+  return loadRequirements();
 }
 
 async function loadRequirements() {
   const kept = fields.requirement.value;
   fields.requirement.replaceChildren();
   if (!fields.project.value) {
-    return;
+    return true;
   }
   const list = await get(`/projects/${fields.project.value}/requirements`);
   for (const requirement of list) {
@@ -436,11 +542,11 @@ async function loadRequirements() {
   if ([...fields.requirement.options].some(option => option.value === kept)) {
     fields.requirement.value = kept;
   }
-  await refresh();
+  return refresh();
 }
 
 async function load() {
-  await loadRequirements();
+  return loadRequirements();
 }
 
 function enter(session) {
@@ -492,6 +598,7 @@ fields.logout.addEventListener("click", async () => {
   csrf = null;
   me = null;
   role = null;
+  roster = [];
   projectNames = {};
   fields.workspace.hidden = true;
   fields.login.hidden = false;
@@ -502,6 +609,7 @@ fields.logout.addEventListener("click", async () => {
   text(fields.todoCount, "");
   fields.detail.replaceChildren();
   text(fields.who, "");
+  say("");
 });
 
 fields.project.addEventListener("change", loadRequirements);

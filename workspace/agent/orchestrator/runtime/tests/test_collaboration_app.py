@@ -7,6 +7,7 @@ import base64
 import hashlib
 import json
 from pathlib import Path
+import re
 import sqlite3
 import subprocess
 import sys
@@ -2026,6 +2027,73 @@ def test_a_new_requirement_revision_is_unread_again(api):
     assert keys("manager") == [(f"requirement_review:{pid}:{rid}:{second}", True)]
 
 
+def test_the_drafting_todos_advertise_a_review_action_that_works(api):
+    project = api.project()
+    pid = project["project_id"]
+    api.member(project)
+    api.member(project, "manager", "manager")
+    manager = api.identities["manager"]["user"]["user_id"]
+    created = create_requirement(api, project, content="# 需求文档\n少了验收标准")
+    rid = created["requirement_id"]
+    reviews = reviews_path(project, rid)
+
+    def drafting(actor):
+        return [entry for entry in checked(api.send(actor, "GET", "/inbox"))
+                if entry["item_type"].startswith("requirement_")]
+
+    assert drafting("manager") == [] and drafting("member") == []
+    checked(api.send("member", "POST", reviews,
+                     json={"action": "request", "revision_id": created["current_revision_id"],
+                           "reviewer_user_id": manager, "expected_version": created["version"]}))
+    owed = drafting("manager")
+    # 草稿阶段待办与执行阶段同一种契约：写回哪里、对着哪个版本、要看哪一份原文。
+    assert [(entry["item_type"], entry["action"], entry["href"]) for entry in owed] == [
+        ("requirement_review", "review_requirement", reviews)]
+    entry = owed[0]
+    live = checked(api.send("member", "GET", f"/projects/{pid}/requirements/{rid}"))
+    assert (entry["expected_version"], entry["review_revision_id"], entry["unread"]) == (
+        live["version"], created["current_revision_id"], True)
+    assert checked(api.send("manager", "GET", entry["links"]["revision"]))["content"] \
+        == "# 需求文档\n少了验收标准"
+    rejected = checked(api.send("manager", "POST", entry["href"],
+                                json={"action": "reject",
+                                      "revision_id": entry["review_revision_id"],
+                                      "reason": "补齐验收标准",
+                                      "expected_version": entry["expected_version"]}))
+    assert rejected["requirement"]["status"] == "draft"
+    assert drafting("manager") == []
+    back = drafting("member")
+    assert [(item["item_type"], item["action"]) for item in back] == [
+        ("requirement_returned", "request_review")]
+    # 驳回把审核人清空了，所以重送必须重新点名一位：待办不会假装还有一个默认审核人。
+    assert back[0]["reviewer_id"] is None
+    assert back[0]["links"]["revision"].endswith(back[0]["current_revision_id"])
+    saved = checked(api.send("member", "POST", f"/projects/{pid}/requirements/{rid}/revisions",
+                             json={"content": "# 需求文档\n补上验收标准",
+                                   "expected_version": back[0]["expected_version"]}), 201)
+    checked(api.send("member", "POST", back[0]["href"],
+                     json={"action": "request", "revision_id": saved["revision"]["revision_id"],
+                           "reviewer_user_id": manager,
+                           "expected_version": back[0]["expected_version"]}), 409)
+    again = drafting("member")[0]
+    assert again["key"] != back[0]["key"] and again["unread"] is True
+    assert again["current_revision_id"] == saved["revision"]["revision_id"]
+    checked(api.send("member", "POST", again["href"],
+                     json={"action": "request", "revision_id": again["current_revision_id"],
+                           "reviewer_user_id": manager,
+                           "expected_version": again["expected_version"]}))
+    assert drafting("member") == []
+    review = drafting("manager")[0]
+    assert (review["item_type"], review["unread"], review["review_revision_id"]) == (
+        "requirement_review", True, saved["revision"]["revision_id"])
+    approved = checked(api.send("manager", "POST", review["href"],
+                                json={"action": "approve",
+                                      "revision_id": review["review_revision_id"],
+                                      "expected_version": review["expected_version"]}))
+    assert approved["requirement"]["status"] == "approved"
+    assert drafting("manager") == [] and drafting("member") == []
+
+
 def test_the_panel_is_static_and_gives_nobody_a_data_free_path(api):
     def asset(path):
         return api.client.request("GET", path, headers={"Origin": ORIGIN})
@@ -2047,4 +2115,13 @@ def test_the_panel_is_static_and_gives_nobody_a_data_free_path(api):
         assert response.status_code in (400, 401, 404), (escape, response.status_code)
     typed = asset("/ui")
     assert typed.status_code == 200 and typed.url.path == "/ui/" and 'id="todos"' in typed.text
+
+
+def test_the_panel_renders_every_kind_of_to_do_the_inbox_can_advertise():
+    # 这一条守住的是本轮补上的那类静默缺口：后端新增一种待办，面板忘了承接，人就永远看不到它。
+    from collaboration.inbox import ACTIONS, DRAFT_ACTIONS
+
+    source = (RUNTIME / "collaboration" / "web" / "app.js").read_text(encoding="utf-8")
+    block = source.split("const DECISIONS = {", 1)[1].split("\n};", 1)[0]
+    assert set(re.findall(r"^  (\w+): \{", block, re.MULTILINE)) == set(ACTIONS) | set(DRAFT_ACTIONS)
 

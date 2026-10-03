@@ -47,6 +47,21 @@ ACTIONS = {
                          "/projects/{project_id}/requirements/{requirement_id}/acceptance", {}),
 }
 
+# The drafting to-dos come from a different projection, so they arrive as bare requirement rows
+# without an action to take. They get the same promise as the six above: this is the write that
+# clears me, and this is the version of mine that it has to be made against. Both of them are
+# decided on the reviews endpoint, and both of them link to the text the decision is made about.
+DRAFT_ACTIONS = {
+    "requirement_review": ("review_requirement",
+                           "/projects/{project_id}/requirements/{requirement_id}/reviews",
+                           {"revision": "/projects/{project_id}/requirements/{requirement_id}"
+                                          "/revisions/{review_revision_id}"}),
+    "requirement_returned": ("request_review",
+                             "/projects/{project_id}/requirements/{requirement_id}/reviews",
+                             {"revision": "/projects/{project_id}/requirements/{requirement_id}"
+                                            "/revisions/{current_revision_id}"}),
+}
+
 
 class InboxService:
     """A projection over stored state, plus one piece of per-user read state.
@@ -71,12 +86,19 @@ class InboxService:
         return entries
 
     def stamp(self, access: Access, entries: list[dict]) -> list[dict]:
-        """Attach every to-do's identity and whether this person has already seen it."""
+        """Give every to-do its identity, this reader's unread flag, and an action if it lacks one."""
         acked = access.store.inbox_acks(access.user.user_id)
         stamped = []
         for entry in entries:
             key = _identity(entry)
-            stamped.append({**entry, "key": key, "unread": key not in acked})
+            enriched = {**entry, "key": key, "unread": key not in acked}
+            if entry["item_type"] in DRAFT_ACTIONS:
+                action, template, links = DRAFT_ACTIONS[entry["item_type"]]
+                enriched.update({"action": action, "href": template.format(**entry),
+                                 "expected_version": entry["version"],
+                                 "links": {name: path.format(**entry)
+                                           for name, path in links.items()}})
+            stamped.append(enriched)
         return stamped
 
     def ack(self, access: Access, *, item_key: str, known: set[str]) -> None:
