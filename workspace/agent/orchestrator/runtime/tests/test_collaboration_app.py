@@ -2042,17 +2042,23 @@ def test_the_drafting_todos_advertise_a_review_action_that_works(api):
                 if entry["item_type"].startswith("requirement_")]
 
     assert drafting("manager") == [] and drafting("member") == []
+    checked(api.send("member", "POST", f"/projects/{pid}/requirements/{rid}/messages",
+                     json={"content": "导出先只支持 CSV"}), 201)
     checked(api.send("member", "POST", reviews,
                      json={"action": "request", "revision_id": created["current_revision_id"],
                            "reviewer_user_id": manager, "expected_version": created["version"]}))
     owed = drafting("manager")
-    # 草稿阶段待办与执行阶段同一种契约：写回哪里、对着哪个版本、要看哪一份原文。
+    # 草稿阶段待办与执行阶段同一种契约：写回哪里、对着哪个版本、要看哪一份原文与澄清。
     assert [(entry["item_type"], entry["action"], entry["href"]) for entry in owed] == [
         ("requirement_review", "review_requirement", reviews)]
     entry = owed[0]
     live = checked(api.send("member", "GET", f"/projects/{pid}/requirements/{rid}"))
     assert (entry["expected_version"], entry["review_revision_id"], entry["unread"]) == (
         live["version"], created["current_revision_id"], True)
+    # 澄清只能在起草期写，所以被点名的审核人照待办给的链接读到的就是那一份上下文。
+    assert [item["content"] for item in checked(api.send("manager", "GET",
+                                                         entry["links"]["messages"]))] == [
+        "导出先只支持 CSV"]
     assert checked(api.send("manager", "GET", entry["links"]["revision"]))["content"] \
         == "# 需求文档\n少了验收标准"
     rejected = checked(api.send("manager", "POST", entry["href"],
@@ -2101,7 +2107,7 @@ def test_the_panel_is_static_and_gives_nobody_a_data_free_path(api):
     page = asset("/ui/")
     assert page.status_code == 200 and page.headers["cache-control"] == "no-store"
     assert 'id="todos"' in page.text and 'id="login-form"' in page.text
-    assert 'id="todoCount"' in page.text
+    assert 'id="todoCount"' in page.text and 'id="createBox"' in page.text
     assert page.headers["content-type"].startswith("text/html")
     assert asset("/ui/app.js").status_code == 200
     assert asset("/ui/styles.css").status_code == 200
@@ -2115,6 +2121,41 @@ def test_the_panel_is_static_and_gives_nobody_a_data_free_path(api):
         assert response.status_code in (400, 401, 404), (escape, response.status_code)
     typed = asset("/ui")
     assert typed.status_code == 200 and typed.url.path == "/ui/" and 'id="todos"' in typed.text
+
+
+def test_the_panel_drafting_chain_creates_clarifies_and_submits(api):
+    project = api.project()
+    pid = project["project_id"]
+    api.member(project)
+    api.member(project, "manager", "manager")
+    manager = api.identities["manager"]["user"]["user_id"]
+
+    # 面板的创建表单发的就是这一份载荷：标题 + 整篇原文 + 每行一条验收标准。
+    created = checked(api.send("member", "POST", f"/projects/{pid}/requirements",
+                               json={"title": "给报表加导出", "content": "# 需求原文\n按当前筛选导出。\n",
+                                     "acceptance_items": ["导出行数与筛选一致"]}), 201)
+    rid = created["requirement_id"]
+    path = f"/projects/{pid}/requirements/{rid}"
+    assert (created["status"], created["requester_id"]) == (
+        "draft", api.identities["member"]["user"]["user_id"])
+    posted = checked(api.send("member", "POST", path + "/messages",
+                              json={"content": "导出格式先只支持 CSV"}), 201)
+    assert [entry["content"] for entry in posted] == ["导出格式先只支持 CSV"]
+    listed = checked(api.send("member", "GET", path + "/messages"))
+    # 本服务没接澄清模型，对话里只有人写下的话：面板不能把空列表渲染成「有人回复了」。
+    assert [entry["role"] for entry in listed] == ["user"]
+    checked(api.send("member", "POST", path + "/reviews",
+                     json={"action": "request", "revision_id": created["current_revision_id"],
+                           "reviewer_user_id": manager, "expected_version": created["version"]}))
+    review = [entry for entry in checked(api.send("manager", "GET", "/inbox"))
+              if entry["item_type"] == "requirement_review"]
+    assert [(entry["href"], entry["expected_version"], entry["unread"]) for entry in review] == [
+        (path + "/reviews", created["version"] + 1, True)]
+    approved = checked(api.send("manager", "POST", review[0]["href"],
+                                json={"action": "approve",
+                                      "revision_id": review[0]["review_revision_id"],
+                                      "expected_version": review[0]["expected_version"]}))
+    assert approved["requirement"]["status"] == "approved"
 
 
 def test_the_panel_renders_every_kind_of_to_do_the_inbox_can_advertise():

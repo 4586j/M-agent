@@ -55,7 +55,9 @@ DRAFT_ACTIONS = {
     "requirement_review": ("review_requirement",
                            "/projects/{project_id}/requirements/{requirement_id}/reviews",
                            {"revision": "/projects/{project_id}/requirements/{requirement_id}"
-                                          "/revisions/{review_revision_id}"}),
+                                          "/revisions/{review_revision_id}",
+                            "messages": "/projects/{project_id}/requirements/{requirement_id}"
+                                        "/messages"}),
     "requirement_returned": ("request_review",
                              "/projects/{project_id}/requirements/{requirement_id}/reviews",
                              {"revision": "/projects/{project_id}/requirements/{requirement_id}"

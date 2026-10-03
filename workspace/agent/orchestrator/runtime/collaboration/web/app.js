@@ -21,7 +21,8 @@ const DECISIONS = {
                        hint: "驳回时写下要改哪里",
                        choices: [["approve", "批准这一版"], ["reject", "驳回"]],
                        extra: {revision_id: "review_revision_id"},
-                       look: "revision", lookLabel: "查看送审原文", shown: showRevision},
+                       look: "revision", lookLabel: "查看送审原文", shown: showRevision,
+                       messages: true},
   requirement_returned: {title: "需求被打回，改稿后重送", field: null, reason: false, choices: [],
                          look: "revision", lookLabel: "查看当前原文", shown: showRevision,
                          edit: true},
@@ -32,11 +33,12 @@ let me = null;
 let role = null;
 let roster = [];
 let projectNames = {};
+let pendingRequirement = null;
 let controller = new AbortController();
 
 const fields = {};
 for (const id of ["login", "workspace", "who", "logout", "project", "requirement", "todos",
-                  "todoCount", "detail", "status"]) {
+                  "todoCount", "createBox", "detail", "status"]) {
   fields[id] = document.getElementById(id);
 }
 
@@ -109,6 +111,7 @@ async function refresh() {
   role = null;
   roster = [];
   fields.todos.replaceChildren();
+  fields.createBox.replaceChildren();
   fields.detail.replaceChildren();
   text(fields.todoCount, "");
   say("");
@@ -128,6 +131,7 @@ async function refresh() {
     if (!fields.todos.children.length) {
       add(fields.todos, "li", null, "当前没有属于你的待办裁定。");
     }
+    renderCreate(projectId);
     if (requirementId) {
       await renderRequirement(projectId, requirementId);
     }
@@ -165,29 +169,19 @@ function renderTodo(entry) {
   facts.hidden = true;
   const form = add(row, "div", "form-row");
   if (spec.look) {
-    const peek = add(form, "button", "soft", spec.lookLabel);
-    peek.type = "button";
-    peek.addEventListener("click", async () => {
-      try {
-        const rows = await get(entry.links[spec.look]);
-        const list = Array.isArray(rows) ? rows : [rows];
-        facts.replaceChildren();
-        if (!list.length) {
-          add(facts, "dd", null, "这个执行身份还没有认领到任何实例。");
-        }
-        for (const item of list) {
-          spec.shown(facts, item);
-        }
-        facts.hidden = false;
-      } catch (error) {
-        if (error.name !== "AbortError") {
-          say(`${spec.lookLabel}失败：${error.message}`, "error");
-        }
-      }
-    });
+    peekButton(form, entry, facts, spec.look, spec.lookLabel, spec.shown,
+               "这个执行身份还没有认领到任何实例。");
+    if (spec.messages) {
+      // 提出人写在澄清里的边界，正是审核人要照着判的那部分上下文。
+      peekButton(form, entry, facts, "messages", "查看澄清对话", showMessage,
+                 "提出人还没有补充过澄清说明。");
+    }
   }
   if (spec.edit) {
-    renderDraft(row, form, entry);
+    draftEditor(row, {project_id: entry.project_id, requirement_id: entry.requirement_id,
+                      expected_version: entry.expected_version,
+                      current_revision_id: entry.current_revision_id,
+                      revision_href: entry.links.revision, submit: "重新送审"});
   } else {
     renderChoice(form, entry, spec);
   }
@@ -196,9 +190,37 @@ function renderTodo(entry) {
   }
 }
 
+function peekButton(form, entry, facts, link, label, shown, empty) {
+  const button = add(form, "button", "soft", label);
+  button.type = "button";
+  button.addEventListener("click", async () => {
+    try {
+      const rows = await get(entry.links[link]);
+      const list = Array.isArray(rows) ? rows : [rows];
+      facts.replaceChildren();
+      if (!list.length) {
+        add(facts, "dd", null, empty);
+      }
+      for (const item of list) {
+        shown(facts, item);
+      }
+      facts.hidden = false;
+    } catch (error) {
+      if (error.name !== "AbortError") {
+        say(`${label}失败：${error.message}`, "error");
+      }
+    }
+  });
+}
+
 function showRevision(parent, revision) {
   add(parent, "dd", null, `第 ${revision.number} 版 · 摘要 ${revision.content_hash}`);
   add(parent, "pre", "original", revision.content);
+}
+
+function showMessage(parent, message) {
+  add(parent, "dd", null, `${message.role === "user" ? "提出人" : "助手"} · `
+                          + `${when(message.created_at)} · ${message.content}`);
 }
 
 function renderChoice(form, entry, spec) {
@@ -244,42 +266,98 @@ function renderChoice(form, entry, spec) {
   });
 }
 
-function renderDraft(row, form, entry) {
-  const editor = document.createElement("textarea");
-  editor.className = "draft";
+function draftEditor(parent, target) {
+  const editor = add(parent, "textarea", "draft");
   editor.rows = 8;
-  editor.placeholder = "改后的需求原文：整篇贴回来，服务端存的是完整原文";
-  row.insertBefore(editor, form);
-  const path = `/projects/${entry.project_id}/requirements/${entry.requirement_id}`;
-  draftButton(form, "把当前原文载入编辑框", "soft", async () => {
-    const revision = await get(entry.links.revision);
-    editor.value = revision.content;
-    say("当前原文已载入编辑框。", "ok");
-  });
+  editor.placeholder = "需求原文：整篇贴回来，服务端存的是完整原文";
+  const form = add(parent, "div", "form-row");
+  const path = `/projects/${target.project_id}/requirements/${target.requirement_id}`;
+  if (target.revision_href) {
+    draftButton(form, "把当前原文载入编辑框", "soft", async () => {
+      const revision = await get(target.revision_href);
+      editor.value = revision.content;
+      say("当前原文已载入编辑框。", "ok");
+    });
+  }
   draftButton(form, "保存为新修订", null, async () => {
     await post(`${path}/revisions`, {content: editor.value,
-                                      expected_version: entry.expected_version});
-    await report("新修订已保存；再选一位审核人点「重新送审」。");
+                                      expected_version: target.expected_version});
+    await report(`新修订已保存；再选审核人点「${target.submit}」。`);
   });
-  // 驳回会把审核人清空，所以重送必须重新点名：这一步没有可继承的默认值。
-  const reviewer = add(form, "select");
-  const blank = add(reviewer, "option", null, "选择审核人");
+  if (target.current_revision_id) {
+    // 驳回会把审核人清空，首次送审也还没点过名，所以这一步必须重新选：没有可继承的默认值。
+    const reviewer = reviewerSelect(form);
+    draftButton(form, target.submit, null, async () => {
+      if (!reviewer.value) {
+        say("先选一位审核人，再送审。", "error");
+        return;
+      }
+      await post(`${path}/reviews`, {action: "request", revision_id: target.current_revision_id,
+                                     reviewer_user_id: reviewer.value,
+                                     expected_version: target.expected_version});
+      await report("已送审，等审核人裁定这一版。");
+    });
+  }
+}
+
+function reviewerSelect(form) {
+  const select = add(form, "select");
+  const blank = add(select, "option", null, "选择审核人");
   blank.value = "";
   for (const member of roster.filter(item => item.status === "active")) {
     const option = document.createElement("option");
     option.value = member.user_id;
     option.textContent = `${member.display_name}（${member.access_role}）`;
-    reviewer.appendChild(option);
+    select.appendChild(option);
   }
-  draftButton(form, "重新送审", null, async () => {
-    if (!reviewer.value) {
-      say("先选一位审核人，再送审。", "error");
+  return select;
+}
+
+function renderCreate(projectId) {
+  const box = fields.createBox;
+  add(box, "p", "locator", "写成一份完整原文再送审：审核人点名的那一位批准之后，需求才会进入拆解与执行。");
+  const title = add(box, "input");
+  title.placeholder = "需求标题";
+  title.size = 34;
+  const content = add(box, "textarea", "draft");
+  content.rows = 6;
+  content.placeholder = "需求原文（整篇贴入）";
+  const items = add(box, "textarea", "draft");
+  items.rows = 3;
+  items.placeholder = "验收标准，每行一条";
+  const form = add(box, "div", "form-row");
+  draftButton(form, "创建需求", null, async () => {
+    if (!content.value.trim()) {
+      say("需求原文不能为空：这里存的是整篇原文，不是摘要。", "error");
       return;
     }
-    await post(entry.href, {action: "request", revision_id: entry.current_revision_id,
-                            reviewer_user_id: reviewer.value,
-                            expected_version: entry.expected_version});
-    await report("已重新送审，等审核人裁定这一版。");
+    const acceptance = items.value.split("\n").map(line => line.trim()).filter(line => line);
+    const created = await post(`/projects/${projectId}/requirements`,
+                               {title: title.value, content: content.value,
+                                acceptance_items: acceptance});
+    pendingRequirement = created.requirement_id;
+    await report("需求已创建为草稿；补好澄清对话后在下方选审核人送审。");
+  });
+}
+
+async function renderClarification(block, projectId, requirementId) {
+  const path = `/projects/${projectId}/requirements/${requirementId}`;
+  const messages = await get(`${path}/messages`);
+  add(block, "dt", null, "澄清对话（本服务未接模型，这里只存人写下的补充）");
+  if (!messages.length) {
+    add(block, "dd", null, "还没有补充说明。把审核人可能要追问的边界先写在这里。");
+  }
+  for (const message of messages) {
+    add(block, "dd", null, `${message.role === "user" ? "我" : "助手"} · `
+                           + `${when(message.created_at)} · ${message.content}`);
+  }
+  const form = add(block, "div", "form-row");
+  const input = add(form, "input");
+  input.placeholder = "补充一条说明（不改动原文）";
+  input.size = 44;
+  draftButton(form, "记进澄清对话", null, async () => {
+    await post(`${path}/messages`, {content: input.value});
+    await report("补充说明已记下。");
   });
 }
 
@@ -322,6 +400,7 @@ function ackButton(form, entry) {
 async function renderRequirement(projectId, requirementId) {
   const requirement = await get(`/projects/${projectId}/requirements/${requirementId}`);
   const block = add(fields.detail, "div");
+  const path = `/projects/${projectId}/requirements/${requirementId}`;
   add(block, "h3", null, requirement.title);
   const facts = add(block, "dl");
   for (const [key, label] of [["status", "状态"], ["version", "版本"]]) {
@@ -371,29 +450,41 @@ async function renderRequirement(projectId, requirementId) {
       }
     });
   }
+  if (requirement.status === "draft" && requirement.requester_id === me) {
+    await renderClarification(block, projectId, requirementId);
+    add(block, "dt", null, "改稿与送审");
+    draftEditor(block, {project_id: projectId, requirement_id: requirementId,
+                        expected_version: requirement.version,
+                        current_revision_id: requirement.current_revision_id,
+                        revision_href: requirement.current_revision_id
+                          ? `${path}/revisions/${requirement.current_revision_id}` : null,
+                        submit: "送审"});
+  }
   if (requirement.current_revision_id) {
-    const revision = await get(`/projects/${projectId}/requirements/${requirementId}`
-                               + `/revisions/${requirement.current_revision_id}`);
+    const revision = await get(`${path}/revisions/${requirement.current_revision_id}`);
     add(block, "dt", null, "需求原文（完整，只读）");
     add(block, "pre", "original", revision.content);
   }
-  await renderWorkItems(block, projectId, requirementId);
-  try {
-    const delivery = await get(`/projects/${projectId}/requirements/${requirementId}/delivery`);
-    add(block, "dt", null, "交付证据");
-    for (const item of delivery.delivery.items) {
-      const row = add(block, "dl", null);
-      add(row, "dd", null, `${item.key} · ${item.status} · 已接受尝试 `
-                        + `${item.attempt_number ?? "无"} · 摘要 ${item.result_hash ?? "无"}`);
-      add(row, "dd", null, `验收项：${item.acceptance.map(entry => entry.text).join("、") || "无"}`);
-      add(row, "dd", null, `产物：${item.artifacts.map(entry => entry.name).join("、") || "无"}`);
-    }
-    for (const verdict of delivery.acceptances) {
-      add(block, "dd", null, `提出人裁定：${verdict.decision} · ${verdict.reason || "无理由文本"}`);
-    }
-  } catch (error) {
-    if (error.name !== "AbortError") {
-      add(block, "p", "locator", `交付视图暂不可用：${error.message}`);
+  // 没有已发布计划时不请求交付视图：那份汇总本来就不存在，服务端只会回一个 409。
+  if (await renderWorkItems(block, projectId, requirementId)) {
+    try {
+      const delivery = await get(`${path}/delivery`);
+      add(block, "dt", null, "交付证据");
+      for (const item of delivery.delivery.items) {
+        const row = add(block, "dl", null);
+        add(row, "dd", null, `${item.key} · ${item.status} · 已接受尝试 `
+                          + `${item.attempt_number ?? "无"} · 摘要 ${item.result_hash ?? "无"}`);
+        add(row, "dd", null,
+            `验收项：${item.acceptance.map(entry => entry.text).join("、") || "无"}`);
+        add(row, "dd", null, `产物：${item.artifacts.map(entry => entry.name).join("、") || "无"}`);
+      }
+      for (const verdict of delivery.acceptances) {
+        add(block, "dd", null, `提出人裁定：${verdict.decision} · ${verdict.reason || "无理由文本"}`);
+      }
+    } catch (error) {
+      if (error.name !== "AbortError") {
+        add(block, "p", "locator", `交付视图暂不可用：${error.message}`);
+      }
     }
   }
 }
@@ -404,7 +495,7 @@ async function renderWorkItems(block, projectId, requirementId) {
   add(block, "dt", null, "工作项");
   if (!published.length) {
     add(block, "dd", null, "还没有已发布的计划，界面不代为拆解需求。");
-    return;
+    return false;
   }
   const people = {};
   for (const member of roster) {
@@ -486,6 +577,7 @@ async function renderWorkItems(block, projectId, requirementId) {
       });
     }
   }
+  return true;
 }
 
 async function report(message) {
@@ -527,7 +619,9 @@ async function loadProjects() {
 }
 
 async function loadRequirements() {
-  const kept = fields.requirement.value;
+  // 刚创建的需求要能被自动选中，否则用户写完原文却找不到它落在哪一行。
+  const kept = pendingRequirement || fields.requirement.value;
+  pendingRequirement = null;
   fields.requirement.replaceChildren();
   if (!fields.project.value) {
     return true;
@@ -599,6 +693,7 @@ fields.logout.addEventListener("click", async () => {
   me = null;
   role = null;
   roster = [];
+  pendingRequirement = null;
   projectNames = {};
   fields.workspace.hidden = true;
   fields.login.hidden = false;
