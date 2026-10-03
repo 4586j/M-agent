@@ -1996,6 +1996,47 @@ def test_a_returned_requirement_reopens_its_items_and_informs_the_next_attempt(a
     assert second["input_hash"] != seen.attempt.input_hash
 
 
+def test_pausing_a_requirement_stops_new_attempts_over_http(api):
+    project, requirement_id, plan, attempt, token = machine_attempt(api)
+    pid = project["project_id"]
+    wid = plan["work_items"][0]["work_item_id"]
+    actions = f"/projects/{pid}/requirements/{requirement_id}/actions"
+    pauses = f"/projects/{pid}/requirements/{requirement_id}/pauses"
+    version = checked(api.send("member", "GET",
+                               f"/projects/{pid}/requirements/{requirement_id}"))["version"]
+
+    checked(api.send("outsider", "GET", pauses), 404)
+    assert checked(api.send("member", "GET", pauses)) == []
+    checked(api.send("outsider", "POST", actions,
+                     json={"action": "pause", "reason": "等答复", "expected_version": version}), 404)
+    checked(api.send("member", "POST", actions,
+                     json={"action": "hold", "reason": "等答复", "expected_version": version}), 422)
+    checked(api.send("member", "POST", actions,
+                     json={"action": "pause", "expected_version": version}), 422)
+    checked(api.send("member", "POST", actions,
+                     json={"action": "pause", "reason": "等答复",
+                           "expected_version": version + 3}), 409)
+    paused = checked(api.send("member", "POST", actions,
+                              json={"action": "pause", "reason": "等提出人确认外部接口",
+                                    "expected_version": version}))
+    assert paused["status"] == "paused"
+    # 暂停不收回已经发手的执行权：那一次尝试仍能读自己的包，重复派发也只回到那一次。
+    checked(api.send(None, "GET", f"/machine/attempts/{attempt.attempt_id}/package",
+                     headers={"X-Instance-Token": token}))
+    assert checked(api.send("manager", "POST", dispatch_path(pid, wid)))["attempt_id"] == (
+        attempt.attempt_id)
+    assert [(entry["action"], entry["reason"], entry["actor_user_id"])
+            for entry in checked(api.send("member", "GET", pauses))] == [
+        ("paused", "等提出人确认外部接口", api.identities["member"]["user"]["user_id"])]
+    resumed = checked(api.send("manager", "POST", actions,
+                               json={"action": "resume", "expected_version": paused["version"]}))
+    assert resumed["status"] == "executing"
+    assert [entry["action"] for entry in checked(api.send("member", "GET", pauses))] == [
+        "paused", "resumed"]
+    checked(api.send("manager", "POST", actions,
+                     json={"action": "resume", "expected_version": resumed["version"]}), 409)
+
+
 def test_inbox_to_dos_lead_to_working_endpoints(api):
     seen = delivered(api)
     pid = seen.project["project_id"]

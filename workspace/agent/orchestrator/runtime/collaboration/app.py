@@ -264,7 +264,7 @@ class AcceptanceDecision(OwnerDecision):
 
 
 class RequirementAction(Input):
-    action: Literal["cancel", "advance"]
+    action: Literal["cancel", "advance", "pause", "resume"]
     expected_version: Version
     reason: Annotated[str, Field(max_length=2048)] = ""
 
@@ -878,10 +878,18 @@ def create_app(config: AppConfig) -> FastAPI:
 
     @router.post("/projects/{pid}/requirements/{rid}/actions")
     def requirement_action(pid: str, rid: str, body: RequirementAction, request: Request):
-        """Controlled requirement moves: re-derive progress from the work items, or cancel."""
+        """Controlled requirement moves: re-derive progress, pause, resume, or cancel."""
         with _access(request, project_id=pid, write=True) as access:
             if body.action == "advance":
                 requirement = app.state.reviews.advance_requirement(
+                    access, project_id=pid, requirement_id=rid,
+                    expected_version=body.expected_version)
+            elif body.action == "pause":
+                requirement = app.state.reviews.pause_requirement(
+                    access, project_id=pid, requirement_id=rid, reason=body.reason,
+                    expected_version=body.expected_version)
+            elif body.action == "resume":
+                requirement = app.state.reviews.resume_requirement(
                     access, project_id=pid, requirement_id=rid,
                     expected_version=body.expected_version)
             else:
@@ -889,6 +897,17 @@ def create_app(config: AppConfig) -> FastAPI:
                     access, project_id=pid, requirement_id=rid, reason=body.reason,
                     expected_version=body.expected_version)
             return asdict(requirement)
+
+    @router.get("/projects/{pid}/requirements/{rid}/pauses")
+    def list_requirement_pauses(pid: str, rid: str, request: Request):
+        """Why this requirement stopped and started again, oldest entry first.
+
+        The reason is what a pause looks like from the outside: without it, "paused" and
+        "nobody is working on this" are the same sentence to everyone waiting.
+        """
+        with _access(request, project_id=pid) as access:
+            access.store.get_requirement(pid, rid)
+            return [asdict(entry) for entry in access.store.list_requirement_pauses(pid, rid)]
 
     @router.get("/projects/{pid}/requirements/{rid}/delivery")
     def requirement_delivery(pid: str, rid: str, request: Request):

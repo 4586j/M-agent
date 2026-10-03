@@ -419,6 +419,67 @@ def test_v9_migration_failure_leaves_the_file_untouched(tmp_path, monkeypatch):
     assert CollaborationStore(Database(path)).get_user("old-user").version == 1
 
 
+def make_v9_database(path):
+    """A v9 file that already holds one signature and one acknowledgement, for v9 -> v10."""
+    make_v8_database(path)
+    with closing(sqlite3.connect(path, isolation_level=None)) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        for statement in database_module._INBOX_ACK_SCHEMA:
+            conn.execute(statement)
+        conn.execute("INSERT INTO inbox_acks(user_id,item_key,acked_at) "
+                     "VALUES('old-user','final_acceptance:old-project:old-requirement',3500.0)")
+        conn.execute("PRAGMA user_version=9")
+        conn.commit()
+
+
+def test_v9_database_upgrades_to_v10_without_losing_the_read_state(tmp_path):
+    path = tmp_path / "v10.sqlite3"
+    make_v9_database(path)
+    database = Database(path)
+    with pytest.raises(database_module.SchemaVersionError):
+        with database.read():
+            pytest.fail("Migration must be explicit")
+    database.initialize()
+    with database.read() as conn:
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+        assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+        assert "requirement_pauses" in {row[0] for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+        assert conn.execute("SELECT acked_at FROM inbox_acks").fetchone()[0] == 3500.0
+        assert conn.execute("SELECT reason FROM requirement_acceptance "
+                            "WHERE acceptance_id='old-signature'").fetchone()[0] == "全部验收项已核对"
+    with database.transaction() as conn:
+        conn.execute("INSERT INTO requirement_pauses(pause_id,project_id,requirement_id,"
+                     "actor_user_id,action,reason,created_at) "
+                     "VALUES('old-pause','old-project','old-requirement','old-user','paused',"
+                     "'等外部接口答复',3600.0)")
+    with pytest.raises(sqlite3.IntegrityError):
+        with database.transaction() as conn:
+            conn.execute("UPDATE requirement_pauses SET reason='事后改写' WHERE pause_id='old-pause'")
+    with pytest.raises(sqlite3.IntegrityError):
+        with database.transaction() as conn:
+            conn.execute("DELETE FROM requirement_pauses WHERE pause_id='old-pause'")
+    with pytest.raises(sqlite3.IntegrityError):
+        with database.transaction() as conn:
+            conn.execute("INSERT INTO requirement_pauses(pause_id,project_id,requirement_id,"
+                         "actor_user_id,action,reason,created_at) VALUES('x','old-project',"
+                         "'old-requirement','no-such-user','paused','r',3600.0)")
+
+
+def test_v10_migration_failure_leaves_the_file_untouched(tmp_path, monkeypatch):
+    path = tmp_path / "v9.sqlite3"
+    make_v9_database(path)
+    before = path.read_bytes()
+    with monkeypatch.context() as patch:
+        patch.setattr(database_module, "_PAUSE_SCHEMA",
+                      database_module._PAUSE_SCHEMA[:1] + ("INVALID SQL",))
+        with pytest.raises(sqlite3.OperationalError):
+            Database(path).initialize()
+    assert path.read_bytes() == before
+    Database(path).initialize()
+    assert CollaborationStore(Database(path)).get_user("old-user").version == 1
+
+
 # --- instance registration ----------------------------------------------------
 
 def test_worker_url_is_registered_and_rejects_extra_callback_targets(team):
@@ -2456,6 +2517,99 @@ def test_a_requirement_return_reopens_every_accepted_item_and_carries_the_next_r
     assert final[1].evidence_hash != final[0].evidence_hash
     assert audited(team, requirement_id)[-1] == "requirement.completed"
     assert todos(team, team.reviewer) == []
+
+
+def test_a_pause_stops_new_attempts_and_resume_re_reads_the_work_items(team):
+    requirement, plan, _instance, token = reserved_plan(team, plan_item(team, "A", estimate=5))
+    project_id, requirement_id = requirement.project_id, requirement.requirement_id
+    item = work_item(team, plan, "A")
+    dispatch = team.make_dispatch(requires_real_data=False)
+    host_for(team).tick(project_id)
+    assert team.store.get_work_item(project_id, item.work_item_id).status == "ready"
+
+    with session(team, team.worker) as access, pytest.raises(Forbidden):
+        team.reviews.pause_requirement(access, project_id=project_id,
+                                       requirement_id=requirement_id, reason="执行的人不能挂需求",
+                                       expected_version=requirement.version)
+    with session(team, team.requester) as access:
+        # 暂停停的是别人的工作，所以必须写下为什么停。
+        with pytest.raises(ValidationError):
+            team.reviews.pause_requirement(access, project_id=project_id,
+                                           requirement_id=requirement_id, reason="   ",
+                                           expected_version=requirement.version)
+        with pytest.raises(Conflict):
+            team.reviews.pause_requirement(access, project_id=project_id,
+                                           requirement_id=requirement_id, reason="等接口答复",
+                                           expected_version=requirement.version + 2)
+    with session(team, team.reviewer) as access:
+        paused = team.reviews.pause_requirement(access, project_id=project_id,
+                                                requirement_id=requirement_id,
+                                                reason="等提出人确认外部接口",
+                                                expected_version=requirement.version)
+    assert (paused.status, paused.version) == ("paused", requirement.version + 1)
+    with pytest.raises(InvalidState, match="paused"):
+        dispatch.dispatch(project_id, item.work_item_id)
+    assert team.store.open_attempt(item.work_item_id) is None
+    # 暂停的需求不在收敛扫描的状态集合里：宿主不会替人把「暂停」解释成任何一种进度。
+    assert host_for(team).tick(project_id)["requirements_changed"] == 0
+    assert team.store.get_requirement(project_id, requirement_id).status == "paused"
+    with session(team, team.requester) as access:
+        replay = team.reviews.pause_requirement(access, project_id=project_id,
+                                                requirement_id=requirement_id,
+                                                reason="等提出人确认外部接口",
+                                                expected_version=1)
+    assert replay == paused
+    assert [entry.action for entry in
+            team.store.list_requirement_pauses(project_id, requirement_id)] == ["paused"]
+
+    with session(team, team.requester) as access:
+        resumed = team.reviews.resume_requirement(access, project_id=project_id,
+                                                  requirement_id=requirement_id,
+                                                  expected_version=paused.version)
+    assert resumed.status == "executing"
+    attempt = dispatch.dispatch(project_id, item.work_item_id)
+    assert attempt.status == "assigned"
+    with session(team, team.reviewer) as access, pytest.raises(InvalidState):
+        team.reviews.resume_requirement(access, project_id=project_id,
+                                        requirement_id=requirement_id,
+                                        expected_version=resumed.version)
+    accept_item(team, project_id, item, token, attempt=attempt)
+    with session(team, team.reviewer) as access:
+        paused_again = team.reviews.pause_requirement(access, project_id=project_id,
+                                                      requirement_id=requirement_id,
+                                                      reason="先别签，等一次演示",
+                                                      expected_version=resumed.version)
+    with session(team, team.requester) as access:
+        # 恢复不是回到「记得的前态」：暂停期间工作项已被验收，所以它落到工作项说的那一格。
+        signed_off = team.reviews.resume_requirement(access, project_id=project_id,
+                                                     requirement_id=requirement_id,
+                                                     expected_version=paused_again.version)
+    assert signed_off.status == "awaiting_acceptance"
+    with session(team, team.requester) as access, pytest.raises(InvalidState):
+        team.reviews.pause_requirement(access, project_id=project_id, requirement_id=requirement_id,
+                                       reason="等着人签字，没有在跑",
+                                       expected_version=signed_off.version)
+    assert [(entry.action, entry.reason) for entry in
+            team.store.list_requirement_pauses(project_id, requirement_id)] == [
+        ("paused", "等提出人确认外部接口"), ("resumed", ""),
+        ("paused", "先别签，等一次演示"), ("resumed", "")]
+    assert audited(team, requirement_id)[-1] == "requirement.resumed"
+
+
+def test_a_paused_requirement_can_still_be_cancelled(team):
+    requirement, _plan, _instance, _token = reserved_plan(team, plan_item(team, "A", estimate=5))
+    project_id, requirement_id = requirement.project_id, requirement.requirement_id
+    with session(team, team.requester) as access:
+        paused = team.reviews.pause_requirement(access, project_id=project_id,
+                                                requirement_id=requirement_id,
+                                                reason="决定不做了",
+                                                expected_version=requirement.version)
+        cancelled = team.reviews.cancel_requirement(access, project_id=project_id,
+                                                    requirement_id=requirement_id,
+                                                    reason="决定不做了",
+                                                    expected_version=paused.version)
+    assert (paused.status, cancelled.status) == ("paused", "cancelled")
+    assert audited(team, requirement_id)[-1] == "requirement.cancelled"
 
 
 # --- inbox ------------------------------------------------------------------------

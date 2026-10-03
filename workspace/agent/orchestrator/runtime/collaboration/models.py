@@ -198,6 +198,17 @@ class RequirementAcceptance:
 
 
 @dataclass(frozen=True)
+class RequirementPause:
+    pause_id: str
+    project_id: str
+    requirement_id: str
+    actor_user_id: str
+    action: str
+    reason: str = ""
+    created_at: float = 0.0
+
+
+@dataclass(frozen=True)
 class RevisionAcceptanceItem:
     revision_id: str
     requirement_id: str

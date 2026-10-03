@@ -29,6 +29,10 @@ REWORKABLE_STATUSES = ("changes_requested", "failed")
 # the resident host re-derives on a timer, and the only set a person may advance by hand, so the
 # two paths cannot disagree about what "in progress" means.
 DELIVERING_STATUSES = ("executing", "rework", "awaiting_acceptance")
+# Only these two states hold dispatch authority, so they are the only ones a pause can stop:
+# ``planning_blocked`` has nothing to dispatch, and ``awaiting_acceptance`` is waiting on a person
+# rather than on work.
+PAUSABLE_STATUSES = ("executing", "rework")
 SECURITY_DECISIONS = ("approved", "rejected")
 MAX_REASON_CHARS = 2048
 MAX_RULE_KEY_CHARS = 128
@@ -454,6 +458,69 @@ class ReviewService:
                                                       updated_at=now)
         record_audit(access.conn, now, access.user.user_id, f"requirement.{status}",
                      requirement_id, project_id=project_id, target_version=updated.version)
+        return updated
+
+    def pause_requirement(self, access: Access, *, project_id: str, requirement_id: str,
+                          expected_version: int, reason: str = "") -> Requirement:
+        """Stop this requirement from starting anything new; leave running work alone.
+
+        A pause is not a cancellation. Execution rights already handed out stay handed out,
+        because taking them back would have to claim something about an outside world nobody
+        checked. What stops is the next attempt: ``DispatchService`` refuses to create one while
+        the requirement is paused, and the scheduler host skips it the same way. The reason is
+        required because a paused requirement looks exactly like a stalled one to the people
+        waiting on it.
+        """
+        explanation = self._reason(reason)
+        if not explanation.strip():
+            raise ValidationError("Pausing a requirement must say why work is stopping")
+        member = self._member(access, project_id)
+        requirement = access.store.get_requirement(project_id, requirement_id)
+        if (member.access_role not in MANAGER_ROLES
+                and requirement.requester_id != access.user.user_id):
+            raise Forbidden("Only the requester or a project manager can pause a requirement")
+        if requirement.status == "paused":
+            return requirement
+        if requirement.status not in PAUSABLE_STATUSES:
+            raise InvalidState("This requirement is not delivering work that can be paused")
+        _version(requirement.version, expected_version)
+        now = self.clock()
+        updated = access.store.set_requirement_status(project_id, requirement_id, status="paused",
+                                                      expected_version=requirement.version,
+                                                      updated_at=now)
+        access.store.add_requirement_pause(project_id, requirement_id,
+                                           actor_user_id=access.user.user_id, action="paused",
+                                           reason=explanation, created_at=now)
+        record_audit(access.conn, now, access.user.user_id, "requirement.paused", requirement_id,
+                     project_id=project_id, target_version=updated.version)
+        return updated
+
+    def resume_requirement(self, access: Access, *, project_id: str, requirement_id: str,
+                           expected_version: int) -> Requirement:
+        """Let a paused requirement start work again, at whatever its items now justify.
+
+        The target is re-derived instead of restored from a remembered "previous state": a person
+        may have confirmed, accepted or returned deliveries while the requirement was paused, and
+        the work items are the only record of what is true now.
+        """
+        member = self._member(access, project_id)
+        requirement = access.store.get_requirement(project_id, requirement_id)
+        if (member.access_role not in MANAGER_ROLES
+                and requirement.requester_id != access.user.user_id):
+            raise Forbidden("Only the requester or a project manager can resume a requirement")
+        if requirement.status != "paused":
+            raise InvalidState("Requirement is not paused")
+        _version(requirement.version, expected_version)
+        target = self.requirement_target(access.store, project_id, requirement_id)
+        now = self.clock()
+        updated = access.store.set_requirement_status(project_id, requirement_id, status=target,
+                                                      expected_version=requirement.version,
+                                                      updated_at=now)
+        access.store.add_requirement_pause(project_id, requirement_id,
+                                           actor_user_id=access.user.user_id, action="resumed",
+                                           reason="", created_at=now)
+        record_audit(access.conn, now, access.user.user_id, "requirement.resumed", requirement_id,
+                     project_id=project_id, target_version=updated.version)
         return updated
 
     def delivery_bundle(self, store: CollaborationStore, project_id: str,

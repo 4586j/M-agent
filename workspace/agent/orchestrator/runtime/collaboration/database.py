@@ -8,7 +8,7 @@ from typing import Iterator
 from .models import SchemaVersionError
 
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 
 _SCHEMA_STATEMENTS = (
     """
@@ -916,6 +916,41 @@ _INBOX_ACK_SCHEMA = (
     """,
 )
 
+# Cancelling takes execution rights back; pausing only stops what has not started yet, and a
+# paused requirement looks exactly like a stalled one to everyone waiting on it. So the stop and
+# the restart are both kept, with the reason the person gave, as an append-only journal beside the
+# requirement's current status.
+_PAUSE_SCHEMA = (
+    """
+    CREATE TABLE requirement_pauses (
+        pause_id TEXT NOT NULL PRIMARY KEY,
+        project_id TEXT NOT NULL,
+        requirement_id TEXT NOT NULL,
+        actor_user_id TEXT NOT NULL,
+        action TEXT NOT NULL CHECK(action IN ('paused','resumed')),
+        reason TEXT NOT NULL DEFAULT '',
+        created_at REAL NOT NULL,
+        FOREIGN KEY (requirement_id, project_id) REFERENCES requirements(requirement_id, project_id),
+        FOREIGN KEY (project_id, actor_user_id) REFERENCES project_members(project_id, user_id)
+    )
+    """,
+    "CREATE INDEX requirement_pauses_requirement ON requirement_pauses(requirement_id,created_at)",
+    """
+    CREATE TRIGGER requirement_pauses_immutable
+    BEFORE UPDATE ON requirement_pauses
+    BEGIN
+        SELECT RAISE(ABORT, 'requirement pauses are immutable');
+    END
+    """,
+    """
+    CREATE TRIGGER requirement_pauses_no_delete
+    BEFORE DELETE ON requirement_pauses
+    BEGIN
+        SELECT RAISE(ABORT, 'requirement pauses are immutable');
+    END
+    """,
+)
+
 
 def _check_schema_version(connection: sqlite3.Connection) -> None:
     version = connection.execute("PRAGMA user_version").fetchone()[0]
@@ -1012,6 +1047,11 @@ class Database:
                     for statement in _INBOX_ACK_SCHEMA:
                         connection.execute(statement)
                     version = 9
+                    migrated = True
+                if version == 9:
+                    for statement in _PAUSE_SCHEMA:
+                        connection.execute(statement)
+                    version = 10
                     migrated = True
                 if migrated:
                     connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")

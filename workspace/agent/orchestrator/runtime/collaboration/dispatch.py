@@ -178,6 +178,10 @@ class DispatchService:
                 return existing
             if item.status not in DISPATCHABLE_STATUSES:
                 raise InvalidState("Work item is not ready for dispatch")
+            if requirement.status == "paused":
+                # A paused requirement keeps the rights it already handed out and starts nothing
+                # new, so an attempt that is already open is still returned to its owner.
+                raise InvalidState("Requirement is paused")
             instance = self._pick_instance(store, item.binding_id, now=now)
         self.instances.admit(project_id, item.binding_id, instance.instance_id,
                              requires_real_data=requires_real_data)
@@ -193,6 +197,8 @@ class DispatchService:
                 if raced.input_hash != input_hash:
                     raise Conflict("Inputs changed while an attempt is open")
                 return raced
+            if store.get_requirement(project_id, plan.requirement_id).status == "paused":
+                raise InvalidState("Requirement is paused")
             attempt = store.create_attempt(
                 project_id, work_item_id, plan_id=plan.plan_id,
                 requirement_id=requirement.requirement_id, revision_id=plan.revision_id,

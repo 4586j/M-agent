@@ -15,7 +15,8 @@ from .models import (
     BudgetEntry, Conflict, ExecutionInstance, ExecutionNode, InvalidState, NotFound, OutboxEvent,
     OPEN_ATTEMPT_STATUSES, OwnerReview, Plan, POST_APPROVAL_STATUSES, Project, ProjectMember,
     Requirement,
-    RequirementAcceptance, RequirementMessage, RequirementReview, RequirementRevision,
+    RequirementAcceptance, RequirementMessage, RequirementPause, RequirementReview,
+    RequirementRevision,
     REPORT_STAGES, RevisionAcceptanceItem,
     SecurityGrant, SecurityReview, User, ValidationError, WorkItem, WorkItemDependency,
 )
@@ -27,19 +28,21 @@ WORK_ITEM_STATUSES = (
     "pending_dependency", "ready", "waiting_agent", "running", "awaiting_owner_review",
     "submitted", "accepted", "changes_requested", "blocked", "failed", "cancelled",
 )
-# A requirement only moves through a named action, never by a free write. ``integrating`` and
-# ``paused`` are absent on purpose: no integration work item or pause rule is implemented yet,
-# so asking for them is refused instead of faking a journey.
+# A requirement only moves through a named action, never by a free write. ``integrating`` is
+# absent on purpose: no integration work item is implemented yet, so asking for it is refused
+# instead of faking a journey. ``paused`` is reached by the pause action and left by the resume
+# action, which re-derives the target from the work items rather than trusting a remembered one.
 REQUIREMENT_TRANSITIONS: dict[str, tuple[str, ...]] = {
     "planning_blocked": ("approved", "planning", "planning_blocked"),
-    "executing": ("approved", "planning", "planning_blocked", "rework"),
-    "rework": ("executing", "awaiting_acceptance", "rework"),
-    "awaiting_acceptance": ("executing", "rework"),
+    "executing": ("approved", "planning", "planning_blocked", "rework", "paused"),
+    "rework": ("executing", "awaiting_acceptance", "rework", "paused"),
+    "awaiting_acceptance": ("executing", "rework", "paused"),
+    "paused": ("executing", "rework"),
     "completed": ("awaiting_acceptance",),
     "cancelling": ("approved", "planning", "planning_blocked", "executing", "rework",
-                   "awaiting_acceptance", "cancelling"),
+                   "awaiting_acceptance", "cancelling", "paused"),
     "cancelled": ("approved", "planning", "planning_blocked", "executing", "rework",
-                  "awaiting_acceptance", "cancelling"),
+                  "awaiting_acceptance", "cancelling", "paused"),
 }
 
 
@@ -174,6 +177,9 @@ _ACCEPTANCE_REVIEW_COLUMNS = _OWNER_REVIEW_COLUMNS
 _REQUIREMENT_ACCEPTANCE_COLUMNS = (
     "acceptance_id,project_id,requirement_id,reviewer_user_id,decision,evidence_hash,reason,"
     "created_at"
+)
+_REQUIREMENT_PAUSE_COLUMNS = (
+    "pause_id,project_id,requirement_id,actor_user_id,action,reason,created_at"
 )
 _SECURITY_REVIEW_COLUMNS = (
     "security_review_id,attempt_id,project_id,rule_key,input_hash,requirement_id,revision_id,"
@@ -1619,6 +1625,31 @@ class CollaborationStore:
                 f"SELECT {_REQUIREMENT_ACCEPTANCE_COLUMNS} FROM requirement_acceptance "
                 "WHERE project_id=? AND requirement_id=? ORDER BY created_at,rowid",
                 (project_id, requirement_id))]
+
+    def add_requirement_pause(self, project_id: str, requirement_id: str, *, actor_user_id: str,
+                              action: str, reason: str,
+                              created_at: float) -> RequirementPause:
+        """One line of the pause journal: somebody stopped or restarted this requirement."""
+        _choice(action, ("paused", "resumed"), "action")
+        pause_id = uuid4().hex
+        with self._write() as conn:
+            requirement = self._requirement(conn, project_id, requirement_id)
+            conn.execute(
+                "INSERT INTO requirement_pauses(pause_id,project_id,requirement_id,actor_user_id,"
+                "action,reason,created_at) VALUES(?,?,?,?,?,?,?)",
+                (pause_id, requirement.project_id, requirement_id, actor_user_id, action, reason,
+                 created_at))
+            return _one(conn, RequirementPause,
+                        f"SELECT {_REQUIREMENT_PAUSE_COLUMNS} FROM requirement_pauses "
+                        "WHERE pause_id=?", (pause_id,))
+
+    def list_requirement_pauses(self, project_id: str,
+                                requirement_id: str) -> list[RequirementPause]:
+        """Every pause and resume this requirement has been through, oldest first."""
+        with self._read() as conn:
+            return [_record(RequirementPause, row) for row in conn.execute(
+                f"SELECT {_REQUIREMENT_PAUSE_COLUMNS} FROM requirement_pauses WHERE project_id=? "
+                "AND requirement_id=? ORDER BY created_at,rowid", (project_id, requirement_id))]
 
     # --- security gate ----------------------------------------------------------
 
