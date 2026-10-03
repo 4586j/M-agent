@@ -8,6 +8,22 @@ from __future__ import annotations
 import time
 
 from .auth import Access
+from .models import ValidationError
+
+
+def _identity(entry: dict) -> str:
+    """One name for one decision owed, so seeing it today means it stays seen after a refresh.
+
+    The most specific resource names it: an attempt, else a work item, else the requirement.
+    A drafting to-do also carries the revision it asks to be reviewed, because reviewing a second
+    revision is a second decision even though the requirement is the same one.
+    """
+    resource = next(value for value in (entry.get("attempt_id"), entry.get("work_item_id"),
+                                        entry.get("requirement_id")) if value)
+    parts = [entry["item_type"], entry["project_id"], resource]
+    if entry["item_type"].startswith("requirement_"):
+        parts.append(entry.get("current_revision_id") or "")
+    return ":".join(parts)
 
 # item_type -> (action, href, links). ``href`` is where the owed decision is written and
 # ``expected_version`` is the version of that same resource; ``links`` are the reads the decision
@@ -33,7 +49,11 @@ ACTIONS = {
 
 
 class InboxService:
-    """Read-only projection over stored state; it decides nothing and writes nothing."""
+    """A projection over stored state, plus one piece of per-user read state.
+
+    It decides nothing about the work itself: a to-do is what a decision service already owes to
+    somebody, and an acknowledgement only says that person has seen it.
+    """
 
     def __init__(self, *, clock=time.time):
         self.clock = clock
@@ -49,3 +69,18 @@ class InboxService:
         entries.sort(key=lambda entry: (-entry["updated_at"], entry["item_type"],
                                         entry["project_id"]))
         return entries
+
+    def stamp(self, access: Access, entries: list[dict]) -> list[dict]:
+        """Attach every to-do's identity and whether this person has already seen it."""
+        acked = access.store.inbox_acks(access.user.user_id)
+        stamped = []
+        for entry in entries:
+            key = _identity(entry)
+            stamped.append({**entry, "key": key, "unread": key not in acked})
+        return stamped
+
+    def ack(self, access: Access, *, item_key: str, known: set[str]) -> None:
+        """Mark one of the to-dos this person is actually owed as seen; the decision stays open."""
+        if item_key not in known:
+            raise ValidationError("That is not a to-do you currently owe")
+        access.store.ack_inbox(access.user.user_id, item_key=item_key, acked_at=self.clock())

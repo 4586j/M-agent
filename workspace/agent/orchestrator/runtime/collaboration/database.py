@@ -8,7 +8,7 @@ from typing import Iterator
 from .models import SchemaVersionError
 
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 _SCHEMA_STATEMENTS = (
     """
@@ -902,6 +902,20 @@ _FINAL_ACCEPTANCE_SCHEMA = (
     """,
 )
 
+# A to-do is derived from live state, so "unread" cannot be a column on it. It is one small
+# acknowledgement row per person per decision owed: read state, not evidence, so it is mutable
+# and deliberately has no immutability trigger.
+_INBOX_ACK_SCHEMA = (
+    """
+    CREATE TABLE inbox_acks (
+        user_id TEXT NOT NULL REFERENCES users(user_id),
+        item_key TEXT NOT NULL CHECK (length(item_key) BETWEEN 1 AND 200),
+        acked_at REAL NOT NULL,
+        PRIMARY KEY (user_id, item_key)
+    )
+    """,
+)
+
 
 def _check_schema_version(connection: sqlite3.Connection) -> None:
     version = connection.execute("PRAGMA user_version").fetchone()[0]
@@ -993,6 +1007,11 @@ class Database:
                     for statement in _FINAL_ACCEPTANCE_SCHEMA:
                         connection.execute(statement)
                     version = 8
+                    migrated = True
+                if version == 8:
+                    for statement in _INBOX_ACK_SCHEMA:
+                        connection.execute(statement)
+                    version = 9
                     migrated = True
                 if migrated:
                     connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")

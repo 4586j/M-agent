@@ -1952,6 +1952,80 @@ def test_inbox_to_dos_lead_to_working_endpoints(api):
     assert owed("member") == [] and owed("manager") == []
 
 
+def test_a_to_do_stays_owed_after_the_person_marks_it_read(api):
+    seen = delivered(api)
+    pid = seen.project["project_id"]
+    key = f"delivery_confirmation:{pid}:{seen.attempt.attempt_id}"
+    ack = "/inbox/ack"
+
+    def rows(actor):
+        return [(entry["key"], entry["unread"])
+                for entry in checked(api.send(actor, "GET", "/inbox"))
+                if not entry["item_type"].startswith("requirement_")]
+
+    assert rows("member") == [(key, True)]
+    checked(api.send(None, "POST", ack, json={"item_key": key}), 401)
+    checked(api.send("member", "POST", ack, json={"item_key": key},
+                     headers={"X-CSRF-Token": None}), 403)
+    for junk in ("", " " * 3, "k" * 201, key + "f"):
+        checked(api.send("member", "POST", ack, json={"item_key": junk}), 422)
+    # 局外人的收件箱里没有这一条，所以连「已读」都不能替他标。
+    assert rows("outsider") == []
+    checked(api.send("outsider", "POST", ack, json={"item_key": key}), 422)
+    checked(api.send("member", "POST", ack, json={"item_key": key}), 204)
+    checked(api.send("member", "POST", ack, json={"item_key": key}), 204)
+    assert rows("member") == [(key, False)]
+    entry = next(item for item in checked(api.send("member", "GET", "/inbox"))
+                 if not item["item_type"].startswith("requirement_"))
+    # 标过已读只是少了一个红点：能写哪个动作、写去哪、对着哪个版本，一个字都没变。
+    assert (entry["action"], entry["href"], entry["expected_version"]) == (
+        "confirm_delivery", f"/projects/{pid}/attempts/{seen.attempt.attempt_id}/reviews",
+        seen.reported["version"])
+    checked(api.send("member", "POST", entry["href"],
+                     json={"decision": "confirmed",
+                           "expected_version": entry["expected_version"]}))
+    assert rows("member") == []
+
+
+def test_a_new_requirement_revision_is_unread_again(api):
+    project = api.project()
+    pid = project["project_id"]
+    api.member(project)
+    api.member(project, "manager", "manager")
+    reviewer = api.identities["manager"]["user"]["user_id"]
+    created = create_requirement(api, project, content="# 需求文档\n第一版")
+    rid, first = created["requirement_id"], created["current_revision_id"]
+    reviews = reviews_path(project, rid)
+
+    def version():
+        path = f"/projects/{pid}/requirements/{rid}"
+        return checked(api.send("member", "GET", path))["version"]
+
+    def keys(actor):
+        return [(entry["key"], entry["unread"])
+                for entry in checked(api.send(actor, "GET", "/inbox"))]
+
+    checked(api.send("member", "POST", reviews, json={"action": "request", "revision_id": first,
+                                                      "reviewer_user_id": reviewer,
+                                                      "expected_version": version()}))
+    assert keys("manager") == [(f"requirement_review:{pid}:{rid}:{first}", True)]
+    checked(api.send("manager", "POST", "/inbox/ack",
+                     json={"item_key": f"requirement_review:{pid}:{rid}:{first}"}), 204)
+    assert keys("manager") == [(f"requirement_review:{pid}:{rid}:{first}", False)]
+    checked(api.send("manager", "POST", reviews, json={"action": "reject", "revision_id": first,
+                                                       "reason": "验收标准没写全",
+                                                       "expected_version": version()}))
+    saved = checked(api.send("member", "POST", f"/projects/{pid}/requirements/{rid}/revisions",
+                             json={"content": "# 需求文档\n第一版\n补上验收标准",
+                                   "expected_version": version()}), 201)
+    second = saved["revision"]["revision_id"]
+    checked(api.send("member", "POST", reviews, json={"action": "request", "revision_id": second,
+                                                      "reviewer_user_id": reviewer,
+                                                      "expected_version": version()}))
+    # 上一版读过不等于这一版读过：换了版本就重新变成未读，审核人不会漏掉新内容。
+    assert keys("manager") == [(f"requirement_review:{pid}:{rid}:{second}", True)]
+
+
 def test_the_panel_is_static_and_gives_nobody_a_data_free_path(api):
     def asset(path):
         return api.client.request("GET", path, headers={"Origin": ORIGIN})
@@ -1959,6 +2033,7 @@ def test_the_panel_is_static_and_gives_nobody_a_data_free_path(api):
     page = asset("/ui/")
     assert page.status_code == 200 and page.headers["cache-control"] == "no-store"
     assert 'id="todos"' in page.text and 'id="login-form"' in page.text
+    assert 'id="todoCount"' in page.text
     assert page.headers["content-type"].startswith("text/html")
     assert asset("/ui/app.js").status_code == 200
     assert asset("/ui/styles.css").status_code == 200

@@ -358,6 +358,64 @@ def test_v8_migration_failure_leaves_the_file_untouched(tmp_path, monkeypatch):
     assert CollaborationStore(Database(path)).get_user("old-user").version == 1
 
 
+def make_v8_database(path):
+    """A v8 file that already holds the requester's signature, so v8 -> v9 is what gets tested."""
+    make_v7_database(path)
+    with closing(sqlite3.connect(path, isolation_level=None)) as conn:
+        conn.execute("PRAGMA foreign_keys = OFF")
+        conn.execute("BEGIN IMMEDIATE")
+        for statement in database_module._FINAL_ACCEPTANCE_SCHEMA:
+            conn.execute(statement)
+        conn.execute("INSERT INTO requirement_acceptance(acceptance_id,project_id,requirement_id,"
+                     "reviewer_user_id,decision,evidence_hash,reason,created_at) "
+                     "VALUES('old-signature','old-project','old-requirement','old-user','accepted',"
+                     "?,'全部验收项已核对',3000.0)", ("e" * 64,))
+        conn.execute("PRAGMA user_version=8")
+        conn.commit()
+
+
+def test_v8_database_upgrades_to_v9_without_losing_the_signature(tmp_path):
+    path = tmp_path / "v9.sqlite3"
+    make_v8_database(path)
+    database = Database(path)
+    with pytest.raises(database_module.SchemaVersionError):
+        with database.read():
+            pytest.fail("Migration must be explicit")
+    database.initialize()
+    with database.read() as conn:
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+        assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+        assert "inbox_acks" in {row[0] for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+        stored = conn.execute("SELECT decision,reason FROM requirement_acceptance "
+                              "WHERE acceptance_id='old-signature'").fetchone()
+    assert (stored["decision"], stored["reason"]) == ("accepted", "全部验收项已核对")
+    # 已读只是每个人的阅读状态，不是证据，所以它可增可改可删——签字那一行正好相反。
+    with database.transaction() as conn:
+        conn.execute("INSERT INTO inbox_acks(user_id,item_key,acked_at) "
+                     "VALUES('old-user','delivery_confirmation:old-project:old-attempt',4000.0)")
+        conn.execute("UPDATE inbox_acks SET acked_at=4100.0 WHERE user_id='old-user'")
+        assert conn.execute("SELECT acked_at FROM inbox_acks").fetchone()[0] == 4100.0
+        conn.execute("DELETE FROM inbox_acks WHERE user_id='old-user'")
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute("INSERT INTO inbox_acks(user_id,item_key,acked_at) "
+                         "VALUES('no-such-user','k',4000.0)")
+
+
+def test_v9_migration_failure_leaves_the_file_untouched(tmp_path, monkeypatch):
+    path = tmp_path / "v8.sqlite3"
+    make_v8_database(path)
+    before = path.read_bytes()
+    with monkeypatch.context() as patch:
+        patch.setattr(database_module, "_INBOX_ACK_SCHEMA",
+                      database_module._INBOX_ACK_SCHEMA[:1] + ("INVALID SQL",))
+        with pytest.raises(sqlite3.OperationalError):
+            Database(path).initialize()
+    assert path.read_bytes() == before
+    Database(path).initialize()
+    assert CollaborationStore(Database(path)).get_user("old-user").version == 1
+
+
 # --- instance registration ----------------------------------------------------
 
 def test_worker_url_is_registered_and_rejects_extra_callback_targets(team):
@@ -2433,4 +2491,36 @@ def test_a_run_that_left_traces_behind_can_be_queued_again(team):
     second = dispatch.dispatch(project_id, item.work_item_id)
     assert (second.number, second.status) == (2, "assigned")
     assert booked(team, "requirement", requirement_id) == [("reserve", 5)]
+
+
+def test_a_seen_to_do_is_still_owed_until_someone_rules(team):
+    requirement, plan, _instance, token = reserved_plan(team, plan_item(team, "A", estimate=5))
+    project_id = requirement.project_id
+    item = work_item(team, plan, "A")
+    attempt = team.make_dispatch(requires_real_data=False).dispatch(project_id, item.work_item_id)
+    deliver(team, token, attempt, "A 自认完成")
+    inbox = InboxService(clock=team.clock)
+    key = f"delivery_confirmation:{project_id}:{attempt.attempt_id}"
+
+    def stamped(actor):
+        with session(team, actor) as access:
+            return inbox.stamp(access, inbox.pending(access))
+
+    before = stamped(team.reviewer)
+    assert [(entry["key"], entry["unread"]) for entry in before] == [(key, True)]
+    keys = {entry["key"] for entry in before}
+    with session(team, team.reviewer) as access:
+        inbox.ack(access, item_key=key, known=keys)
+    after = stamped(team.reviewer)
+    assert [(entry["key"], entry["unread"]) for entry in after] == [(key, False)]
+    # 读过不等于裁定：待办一条不少，能写的动作、写去哪、要填的版本都没变。
+    def without_unread(entry):
+        return {name: value for name, value in entry.items() if name != "unread"}
+
+    assert [without_unread(entry) for entry in after] == [without_unread(entry)
+                                                          for entry in before]
+    # 每个人各记各的已读：负责人看过，不代表执行的人看过同一条。
+    assert stamped(team.worker)[0]["unread"] is True
+    with session(team, team.reviewer) as access, pytest.raises(ValidationError):
+        inbox.ack(access, item_key=f"final_acceptance:{project_id}{'f' * 32}", known=keys)
 

@@ -1101,6 +1101,18 @@ class CollaborationStore:
                 (user_id, user_id, user_id, now, user_id, user_id)).fetchall()
         return [dict(row) for row in rows]
 
+    def inbox_acks(self, user_id: str) -> set[str]:
+        """Keys this person already acknowledged; read state, so it is allowed to be stale."""
+        with self._read() as conn:
+            return {row["item_key"] for row in conn.execute(
+                "SELECT item_key FROM inbox_acks WHERE user_id=?", (user_id,))}
+
+    def ack_inbox(self, user_id: str, *, item_key: str, acked_at: float) -> None:
+        _text(item_key, "item_key", 200)
+        with self._write() as conn:
+            conn.execute("INSERT INTO inbox_acks(user_id,item_key,acked_at) VALUES(?,?,?) "
+                         "ON CONFLICT(user_id,item_key) DO NOTHING", (user_id, item_key, acked_at))
+
     def advance_work_item(self, work_item_id: str, *, status: str, expected_version: int,
                           updated_at: float) -> WorkItem:
         _choice(status, WORK_ITEM_STATUSES, "status")

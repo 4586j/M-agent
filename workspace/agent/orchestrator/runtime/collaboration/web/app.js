@@ -26,7 +26,7 @@ let controller = new AbortController();
 
 const fields = {};
 for (const id of ["login", "workspace", "who", "logout", "project", "requirement", "todos",
-                  "detail", "status"]) {
+                  "todoCount", "detail", "status"]) {
   fields[id] = document.getElementById(id);
 }
 
@@ -99,15 +99,19 @@ async function refresh() {
   role = null;
   fields.todos.replaceChildren();
   fields.detail.replaceChildren();
+  text(fields.todoCount, "");
   if (!projectId) {
     return;
   }
   try {
     role = (await get(`/projects/${projectId}`)).access_role;
     const inbox = await get("/inbox");
-    for (const entry of inbox.filter(item => DECISIONS[item.item_type])) {
+    const todos = inbox.filter(item => DECISIONS[item.item_type]);
+    for (const entry of todos) {
       renderTodo(entry);
     }
+    const unread = todos.filter(entry => entry.unread).length;
+    text(fields.todoCount, unread ? `（未读 ${unread}）` : "");
     if (!fields.todos.children.length) {
       add(fields.todos, "li", null, "当前没有属于你的待办裁定。");
     }
@@ -134,7 +138,11 @@ function renderInstance(parent, instance) {
 function renderTodo(entry) {
   const spec = DECISIONS[entry.item_type];
   const row = add(fields.todos, "li");
-  add(row, "div", "kind", spec.title);
+  const head = add(row, "div", "kind");
+  add(head, "span", null, spec.title);
+  if (entry.unread) {
+    add(head, "span", "unread", "未读");
+  }
   add(row, "div", "locator", `${projectNames[entry.project_id] ?? entry.project_id} · `
                              + `${entry.title} · ${entry.item_type} · 版本 ${entry.expected_version}`);
   const facts = add(row, "dl", "evidence");
@@ -199,6 +207,24 @@ function renderTodo(entry) {
       }
     }
   });
+  if (entry.unread) {
+    // 读过不等于裁定：标记之后这条待办仍然挂着，直到写下决定。
+    const seen = add(form, "button", "soft", "标记已读");
+    seen.type = "button";
+    seen.addEventListener("click", async () => {
+      seen.disabled = true;
+      try {
+        await post("/inbox/ack", {item_key: entry.key});
+        say("已记下你看过了这条待办；裁定仍然挂着。", "ok");
+        await load();
+      } catch (error) {
+        seen.disabled = false;
+        if (error.name !== "AbortError") {
+          say(`标记已读失败：${error.message}`, "error");
+        }
+      }
+    });
+  }
 }
 
 async function renderRequirement(projectId, requirementId) {
@@ -473,6 +499,7 @@ fields.logout.addEventListener("click", async () => {
   fields.project.replaceChildren();
   fields.requirement.replaceChildren();
   fields.todos.replaceChildren();
+  text(fields.todoCount, "");
   fields.detail.replaceChildren();
   text(fields.who, "");
 });

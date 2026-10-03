@@ -285,6 +285,10 @@ class WorkItemCancel(ExpectedVersion):
     reason: Annotated[str, Field(max_length=2048)] = ""
 
 
+class InboxAck(Input):
+    item_key: Annotated[str, Field(min_length=1, max_length=200)]
+
+
 class SecurityRuleCreate(Input):
     rule_key: Annotated[str, Field(min_length=1, max_length=128)]
 
@@ -1057,13 +1061,25 @@ def create_app(config: AppConfig) -> FastAPI:
                 access, scope="global", ref_id="", limit_units=body.limit_units,
                 expected_version=body.expected_version)
 
+    def _inbox(access) -> list[dict]:
+        """Drafting to-dos and execution decisions in one list, newest first, each stamped with
+        whether this person has already seen it."""
+        merged = app.state.inbox.stamp(
+            access, app.state.requirements.inbox(access) + app.state.inbox.pending(access))
+        return sorted(merged, key=lambda entry: (-entry["updated_at"], entry["item_type"],
+                                                 entry.get("requirement_id") or ""))
+
     @router.get("/inbox")
     def inbox(request: Request):
-        """Drafting to-dos and execution decisions in one list, newest first."""
         with _access(request) as access:
-            merged = app.state.requirements.inbox(access) + app.state.inbox.pending(access)
-            return sorted(merged, key=lambda entry: (-entry["updated_at"], entry["item_type"],
-                                                     entry.get("requirement_id") or ""))
+            return _inbox(access)
+
+    @router.post("/inbox/ack", status_code=204)
+    def ack_inbox_todo(body: InboxAck, request: Request):
+        """Say "I have seen this" about a to-do the caller really owes; it stays owed."""
+        with _access(request, write=True) as access:
+            app.state.inbox.ack(access, item_key=body.item_key,
+                                known={entry["key"] for entry in _inbox(access)})
 
     @router.get("/projects/{pid}/audit")
     def project_audit(pid: str, request: Request, limit: AuditLimit = 100):
