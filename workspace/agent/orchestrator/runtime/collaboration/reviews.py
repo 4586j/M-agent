@@ -517,12 +517,18 @@ class ReviewService:
                            decision: str, expected_version: int, reason: str = "") -> Requirement:
         """The requester signs for the whole requirement; nobody else can speak for them.
 
-        Returning a requirement is refused until there is a carrier for the extra work: every
-        item is already accepted, so a bare "not good enough" would park the requirement in a
-        state with no way to run again.
+        A return re-opens every accepted work item instead of refusing, because the published
+        plan already carries the second round: no new plan is made and the original text is not
+        rewritten, only the items go back. Their ``changes_requested`` status is what puts a
+        re-queue to-do in front of a manager, and the verdict row keeps which bundle was refused.
+        A per-attempt acceptance row is deliberately not written here: one attempt holds one
+        business verdict, and a requirement-level verdict spans every attempt of the round, so
+        ``requirement_acceptance`` is the record the next attempt reads.
         """
         verdict = _choice(decision, ACCEPT_DECISIONS, "decision")
         explanation = self._reason(reason)
+        if verdict == "changes_requested" and not explanation.strip():
+            raise ValidationError("A returned requirement must say what the delivery missed")
         self._member(access, project_id)
         requirement = access.store.get_requirement(project_id, requirement_id)
         if requirement.requester_id != access.user.user_id:
@@ -531,23 +537,43 @@ class ReviewService:
             if verdict == "accepted":
                 return requirement
             raise InvalidState("A completed requirement cannot be returned")
-        if verdict == "changes_requested":
-            raise InvalidState(
-                "Returning a whole requirement needs new work to carry it; not implemented yet")
         if requirement.status != "awaiting_acceptance":
+            if self._returned_already(access, requirement, verdict):
+                return requirement
             raise InvalidState("Requirement is not awaiting acceptance")
         _version(requirement.version, expected_version)
         bundle = self.delivery_bundle(access.store, project_id, requirement_id)
         if any(entry["status"] != "accepted" for entry in bundle["items"]):
             raise InvalidState("Every work item must be accepted before the requirement is")
         now = self.clock()
-        updated = access.store.set_requirement_status(project_id, requirement_id,
-                                                      status="completed",
+        target = "rework" if verdict == "changes_requested" else "completed"
+        if verdict == "changes_requested":
+            for entry in bundle["items"]:
+                stored = access.store.get_work_item(project_id, entry["work_item_id"])
+                reopened = access.store.advance_work_item(entry["work_item_id"],
+                                                          status="changes_requested",
+                                                          expected_version=stored.version,
+                                                          updated_at=now)
+                record_audit(access.conn, now, access.user.user_id, "work_item.changes_requested",
+                             entry["work_item_id"], project_id=project_id,
+                             target_version=reopened.version)
+        updated = access.store.set_requirement_status(project_id, requirement_id, status=target,
                                                       expected_version=requirement.version,
                                                       updated_at=now)
         access.store.add_requirement_acceptance(
             project_id, requirement_id, reviewer_user_id=access.user.user_id, decision=verdict,
             evidence_hash=bundle["evidence_hash"], reason=explanation, created_at=now)
-        record_audit(access.conn, now, access.user.user_id, "requirement.completed", requirement_id,
+        record_audit(access.conn, now, access.user.user_id,
+                     "requirement.returned" if verdict == "changes_requested"
+                     else "requirement.completed", requirement_id,
                      project_id=project_id, target_version=updated.version)
         return updated
+
+    def _returned_already(self, access: Access, requirement: Requirement, verdict: str) -> bool:
+        """Is this the very return the requester already signed? Then the second click changes
+        nothing, so a retried request cannot reopen work that is already back in the queue."""
+        if verdict != "changes_requested" or requirement.status != "rework":
+            return False
+        rows = access.store.list_requirement_acceptances(requirement.project_id,
+                                                         requirement.requirement_id)
+        return bool(rows) and rows[-1].decision == "changes_requested"

@@ -76,12 +76,16 @@ class DispatchService:
                                  "artifacts": artifacts})
         return sorted(dependencies, key=lambda entry: entry["key"])
 
-    def _rework_notes(self, store, project_id: str, work_item_id: str) -> list[dict]:
+    def _rework_notes(self, store, project_id: str, work_item_id: str,
+                      requirement_id: str) -> list[dict]:
         """Every human return for this item, in the order the rounds actually happened.
 
-        Both the owner's confirmation and the business acceptance can send a delivery back,
-        and the person executing the next attempt has to see which of the two said what. The
-        attempt number orders the notes because a clock can hand two reviewers the same second.
+        Both the owner's confirmation and the business acceptance can send one delivery back, and
+        the requester's verdict on the whole requirement sends every accepted delivery of the plan
+        back at once. All three are notes the next attempt has to read, so they share one list.
+        The attempt number orders the per-delivery notes because a clock can hand two reviewers the
+        same second; a requirement verdict has no attempt of its own, so within one second it
+        comes after the deliveries it covered.
         """
         notes = []
         for kind, entries in (("owner_confirmation", store.list_returned_reviews(project_id,
@@ -94,8 +98,15 @@ class DispatchService:
                                                                    entry.attempt_id).number,
                               "reason": entry.reason, "reviewed_by": entry.reviewer_user_id,
                               "reviewed_at": entry.created_at})
-        return sorted(notes, key=lambda note: (note["reviewed_at"], note["attempt_number"],
-                                               note["kind"]))
+        for entry in store.list_requirement_acceptances(project_id, requirement_id):
+            if entry.decision == "changes_requested":
+                notes.append({"kind": "requirement_acceptance", "attempt_id": None,
+                              "attempt_number": None, "reason": entry.reason,
+                              "reviewed_by": entry.reviewer_user_id,
+                              "reviewed_at": entry.created_at})
+        return sorted(notes, key=lambda note: (note["reviewed_at"],
+                                               float("inf") if note["attempt_number"] is None
+                                               else note["attempt_number"], note["kind"]))
 
     def package_core(self, store, project_id: str, work_item_id: str) -> tuple[str, str]:
         """Freeze the inputs of a dispatch; the digest covers everything but identity."""
@@ -122,9 +133,10 @@ class DispatchService:
                                for entry in store.list_work_item_acceptance(item.work_item_id)],
             },
             "dependencies": self._dependencies(store, project_id, plan.plan_id, item.work_item_id),
-            # What a human already sent back for this item: the next attempt is told which
-            # acceptance item missed instead of being asked to guess from the same original.
-            "rework": self._rework_notes(store, project_id, item.work_item_id),
+            # What a human already sent back for this item or for the whole delivery: the next
+            # attempt is told which acceptance item missed instead of being asked to guess.
+            "rework": self._rework_notes(store, project_id, item.work_item_id,
+                                         requirement.requirement_id),
             "policy": {
                 "binding_id": binding.binding_id, "binding_version": binding.version,
                 "duty": binding.duty, "persona_version": binding.persona_version,

@@ -2295,7 +2295,7 @@ def test_the_requirement_aggregates_to_acceptance_and_the_requester_signs(team):
                          (rows[0].acceptance_id,))
 
 
-def test_a_requirement_return_needs_a_carrier_while_items_can_still_come_back(team):
+def test_a_requirement_return_is_refused_while_a_delivery_is_still_in_play(team):
     requirement, plan, _instance, token = reserved_plan(
         team, plan_item(team, "A", estimate=5), plan_item(team, "B", estimate=3))
     project_id, requirement_id = requirement.project_id, requirement.requirement_id
@@ -2312,8 +2312,8 @@ def test_a_requirement_return_needs_a_carrier_while_items_can_still_come_back(te
         reworking = team.reviews.advance_requirement(access, project_id=project_id,
                                                     requirement_id=requirement_id,
                                                     expected_version=requirement.version)
-        # 需求级退回目前没有被承载的新工作：签字前全部工作项都已 accepted 时无处可返，
-        # 而在途退回由工作项自己承载；因此拒绝而不是把需求推进一个没有出口的退回态。
+        # 需求级退回只能落在一份「已经交齐、等着签字」的交付上：现在 B 还在返工路上，
+        # 提出人手里没有签核对象，退回会把需求推成第二次退回而不是承载它。
         with pytest.raises(InvalidState):
             team.reviews.accept_requirement(access, project_id=project_id,
                                             requirement_id=requirement_id,
@@ -2349,6 +2349,110 @@ def test_a_requirement_return_needs_a_carrier_while_items_can_still_come_back(te
     rows = team.store.list_requirement_acceptances(project_id, requirement_id)
     assert [(row.decision, row.evidence_hash) for row in rows] == [
         ("accepted", final["evidence_hash"])]
+
+
+def test_a_requirement_return_reopens_every_accepted_item_and_carries_the_next_round(team):
+    requirement, plan, _instance, token = reserved_plan(
+        team, plan_item(team, "A", estimate=5), plan_item(team, "B", estimate=3))
+    project_id, requirement_id = requirement.project_id, requirement.requirement_id
+    item_a, item_b = work_item(team, plan, "A"), work_item(team, plan, "B")
+    first_a = accept_item(team, project_id, item_a, token)
+    accept_item(team, project_id, item_b, token)
+    versions = {key: team.store.get_work_item(project_id, item.work_item_id).version
+                for key, item in (("A", item_a), ("B", item_b))}
+    with session(team, team.requester) as access:
+        waiting = team.reviews.advance_requirement(access, project_id=project_id,
+                                                   requirement_id=requirement_id,
+                                                   expected_version=requirement.version)
+        bundle = team.reviews.delivery_bundle(access.store, project_id, requirement_id)
+        # 退回必须写清缺了什么：下一轮执行的人只能照着这句话改。
+        with pytest.raises(ValidationError):
+            team.reviews.accept_requirement(access, project_id=project_id,
+                                            requirement_id=requirement_id,
+                                            decision="changes_requested",
+                                            expected_version=waiting.version)
+        with pytest.raises(Conflict):
+            team.reviews.accept_requirement(access, project_id=project_id,
+                                            requirement_id=requirement_id,
+                                            decision="changes_requested", reason="缺灰度开关",
+                                            expected_version=waiting.version + 3)
+    assert waiting.status == "awaiting_acceptance"
+    with session(team, team.reviewer) as access, pytest.raises(Forbidden):
+        team.reviews.accept_requirement(access, project_id=project_id,
+                                        requirement_id=requirement_id,
+                                        decision="changes_requested", reason="缺灰度开关",
+                                        expected_version=waiting.version)
+
+    with session(team, team.requester) as access:
+        returned = team.reviews.accept_requirement(access, project_id=project_id,
+                                                  requirement_id=requirement_id,
+                                                  decision="changes_requested",
+                                                  reason="对照原文，灰度开关整条没做",
+                                                  expected_version=waiting.version)
+    assert (returned.status, returned.version) == ("rework", waiting.version + 1)
+    reopened = {key: team.store.get_work_item(project_id, item.work_item_id)
+                for key, item in (("A", item_a), ("B", item_b))}
+    assert [(entry.status, entry.version) for entry in reopened.values()] == [
+        ("changes_requested", versions["A"] + 1), ("changes_requested", versions["B"] + 1)]
+    # 一次尝试只留一份业务裁定：需求级退回不去改写工作项的 acceptance_reviews，
+    # 它自己那条 requirement_acceptance 才是下一轮读到的返工指示。
+    assert team.store.list_returned_acceptances(project_id, item_a.work_item_id) == []
+    assert team.store.list_returned_acceptances(project_id, item_b.work_item_id) == []
+    rows = team.store.list_requirement_acceptances(project_id, requirement_id)
+    assert [(row.decision, row.reviewer_user_id, row.reason, row.evidence_hash)
+            for row in rows] == [
+        ("changes_requested", team.requester.user_id, "对照原文，灰度开关整条没做",
+         bundle["evidence_hash"])]
+    assert audited(team, requirement_id)[-1] == "requirement.returned"
+
+    requeues = [f"/projects/{project_id}/work-items/{item.work_item_id}/rework"
+                for item in (item_a, item_b)]
+    assert sorted(entry[0] for entry in todos(team, team.reviewer)) == ["rework_queue"] * 2
+    assert {entry[2] for entry in todos(team, team.reviewer)} == set(requeues)
+    assert todos(team, team.requester) == []
+    with session(team, team.requester) as access:
+        again = team.reviews.accept_requirement(access, project_id=project_id,
+                                                requirement_id=requirement_id,
+                                                decision="changes_requested",
+                                                reason="对照原文，灰度开关整条没做",
+                                                expected_version=1)
+    assert (again.status, again.version) == ("rework", returned.version)
+    assert len(team.store.list_requirement_acceptances(project_id, requirement_id)) == 1
+
+    service = team.make_execution()
+    for key, item in (("A", item_a), ("B", item_b)):
+        with session(team, team.reviewer) as access:
+            team.reviews.rework(access, project_id=project_id, work_item_id=item.work_item_id,
+                                expected_version=reopened[key].version)
+    second_a = team.make_dispatch(requires_real_data=False).dispatch(project_id,
+                                                                     item_a.work_item_id)
+    payload = json.loads(service.package(token, second_a.attempt_id)[0])
+    assert [(entry["kind"], entry["attempt_number"], entry["reason"], entry["attempt_id"])
+            for entry in payload["rework"]] == [
+        ("requirement_acceptance", None, "对照原文，灰度开关整条没做", None)]
+    assert second_a.input_hash != first_a.input_hash
+
+    accept_item(team, project_id, item_a, token, attempt=second_a, summary="补上了灰度开关")
+    accept_item(team, project_id, item_b, token, summary="补上了灰度开关")
+    with session(team, team.requester) as access:
+        second_round = team.reviews.advance_requirement(access, project_id=project_id,
+                                                        requirement_id=requirement_id,
+                                                        expected_version=returned.version)
+    assert second_round.status == "awaiting_acceptance"
+    assert todos(team, team.requester) == [
+        ("final_acceptance", "accept_requirement",
+         f"/projects/{project_id}/requirements/{requirement_id}/acceptance")]
+    with session(team, team.requester) as access:
+        signed = team.reviews.accept_requirement(access, project_id=project_id,
+                                                 requirement_id=requirement_id,
+                                                 decision="accepted",
+                                                 expected_version=second_round.version)
+    assert signed.status == "completed"
+    final = team.store.list_requirement_acceptances(project_id, requirement_id)
+    assert [entry.decision for entry in final] == ["changes_requested", "accepted"]
+    assert final[1].evidence_hash != final[0].evidence_hash
+    assert audited(team, requirement_id)[-1] == "requirement.completed"
+    assert todos(team, team.reviewer) == []
 
 
 # --- inbox ------------------------------------------------------------------------

@@ -1896,8 +1896,8 @@ def test_the_requester_signs_for_the_requirement_delivery_over_http(api):
     checked(api.send("member", "POST", acceptance,
                      json={"decision": "signed_off", "expected_version": waiting["version"]}), 422)
     checked(api.send("member", "POST", acceptance,
-                     json={"decision": "changes_requested", "reason": "整体不满意",
-                           "expected_version": waiting["version"]}), 409)
+                     json={"decision": "changes_requested", "expected_version": waiting["version"]}),
+              422)
     done = checked(api.send("member", "POST", acceptance,
                             json={"decision": "accepted", "expected_version": waiting["version"],
                                   "reason": "对照原文逐条可用"}))
@@ -1915,6 +1915,85 @@ def test_the_requester_signs_for_the_requirement_delivery_over_http(api):
                      json={"action": "advance", "expected_version": done["version"]}), 409)
     checked(api.send("member", "POST", actions,
                      json={"action": "cancel", "expected_version": done["version"]}), 409)
+
+
+def test_a_returned_requirement_reopens_its_items_and_informs_the_next_attempt(api):
+    seen = delivered(api)
+    pid = seen.project["project_id"]
+    wid = seen.plan["work_items"][0]["work_item_id"]
+    base = f"/projects/{pid}/requirements/{seen.requirement_id}"
+    sign, actions, delivery = f"{base}/acceptance", f"{base}/actions", f"{base}/delivery"
+    rework = f"/projects/{pid}/work-items/{wid}/rework"
+
+    def owed(actor):
+        return [(entry["item_type"], entry["action"], entry["href"]) for entry in
+                checked(api.send(actor, "GET", "/inbox"))
+                if not entry["item_type"].startswith("requirement_")]
+
+    checked(api.send("member", "POST", delivery_path(pid, seen.attempt.attempt_id),
+                     json={"decision": "confirmed", "expected_version": seen.reported["version"]}))
+    item = checked(api.send("manager", "GET", plans_path(seen.project, seen.requirement_id)
+                            + f"/{seen.plan['plan']['plan_id']}"))["work_items"][0]
+    checked(api.send("manager", "POST", f"/projects/{pid}/work-items/{wid}/accept",
+                     json={"decision": "accepted", "expected_version": item["version"]}))
+    requirement = checked(api.send("member", "GET", base))
+    waiting = checked(api.send("member", "POST", actions,
+                               json={"action": "advance",
+                                     "expected_version": requirement["version"]}))
+    assert waiting["status"] == "awaiting_acceptance"
+    refused = checked(api.send("member", "GET", delivery))["delivery"]["evidence_hash"]
+
+    checked(api.send("outsider", "POST", sign,
+                     json={"decision": "changes_requested", "reason": "缺灰度开关",
+                           "expected_version": waiting["version"]}), 404)
+    checked(api.send("manager", "POST", sign,
+                     json={"decision": "changes_requested", "reason": "缺灰度开关",
+                           "expected_version": waiting["version"]}), 403)
+    checked(api.send("member", "POST", sign,
+                     json={"decision": "changes_requested", "expected_version": waiting["version"]}),
+              422)
+    checked(api.send("member", "POST", sign,
+                     json={"decision": "changes_requested", "reason": "缺灰度开关",
+                           "expected_version": waiting["version"] + 4}), 409)
+    returned = checked(api.send("member", "POST", sign,
+                                json={"decision": "changes_requested",
+                                      "reason": "对照原文，灰度开关整条没做",
+                                      "expected_version": waiting["version"]}))
+    assert (returned["status"], returned["version"]) == ("rework", waiting["version"] + 1)
+    assert work_item_statuses(api, seen.project, seen.requirement_id, seen.plan) == [
+        "changes_requested"]
+    rows = checked(api.send("member", "GET", delivery))["acceptances"]
+    assert [(entry["decision"], entry["reason"], entry["reviewer_user_id"],
+             entry["evidence_hash"]) for entry in rows] == [
+        ("changes_requested", "对照原文，灰度开关整条没做",
+         api.identities["member"]["user"]["user_id"], refused)]
+    # 需求级裁定不冒充工作项裁定：那一次尝试仍然只有一条 accepted 的业务验收记录。
+    assert checked(api.send("member", "GET",
+                            delivery_path(pid, seen.attempt.attempt_id)))["acceptance_review"][
+        "decision"] == "accepted"
+    assert owed("manager") == [("rework_queue", "rework_work_item", rework)]
+    assert owed("member") == []
+    replay = checked(api.send("member", "POST", sign,
+                              json={"decision": "changes_requested",
+                                    "reason": "对照原文，灰度开关整条没做",
+                                    "expected_version": 1}))
+    assert (replay["status"], replay["version"]) == ("rework", returned["version"])
+    assert len(checked(api.send("member", "GET", delivery))["acceptances"]) == 1
+
+    reopened = checked(api.send("manager", "GET", plans_path(seen.project, seen.requirement_id)
+                                + f"/{seen.plan['plan']['plan_id']}"))["work_items"][0]
+    assert (reopened["status"], reopened["version"]) == ("changes_requested",
+                                                         item["version"] + 2)
+    queued = checked(api.send("manager", "POST", rework,
+                              json={"expected_version": reopened["version"]}))
+    assert queued["status"] == "ready"
+    second = checked(api.send("manager", "POST", dispatch_path(pid, wid)))
+    payload = checked(api.send(None, "GET", f"/machine/attempts/{second['attempt_id']}/package",
+                               headers={"X-Instance-Token": seen.token}))
+    assert [(entry["kind"], entry["attempt_number"], entry["reason"], entry["attempt_id"])
+            for entry in payload["rework"]] == [
+        ("requirement_acceptance", None, "对照原文，灰度开关整条没做", None)]
+    assert second["input_hash"] != seen.attempt.input_hash
 
 
 def test_inbox_to_dos_lead_to_working_endpoints(api):
