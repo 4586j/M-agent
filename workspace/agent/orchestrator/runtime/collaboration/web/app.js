@@ -30,6 +30,50 @@ const DECISIONS = {
                          edit: true},
 };
 
+// 需求动态读的是审计流水，主语由服务端算好（工作项 A、第 1 次尝试 · A），这里只补谓语那半句。
+// 没在这里登记的动作不会被藏起来：它会带着机器名出现，所以漏一个词只是难看，不会少一条事实。
+const NEWS = {
+  "requirement.created": "被创建",
+  "requirement.revision_saved": "存下来了",
+  "requirement.message_posted": "补了一条澄清",
+  "requirement.review_requested": "已送审",
+  "requirement.review_approved": "被点名的审核人批准了这一版",
+  "requirement.review_rejected": "被点名的审核人驳回，要改",
+  "requirement.executing": "进入执行",
+  "requirement.awaiting_acceptance": "整篇交付等提出人签字",
+  "requirement.rework": "退回返工",
+  "requirement.completed": "已签字验收",
+  "requirement.cancelling": "进入取消流程",
+  "requirement.cancelled": "已取消",
+  "requirement.planning_blocked": "拆解被挡住",
+  "requirement.paused": "已暂停",
+  "requirement.resumed": "已恢复",
+  "plan.published": "已发布",
+  "plan.blocked": "被挡住",
+  "work_item.pending_dependency": "还在等依赖",
+  "work_item.ready": "就绪",
+  "work_item.waiting_agent": "等可用的执行机",
+  "work_item.running": "开始执行",
+  "work_item.awaiting_owner_review": "等负责人确认产出",
+  "work_item.submitted": "已提交产出",
+  "work_item.accepted": "被验收通过",
+  "work_item.changes_requested": "被要求改动",
+  "work_item.blocked": "被阻塞",
+  "work_item.failed": "失败",
+  "work_item.requeued": "重新排队",
+  "work_item.cancelled": "被取消",
+  "attempt.assigned": "已派发",
+  "attempt.ack": "执行机确认接到",
+  "attempt.start": "执行机开始运行",
+  "attempt.result": "执行机回报了结果",
+  "attempt.cancel": "执行机确认已停止",
+  "attempt.confirmed": "负责人确认了这次产出",
+  "attempt.changes_requested": "负责人退回了这次产出",
+  "attempt.reconciled.cancelled": "对账为已停止且无副作用",
+  "attempt.reconciled.failed": "对账为已产生副作用",
+};
+const ACTIVITY_LIMIT = 20;
+
 let csrf = null;
 let me = null;
 let role = null;
@@ -421,6 +465,27 @@ function renderPauseState(block, requirement, pauses) {
   }
 }
 
+function renderActivity(block, entries) {
+  // 待办说的是「你还欠一个决定」，动态说的是「你不在的时候这里发生了什么」：两件事，两栏。
+  add(block, "dt", null, "需求动态（读自审计流水，最新在前）");
+  if (!entries.length) {
+    add(block, "dd", null, "还没有记到任何动态。");
+    return;
+  }
+  const names = {};
+  for (const member of roster) {
+    names[member.user_id] = member.display_name;
+  }
+  for (const entry of entries) {
+    const who = entry.actor_id ? names[entry.actor_id] || entry.actor_id : "系统";
+    add(block, "dd", null, `${when(entry.created_at)} · ${who} · ${entry.label}：`
+                          + `${NEWS[entry.action] || entry.action}`);
+  }
+  if (entries.length === ACTIVITY_LIMIT) {
+    add(block, "dd", "locator", `只列最近 ${ACTIVITY_LIMIT} 条，更早的动态没有消失，界面不自动翻页。`);
+  }
+}
+
 async function renderRequirement(projectId, requirementId) {
   const requirement = await get(`/projects/${projectId}/requirements/${requirementId}`);
   const block = add(fields.detail, "div");
@@ -538,6 +603,7 @@ async function renderRequirement(projectId, requirementId) {
       }
     }
   }
+  renderActivity(block, await get(`${path}/activity?limit=${ACTIVITY_LIMIT}`));
 }
 
 async function renderWorkItems(block, projectId, requirementId, paused) {

@@ -400,6 +400,42 @@ def _audit_rows(conn, project_id: str | None, limit: int):
     return [dict(row) for row in rows]
 
 
+# A lease renewal repeats on a timer and a rejected callback changed nothing: neither is news a
+# person wants in a story about the requirement, and the first one would crowd the rest out.
+_ACTIVITY_DENIED = ("attempt.lease", "attempt.callback_rejected")
+
+
+def _activity_rows(conn, project_id: str, requirement_id: str, limit: int):
+    """One requirement's story, newest first, read off the audit trail it already wrote.
+
+    The audit table is the only event source here: an action shows up as soon as its target
+    belongs to this requirement, so nothing has to be written a second time to become visible.
+    Events written in one transaction share a timestamp, so the row id breaks the tie: this table
+    is append-only by trigger, which makes it the order the writes actually happened in.
+    """
+    denied = ",".join("?" * len(_ACTIVITY_DENIED))
+    rows = conn.execute(
+        f"""
+        WITH subject(id, kind, label) AS (
+            SELECT ?, 'requirement', '需求本身'
+            UNION ALL SELECT revision_id, 'revision', '第 ' || number || ' 版原文'
+                FROM requirement_revisions WHERE requirement_id=?
+            UNION ALL SELECT plan_id, 'plan', '拆解计划' FROM plans WHERE requirement_id=?
+            UNION ALL SELECT w.work_item_id, 'work_item', '工作项 ' || w.key
+                FROM work_items w JOIN plans p ON p.plan_id=w.plan_id WHERE p.requirement_id=?
+            UNION ALL SELECT a.attempt_id, 'attempt', '第 ' || a.number || ' 次尝试 · ' || w.key
+                FROM attempts a JOIN work_items w ON w.work_item_id=a.work_item_id
+                WHERE a.requirement_id=?)
+        SELECT a.event_id,a.actor_id,a.action,a.created_at,s.kind,s.label
+        FROM collaboration_audit a JOIN subject s ON s.id=a.target_id
+        WHERE a.project_id=? AND a.action NOT IN ({denied})
+        ORDER BY a.created_at DESC,a.rowid DESC LIMIT ?
+        """,
+        (requirement_id, requirement_id, requirement_id, requirement_id, requirement_id,
+         project_id, *_ACTIVITY_DENIED, limit))
+    return [dict(row) for row in rows]
+
+
 def _wake(client: httpx.Client, url: str, payload: dict) -> None:
     """Advisory wake-up of a registered worker; failure only delays its next pull."""
     response = client.post(url, json=payload, headers={"x-collab-wake": "1"})
@@ -908,6 +944,18 @@ def create_app(config: AppConfig) -> FastAPI:
         with _access(request, project_id=pid) as access:
             access.store.get_requirement(pid, rid)
             return [asdict(entry) for entry in access.store.list_requirement_pauses(pid, rid)]
+
+    @router.get("/projects/{pid}/requirements/{rid}/activity")
+    def requirement_activity(pid: str, rid: str, request: Request, limit: AuditLimit = 20):
+        """What has happened to this requirement, newest first.
+
+        The to-do list only says what a person still owes somebody. This is the other half of the
+        same page: what moved while they were not looking. It reads the audit trail the decisions
+        already wrote, so it can neither decide anything nor drift from what really happened.
+        """
+        with _access(request, project_id=pid) as access:
+            access.store.get_requirement(pid, rid)
+            return _activity_rows(access.conn, pid, rid, limit)
 
     @router.get("/projects/{pid}/requirements/{rid}/delivery")
     def requirement_delivery(pid: str, rid: str, request: Request):

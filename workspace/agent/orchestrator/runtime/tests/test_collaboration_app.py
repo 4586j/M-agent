@@ -2037,6 +2037,59 @@ def test_pausing_a_requirement_stops_new_attempts_over_http(api):
                      json={"action": "resume", "expected_version": resumed["version"]}), 409)
 
 
+def test_the_requirement_timeline_reads_the_story_off_the_audit_trail(api):
+    # 动态是审计的读视图：决定当时写过什么，这里就读出什么，不需要有人再写第二遍。
+    project, requirement_id, plan, attempt, token = machine_attempt(api)
+    pid = project["project_id"]
+    activity = f"/projects/{pid}/requirements/{requirement_id}/activity"
+    checked(api.send("outsider", "GET", activity), 404)
+    manager = api.identities["manager"]["user"]["user_id"]
+    member = api.identities["member"]["user"]["user_id"]
+    assert [(entry["action"], entry["kind"], entry["label"], entry["actor_id"])
+            for entry in checked(api.send("member", "GET", activity))] == [
+        ("attempt.assigned", "attempt", "第 1 次尝试 · A", manager),
+        # 计划发布与需求转执行写在同一个事务里：同一刻的先后按写入顺序倒过来，不靠随机 id 猜。
+        ("requirement.executing", "requirement", "需求本身", manager),
+        ("plan.published", "plan", "拆解计划", manager),
+        ("requirement.review_approved", "requirement", "需求本身", manager),
+        ("requirement.review_requested", "requirement", "需求本身", member),
+        ("requirement.revision_saved", "revision", "第 1 版原文", member),
+        ("requirement.created", "requirement", "需求本身", member)]
+    # 租约续期按定时器重复、被拒的回调什么也没改变：它们不该把这个故事挤掉。
+    def timeline(limit=200):
+        return [entry["action"] for entry in
+                checked(api.send("member", "GET", f"{activity}?limit={limit}"))]
+
+    before = timeline()
+    checked(api.send(None, "POST", f"/machine/attempts/{attempt.attempt_id}/lease",
+                     json=machine_claims(attempt), headers={"X-Instance-Token": token}))
+    assert timeline() == before
+    # 少掉的每一条都是被点名的噪音，不是漏掉的记录：同一份审计里它就在那儿。
+    assert "attempt.lease" in {entry["action"] for entry in
+                               checked(api.send("manager", "GET",
+                                                f"/projects/{pid}/audit?limit=200"))}
+    assert before[:3] == ["attempt.assigned", "requirement.executing", "plan.published"]
+    checked(api.send("member", "GET", f"{activity}?limit=0"), 422)
+    checked(api.send("member", "GET", f"{activity}?limit=201"), 422)
+
+
+def test_one_requirements_timeline_never_carries_another_ones_events(api):
+    # 一个项目的审计流水是混在一起的：读视图按归属取行，取错就等于把别人的草稿摊给全项目。
+    project, requirement_id, plan, attempt, token = machine_attempt(api)
+    pid = project["project_id"]
+    other = checked(api.send("member", "POST", f"/projects/{pid}/requirements",
+                             json={"title": "另一份需求", "content": "# 另一篇原文\n别混在一起。\n",
+                                   "acceptance_items": ["两份需求互不影响"]}), 201)
+    base = f"/projects/{pid}/requirements"
+    mine = checked(api.send("member", "GET", f"{base}/{requirement_id}/activity?limit=200"))
+    theirs = checked(api.send("member", "GET",
+                              f"{base}/{other['requirement_id']}/activity?limit=200"))
+    assert [(entry["action"], entry["kind"], entry["label"]) for entry in theirs] == [
+        ("requirement.revision_saved", "revision", "第 1 版原文"),
+        ("requirement.created", "requirement", "需求本身")]
+    assert not ({entry["event_id"] for entry in mine} & {entry["event_id"] for entry in theirs})
+
+
 def test_inbox_to_dos_lead_to_working_endpoints(api):
     seen = delivered(api)
     pid = seen.project["project_id"]
@@ -2320,4 +2373,16 @@ def test_the_pause_reason_the_panel_banner_shows_is_readable_by_every_member(api
     # 面板用 filter(paused).pop() 取当前这一次的原因：排序一反就把它停手前的旧理由当成现在的。
     assert (history[-1]["reason"], history[-1]["actor_user_id"]) == (
         "先别派，我要改一条验收项", api.identities["member"]["user"]["user_id"])
+
+
+def test_the_panel_names_every_action_the_requirement_timeline_can_show(api):
+    # 动态读的是审计：新动作一出现就自己冒到时间线上，界面得有词称呼它，否则人只看到机器名。
+    source = (RUNTIME / "collaboration" / "web" / "app.js").read_text(encoding="utf-8")
+    block = source.split("const NEWS = {", 1)[1].split("\n};", 1)[0]
+    named = set(re.findall(r'^  "([\w.]+)":', block, re.MULTILINE))
+    seen = delivered(api)
+    rows = checked(api.send("member", "GET",
+                            f"/projects/{seen.project['project_id']}/requirements"
+                            f"/{seen.requirement_id}/activity?limit=200"))
+    assert {entry["action"] for entry in rows} <= named
 
