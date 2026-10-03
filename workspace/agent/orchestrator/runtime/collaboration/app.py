@@ -570,7 +570,10 @@ def create_app(config: AppConfig) -> FastAPI:
     @router.get("/projects/{pid}/members")
     def list_members(pid: str, request: Request):
         with _access(request, project_id=pid) as access:
-            return [asdict(member) for member in access.store.list_members(pid)]
+            members = access.store.list_members(pid)
+            names = access.store.display_names([member.user_id for member in members])
+            return [{**asdict(member), "display_name": names[member.user_id]}
+                    for member in members]
 
     @router.post("/projects/{pid}/members", status_code=201)
     def add_member(pid: str, body: MemberCreate, request: Request):

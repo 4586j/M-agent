@@ -229,7 +229,7 @@ async function renderRequirement(projectId, requirementId) {
     });
   }
   if ((MANAGERS.includes(role) || requirement.requester_id === me)
-      && requirement.status !== "cancelled") {
+      && !["cancelled", "completed"].includes(requirement.status)) {
     const form = add(block, "div", "form-row");
     const reason = add(form, "input");
     reason.placeholder = "取消理由（可留空）";
@@ -290,14 +290,48 @@ async function renderWorkItems(block, projectId, requirementId) {
     add(block, "dd", null, "还没有已发布的计划，界面不代为拆解需求。");
     return;
   }
+  const roster = await get(`/projects/${projectId}/members`);
+  const people = {};
+  for (const member of roster) {
+    people[member.user_id] = member.display_name;
+  }
   const plan = published[published.length - 1];
   const detail = await get(`/projects/${projectId}/requirements/${requirementId}/plans`
                            + `/${plan.plan_id}`);
+  const keys = {};
+  for (const item of detail.work_items) {
+    keys[item.work_item_id] = item.key;
+  }
+  const needs = {};
+  for (const edge of detail.dependencies) {
+    (needs[edge.work_item_id] = needs[edge.work_item_id] || []).push(
+      keys[edge.depends_on_id] || edge.depends_on_id);
+  }
+  if (MANAGERS.includes(role)) {
+    const form = add(block, "div", "form-row");
+    const tick = add(form, "button", null, "推进工作项队列");
+    tick.type = "button";
+    tick.addEventListener("click", async () => {
+      tick.disabled = true;
+      try {
+        const moved = await post(`/projects/${projectId}/scheduler/tick`, {});
+        say(`队列已重算，${moved.work_items_changed} 个工作项状态变化。`, "ok");
+        await load();
+      } catch (error) {
+        tick.disabled = false;
+        if (error.name !== "AbortError") {
+          say(`队列推进失败：${error.message}`, "error");
+        }
+      }
+    });
+  }
   for (const item of detail.work_items) {
     const row = add(block, "dl", null);
     add(row, "dd", null, `${item.key} · ${item.title} · ${item.status} · 版本 ${item.version}`
                           + ` · 估算 ${item.estimated_units}`);
-    add(row, "dd", null, `职责 ${item.duty} · 负责人 ${item.assignee_user_id}`);
+    add(row, "dd", null, `职责 ${item.duty} · 负责人 ${people[item.assignee_user_id] ?? item.assignee_user_id}`
+                          + (needs[item.work_item_id] ? ` · 依赖 ${needs[item.work_item_id].join("、")}`
+                                                       : ""));
     if (MANAGERS.includes(role) && item.status === "ready") {
       const form = add(row, "div", "form-row");
       const button = add(form, "button", null, "派发一次尝试");
@@ -445,5 +479,5 @@ fields.logout.addEventListener("click", async () => {
 
 fields.project.addEventListener("change", loadRequirements);
 fields.requirement.addEventListener("change", refresh);
-document.getElementById("refresh").addEventListener("click", refresh);
+document.getElementById("refresh").addEventListener("click", load);
 resume();

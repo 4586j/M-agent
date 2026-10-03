@@ -269,6 +269,15 @@ class CollaborationStore:
         with self._read() as conn:
             return self._user(conn, user_id)
 
+    def display_names(self, user_ids: list[str]) -> dict[str, str]:
+        """Names for a roster in one read, so a listing does not become a query per member."""
+        if not user_ids:
+            return {}
+        with self._read() as conn:
+            return {row["user_id"]: row["display_name"] for row in conn.execute(
+                f"SELECT user_id,display_name FROM users WHERE user_id IN "
+                f"({','.join('?' * len(user_ids))})", tuple(user_ids))}
+
     def update_user(self, user_id: str, *, display_name: str, status: str, expected_version: int) -> User:
         _text(display_name, "display_name")
         _choice(status, ("active", "disabled"), "status")

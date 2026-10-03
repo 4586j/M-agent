@@ -271,7 +271,9 @@ def test_projects_members_agents_bindings_and_audit_round_trip(api):
     updated_member = checked(api.send("owner", "PATCH", f"/projects/{pid}/members/{member['user_id']}",
                                       json={"access_role": "reviewer", "status": "active", "expected_version": 1}))
     assert updated_member["version"] == 2
-    assert len(checked(api.send("member", "GET", f"/projects/{pid}/members"))) == 2
+    roster = checked(api.send("member", "GET", f"/projects/{pid}/members"))
+    assert len(roster) == 2
+    assert {entry["display_name"] for entry in roster} == {"Owner", "Member"}
     updated_agent = checked(api.send("member", "PATCH", f"/agents/{agent['agent_id']}",
                                      json={"name": "Renamed", "status": "active", "expected_version": 1}))
     assert updated_agent["version"] == 2
