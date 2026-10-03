@@ -5,6 +5,7 @@ import base64
 import hashlib
 import json
 import secrets
+import shutil
 import sqlite3
 import sys
 from contextlib import closing, contextmanager
@@ -17,11 +18,13 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from collaboration import database as database_module
+from collaboration.__main__ import main as host_main
 from collaboration.auth import Access, Forbidden, Unauthorized
 from collaboration.budgets import BudgetService
 from collaboration.database import Database, SCHEMA_VERSION
 from collaboration.dispatch import DispatchService, TOPIC_ATTEMPT_ASSIGNED, TOPIC_ATTEMPT_REVOKED
 from collaboration.execution import ExecutionService, decode_artifact
+from collaboration.host import SchedulerHost
 from collaboration.inbox import InboxService
 from collaboration.instances import AdmissionDenied, InstanceService
 from collaboration.scheduler import OutboxDispatcher, QueueService, Scheduler
@@ -2627,4 +2630,82 @@ def test_a_seen_to_do_is_still_owed_until_someone_rules(team):
     assert stamped(team.worker)[0]["unread"] is True
     with session(team, team.reviewer) as access, pytest.raises(ValidationError):
         inbox.ack(access, item_key=f"final_acceptance:{project_id}{'f' * 32}", known=keys)
+
+
+# --- resident scheduler host ---------------------------------------------------------
+
+def host_for(team, *, dispatch=None):
+    """The host over the same services the HTTP entry assembles, minus planner and push transport."""
+    return SchedulerHost(
+        Scheduler(team.database, planning=SimpleNamespace(),
+                  queue=QueueService(team.database, clock=team.clock), dispatch=dispatch,
+                  clock=team.clock),
+        team.database, reviews=team.reviews, clock=team.clock)
+
+
+def test_the_host_carries_a_finished_delivery_to_the_requester_without_a_click(team):
+    requirement, plan, _instance, token = reserved_plan(
+        team, plan_item(team, "A", estimate=5), plan_item(team, "B", estimate=3))
+    project_id, requirement_id = requirement.project_id, requirement.requirement_id
+    accept_item(team, project_id, work_item(team, plan, "A"), token)
+    accept_item(team, project_id, work_item(team, plan, "B"), token)
+    assert team.store.get_requirement(project_id, requirement_id).status == "executing"
+
+    host = host_for(team)
+    assert host.tick(project_id)["requirements_changed"] == 1
+    waiting = team.store.get_requirement(project_id, requirement_id)
+    assert waiting.status == "awaiting_acceptance"
+    assert todos(team, team.requester) == [
+        ("final_acceptance", "accept_requirement",
+         f"/projects/{project_id}/requirements/{requirement_id}/acceptance")]
+    with team.database.read() as conn:
+        assert conn.execute("SELECT actor_id FROM collaboration_audit WHERE target_id=? "
+                            "AND action='requirement.awaiting_acceptance'",
+                            (requirement_id,)).fetchone()[0] is None
+    # 第二轮没有新事实就不推版本：宿主收敛的是工作项已经造成的变化，不是自己的心跳。
+    assert host.tick(project_id)["requirements_changed"] == 0
+    assert team.store.get_requirement(project_id, requirement_id).version == waiting.version
+
+
+class _Rounds:
+    """A scheduler that fails once, so what is under test is the loop and not the round."""
+
+    def __init__(self):
+        self.seen = []
+
+    def tick(self, project_id=None):
+        self.seen.append(project_id)
+        if len(self.seen) == 2:
+            raise sqlite3.OperationalError("database is locked")
+        return {}
+
+
+def test_the_host_loop_outlives_one_bad_round_and_stops_when_told(team, caplog):
+    rounds = _Rounds()
+    host = SchedulerHost(rounds, team.database, reviews=team.reviews, clock=team.clock)
+    slept = []
+    with caplog.at_level("WARNING"):
+        done = host.run(interval=0.5, iterations=3, project_id=team.project_a.project_id,
+                        sleeper=slept.append)
+    assert (done, rounds.seen, slept) == (3, [team.project_a.project_id] * 3, [0.5, 0.5])
+    assert "OperationalError" in caplog.text
+    assert "database is locked" not in caplog.text
+
+
+def test_the_scheduler_command_runs_one_real_round_over_the_seeded_database(team, capsys):
+    requirement, plan, _instance, token = reserved_plan(team, plan_item(team, "A", estimate=5))
+    project_id, requirement_id = requirement.project_id, requirement.requirement_id
+    accept_item(team, project_id, work_item(team, plan, "A"), token)
+    shutil.copy2(team.database.path, team.database.path.parent / "metadata.sqlite3")
+    data_dir = str(team.database.path.parent)
+
+    for argv in (["--interval", "0"], ["--iterations", "0"]):
+        with pytest.raises(SystemExit):
+            host_main(["scheduler", "--data-dir", data_dir, *argv])
+    assert host_main(["scheduler", "--data-dir", data_dir, "--iterations", "1"]) == 0
+    assert capsys.readouterr().out.strip() == "1"
+    moved = CollaborationStore(Database(team.database.path.parent / "metadata.sqlite3"))
+    assert moved.get_requirement(project_id, requirement_id).status == "awaiting_acceptance"
+    # 命令行那一轮只写了副本：宿主不碰原库，就不可能把测试里那份需求的状态顺手改掉。
+    assert team.store.get_requirement(project_id, requirement_id).status == "executing"
 

@@ -1,17 +1,24 @@
-"""Explicit local bootstrap and standalone HTTP service commands."""
+"""Explicit local bootstrap, standalone HTTP service and scheduler host commands."""
 from __future__ import annotations
 
 import argparse
 from getpass import getpass
+import httpx
 from ipaddress import ip_address
 from pathlib import Path
 import sqlite3
 
-from .app import AppConfig, create_app
+from .app import AppConfig, _wake, create_app
 from .auth import AuthService, Unauthorized, Forbidden, RateLimited
+from .budgets import BudgetService
 from .database import Database
+from .dispatch import DispatchService
+from .host import SchedulerHost
 from .instances import InstanceService
 from .models import CollaborationError
+from .planning import PlanService
+from .reviews import ReviewService
+from .scheduler import QueueService, Scheduler
 
 
 class _Parser(argparse.ArgumentParser):
@@ -38,6 +45,13 @@ def main(argv=None) -> int:
     disable = commands.add_parser("node-disable", help="Disable an execution node and its live instances")
     disable.add_argument("--data-dir", type=Path, required=True)
     disable.add_argument("--node-id", required=True)
+    scheduler = commands.add_parser("scheduler",
+                                    help="Keep running scheduling rounds until stopped (Ctrl-C)")
+    scheduler.add_argument("--data-dir", type=Path, required=True)
+    scheduler.add_argument("--interval", type=float, default=5.0)
+    scheduler.add_argument("--iterations", type=int, default=None)
+    scheduler.add_argument("--project", default=None)
+    scheduler.add_argument("--auto-dispatch", action="store_true")
     args = parser.parse_args(argv)
 
     if args.command == "bootstrap":
@@ -75,6 +89,41 @@ def main(argv=None) -> int:
         except (CollaborationError, Unauthorized, Forbidden, RateLimited, sqlite3.Error):
             parser.error("Node operation failed")
         print(node.node_id)
+        return 0
+
+    if args.command == "scheduler":
+        if not 0.1 <= args.interval <= 3600:
+            parser.error("Interval must be between 0.1 and 3600 seconds")
+        if args.iterations is not None and args.iterations < 1:
+            parser.error("Iterations must be at least 1")
+        # Same services and the same wake transport the HTTP entry assembles, so the host cannot
+        # hand out a lease the serving process would not honour.
+        config = AppConfig(args.data_dir)
+        waker = httpx.Client(timeout=httpx.Timeout(10.0, connect=3.0))
+        try:
+            database = Database(config.data_dir / "metadata.sqlite3")
+            database.initialize()
+            instances = InstanceService(database)
+            budgets = BudgetService()
+            host = SchedulerHost(
+                Scheduler(database, planning=PlanService(database, budgets=budgets),
+                          queue=QueueService(database,
+                                             heartbeat_timeout=instances.heartbeat_timeout),
+                          dispatch=DispatchService(database, instances=instances,
+                                                   lease_ttl=config.lease_ttl,
+                                                   push=lambda url, payload: _wake(
+                                                       waker, url, payload)),
+                          auto_dispatch=args.auto_dispatch),
+                database, reviews=ReviewService(budgets=budgets))
+            print(host.run(interval=args.interval, iterations=args.iterations,
+                           project_id=args.project))
+        except (CollaborationError, Unauthorized, Forbidden, RateLimited, sqlite3.Error):
+            parser.error("Scheduler host failed")
+        except KeyboardInterrupt:
+            # Ctrl-C is how this command is meant to stop, so a clean exit is not a failure.
+            pass
+        finally:
+            waker.close()
         return 0
 
     if not 1 <= args.port <= 65535:

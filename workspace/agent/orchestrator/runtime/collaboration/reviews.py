@@ -25,6 +25,10 @@ ACCEPT_DECISIONS = ("accepted", "changes_requested")
 # Both of these send a work item back to the queue: a returned delivery carries its note to
 # the next attempt, while a failed one is retried with the very same frozen inputs.
 REWORKABLE_STATUSES = ("changes_requested", "failed")
+# A requirement is still delivering while its own work items can move it. This is exactly the set
+# the resident host re-derives on a timer, and the only set a person may advance by hand, so the
+# two paths cannot disagree about what "in progress" means.
+DELIVERING_STATUSES = ("executing", "rework", "awaiting_acceptance")
 SECURITY_DECISIONS = ("approved", "rejected")
 MAX_REASON_CHARS = 2048
 MAX_RULE_KEY_CHARS = 128
@@ -487,22 +491,31 @@ class ReviewService:
                     _canonical({"items": entries}).encode("utf-8")).hexdigest(),
                 "items": entries}
 
+    def requirement_target(self, store: CollaborationStore, project_id: str,
+                           requirement_id: str) -> str:
+        """What this requirement's own work items say right now.
+
+        One rule serves both the person who asks from the panel and the host that asks on a
+        timer, so an automatic round can never disagree with the manual one. ``delivery_bundle``
+        refuses a requirement without a published plan, so only delivered work answers here.
+        """
+        statuses = {entry["status"] for entry in
+                    self.delivery_bundle(store, project_id, requirement_id)["items"]}
+        if statuses == {"accepted"}:
+            return "awaiting_acceptance"
+        if statuses & set(REWORKABLE_STATUSES):
+            return "rework"
+        return "executing"
+
     def advance_requirement(self, access: Access, *, project_id: str, requirement_id: str,
                             expected_version: int) -> Requirement:
         """Re-derive the requirement's own status from what its work items actually did."""
         self._member(access, project_id)
         requirement = access.store.get_requirement(project_id, requirement_id)
         _version(requirement.version, expected_version)
-        if requirement.status not in ("executing", "rework", "awaiting_acceptance"):
+        if requirement.status not in DELIVERING_STATUSES:
             raise InvalidState("Requirement is not delivering work")
-        statuses = {entry["status"] for entry in
-                    self.delivery_bundle(access.store, project_id, requirement_id)["items"]}
-        if statuses == {"accepted"}:
-            target = "awaiting_acceptance"
-        elif statuses & set(REWORKABLE_STATUSES):
-            target = "rework"
-        else:
-            target = "executing"
+        target = self.requirement_target(access.store, project_id, requirement_id)
         if target == requirement.status:
             return requirement
         now = self.clock()

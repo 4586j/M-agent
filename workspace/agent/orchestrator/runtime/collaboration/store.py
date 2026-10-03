@@ -652,6 +652,24 @@ class CollaborationStore:
                 "ORDER BY created_at,requirement_id",
                 (project_id, *POST_APPROVAL_STATUSES, user_id, user_id))]
 
+    def delivering_requirements(self, statuses: tuple[str, ...],
+                               project_id: str | None = None) -> list[Requirement]:
+        """System view of requirements in the given statuses, for the resident scheduler host.
+
+        Not a member listing: the host acts for nobody and shows nothing to anyone, so it reads
+        the set directly and only ever writes back the status its work items already justify.
+        """
+        placeholders = ",".join("?" * len(statuses))
+        with self._read() as conn:
+            where = f"status IN ({placeholders})"
+            values = list(statuses)
+            if project_id is not None:
+                where += " AND project_id=?"
+                values.append(project_id)
+            return [_record(Requirement, row) for row in conn.execute(
+                f"SELECT {_REQUIREMENT_COLUMNS} FROM requirements WHERE {where} "
+                "ORDER BY updated_at,requirement_id", values)]
+
     def add_revision(self, project_id: str, requirement_id: str, *, content: str, content_hash: str,
                      content_size: int, author_id: str, expected_version: int,
                      created_at: float,
