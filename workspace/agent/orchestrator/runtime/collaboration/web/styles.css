@@ -19,6 +19,8 @@ button:disabled { opacity: .55; cursor: progress; }
 .unread { background: #fdf0d5; border: 1px solid #e0b96a; border-radius: 10px; color: #7a5310;
   font-size: 12px; font-weight: 600; margin-left: 8px; padding: 1px 8px; }
 .locator { color: #5b6675; font-size: 13px; }
+.paused { background: #fdf3e3; border-left: 4px solid #e0b96a; border-radius: 4px;
+  padding: 8px 12px; margin: 10px 0 4px; color: #6b4a10; font-weight: 600; }
 button.soft { border-color: #b9c3d0; background: #f2f5f9; color: #33404f; }
 .form-row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; margin-top: 6px; }
 .evidence { border-left: 3px solid #d8dee7; padding-left: 10px; margin-top: 8px; }

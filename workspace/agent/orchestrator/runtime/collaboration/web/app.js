@@ -1,5 +1,7 @@
 const API = "/collab/v1";
 const MANAGERS = ["owner", "manager"];
+// 与后端 PAUSABLE_STATUSES 同一条边界：只有还在派发的需求能被暂停，等签字的交付不由界面打断。
+const PAUSABLE = ["executing", "rework"];
 const DECISIONS = {
   delivery_confirmation: {title: "产出确认", field: "decision", reason: true,
                           choices: [["confirmed", "确认交付"], ["changes_requested", "退回"]]},
@@ -397,6 +399,28 @@ function ackButton(form, entry) {
   });
 }
 
+function renderPauseState(block, requirement, pauses) {
+  // 一个 "paused" 说明不了为什么没人干活：把按下暂停的人写下的原因原样摊开，等待的才不用猜。
+  if (requirement.status === "paused") {
+    const latest = pauses.filter(entry => entry.action === "paused").pop();
+    const names = {};
+    for (const member of roster) {
+      names[member.user_id] = member.display_name;
+    }
+    add(block, "p", "paused", `已暂停：${latest ? latest.reason : "没有留下原因"}`);
+    add(block, "dd", "locator", "暂停只停未开始的尝试，已在途的执行不受影响；恢复后界面会重读事实。"
+        + (latest ? ` 由 ${names[latest.actor_user_id] || latest.actor_user_id} 于 `
+                  + when(latest.created_at) + " 按下。" : ""));
+  }
+  if (pauses.length) {
+    add(block, "dt", null, "暂停与恢复记录");
+    for (const entry of pauses) {
+      add(block, "dd", null, `${entry.action === "paused" ? "暂停" : "恢复"} · `
+                          + `${when(entry.created_at)} · ${entry.reason || "无说明"}`);
+    }
+  }
+}
+
 async function renderRequirement(projectId, requirementId) {
   const requirement = await get(`/projects/${projectId}/requirements/${requirementId}`);
   const block = add(fields.detail, "div");
@@ -406,6 +430,9 @@ async function renderRequirement(projectId, requirementId) {
   for (const [key, label] of [["status", "状态"], ["version", "版本"]]) {
     add(facts, "dt", null, label);
     add(facts, "dd", null, String(requirement[key]));
+  }
+  if (["executing", "rework", "paused"].includes(requirement.status)) {
+    renderPauseState(block, requirement, await get(`${path}/pauses`));
   }
   if (["executing", "rework", "awaiting_acceptance"].includes(requirement.status)) {
     const advance = add(block, "button", null, "按工作项事实汇总需求进度");
@@ -426,6 +453,30 @@ async function renderRequirement(projectId, requirementId) {
   }
   if ((MANAGERS.includes(role) || requirement.requester_id === me)
       && !["cancelled", "completed"].includes(requirement.status)) {
+    // 暂停、恢复、取消都只由提出人或项目管理者按下：界面不替别人停掉正在派的活。
+    if (PAUSABLE.includes(requirement.status)) {
+      const form = add(block, "div", "form-row");
+      const why = add(form, "input");
+      why.placeholder = "暂停原因（必填：停下来是在等什么）";
+      why.size = 34;
+      draftButton(form, "暂停需求", null, async () => {
+        if (!why.value.trim()) {
+          say("暂停需求必须写下原因：等待的人要分清这是有意停手，不是没人干活。", "error");
+          return;
+        }
+        await post(`${path}/actions`, {action: "pause", reason: why.value,
+                                       expected_version: requirement.version});
+        await report("需求已暂停；未开始的工作项不再派发，已在途的执行不受影响。");
+      });
+    }
+    if (requirement.status === "paused") {
+      const form = add(block, "div", "form-row");
+      draftButton(form, "恢复需求", null, async () => {
+        const back = await post(`${path}/actions`, {action: "resume",
+                                                    expected_version: requirement.version});
+        await report(`需求已恢复为 ${back.status}；未开始的工作项重新可派发。`);
+      });
+    }
     const form = add(block, "div", "form-row");
     const reason = add(form, "input");
     reason.placeholder = "取消理由（可留空）";
@@ -466,7 +517,7 @@ async function renderRequirement(projectId, requirementId) {
     add(block, "pre", "original", revision.content);
   }
   // 没有已发布计划时不请求交付视图：那份汇总本来就不存在，服务端只会回一个 409。
-  if (await renderWorkItems(block, projectId, requirementId)) {
+  if (await renderWorkItems(block, projectId, requirementId, requirement.status === "paused")) {
     try {
       const delivery = await get(`${path}/delivery`);
       add(block, "dt", null, "交付证据");
@@ -489,7 +540,7 @@ async function renderRequirement(projectId, requirementId) {
   }
 }
 
-async function renderWorkItems(block, projectId, requirementId) {
+async function renderWorkItems(block, projectId, requirementId, paused) {
   const plans = await get(`/projects/${projectId}/requirements/${requirementId}/plans`);
   const published = plans.filter(plan => plan.status === "published");
   add(block, "dt", null, "工作项");
@@ -542,6 +593,11 @@ async function renderWorkItems(block, projectId, requirementId) {
       const button = add(form, "button", null, "派发一次尝试");
       button.type = "button";
       button.addEventListener("click", async () => {
+        if (paused) {
+          // 服务端也会拒这一枪，但它只回通用的 Conflict：谁按下的暂停写在横幅里，这里把那句话递到手边。
+          say("需求已暂停：先点「恢复需求」才能派发新的尝试。", "error");
+          return;
+        }
         button.disabled = true;
         try {
           await post(`/projects/${projectId}/work-items/${item.work_item_id}/dispatch`, {});
@@ -630,7 +686,9 @@ async function loadRequirements() {
   for (const requirement of list) {
     const option = document.createElement("option");
     option.value = requirement.requirement_id;
-    option.textContent = `${requirement.title}（${requirement.status}）`;
+    option.textContent = requirement.status === "paused"
+      ? `${requirement.title}（paused · 已暂停，不再派发）`
+      : `${requirement.title}（${requirement.status}）`;
     fields.requirement.appendChild(option);
   }
   if ([...fields.requirement.options].some(option => option.value === kept)) {

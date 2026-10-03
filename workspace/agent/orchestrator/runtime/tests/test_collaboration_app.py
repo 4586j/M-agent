@@ -2286,3 +2286,38 @@ def test_the_panel_renders_every_kind_of_to_do_the_inbox_can_advertise():
     block = source.split("const DECISIONS = {", 1)[1].split("\n};", 1)[0]
     assert set(re.findall(r"^  (\w+): \{", block, re.MULTILINE)) == set(ACTIONS) | set(DRAFT_ACTIONS)
 
+
+def test_the_panel_offers_every_action_the_requirement_endpoint_accepts():
+    # 后端多一个需求动作而面板没有按钮，等待的人就只剩命令行能停手或恢复——这条守住那道接缝。
+    from typing import get_args
+
+    from collaboration.app import RequirementAction
+
+    source = (RUNTIME / "collaboration" / "web" / "app.js").read_text(encoding="utf-8")
+    offered = set(re.findall(r'/actions`,\s*\{action: "(\w+)"', source))
+    assert offered == set(get_args(RequirementAction.model_fields["action"].annotation))
+
+
+def test_the_pause_reason_the_panel_banner_shows_is_readable_by_every_member(api):
+    # 横幅取「最后一条 paused」，而且渲染在权限门之外：每个等待的人都要看到同一句原因。
+    project, requirement_id, plan, attempt, token = machine_attempt(api)
+    pid = project["project_id"]
+    api.member(project, "outsider")
+    actions = f"/projects/{pid}/requirements/{requirement_id}/actions"
+    pauses = f"/projects/{pid}/requirements/{requirement_id}/pauses"
+    first = checked(api.send("member", "GET", f"/projects/{pid}/requirements/{requirement_id}"))
+
+    stopped = checked(api.send("member", "POST", actions, json={
+        "action": "pause", "reason": "等外部接口答复", "expected_version": first["version"]}))
+    back = checked(api.send("manager", "POST", actions, json={
+        "action": "resume", "expected_version": stopped["version"]}))
+    again = checked(api.send("member", "POST", actions, json={
+        "action": "pause", "reason": "先别派，我要改一条验收项", "expected_version": back["version"]}))
+    assert (again["status"], again["version"]) == ("paused", first["version"] + 3)
+
+    history = checked(api.send("outsider", "GET", pauses))
+    assert [entry["action"] for entry in history] == ["paused", "resumed", "paused"]
+    # 面板用 filter(paused).pop() 取当前这一次的原因：排序一反就把它停手前的旧理由当成现在的。
+    assert (history[-1]["reason"], history[-1]["actor_user_id"]) == (
+        "先别派，我要改一条验收项", api.identities["member"]["user"]["user_id"])
+
