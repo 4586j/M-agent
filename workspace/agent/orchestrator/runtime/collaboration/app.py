@@ -422,7 +422,10 @@ def create_app(config: AppConfig) -> FastAPI:
         app.state.planning = PlanService(database, budgets=app.state.budgets)
         app.state.queue = QueueService(database,
                                        heartbeat_timeout=app.state.instances.heartbeat_timeout)
-        waker = httpx.Client(timeout=httpx.Timeout(10.0, connect=3.0))
+        # Wake-ups go to the exact worker URL that was registered with this service, direct, the
+        # same way the worker's own client reaches us: an ambient proxy from the machine's
+        # environment would send those POSTs somewhere else and silently cost us the push.
+        waker = httpx.Client(timeout=httpx.Timeout(10.0, connect=3.0), trust_env=False)
         app.state.dispatch = DispatchService(
             database, instances=app.state.instances, lease_ttl=config.lease_ttl,
             push=lambda url, payload: _wake(waker, url, payload))

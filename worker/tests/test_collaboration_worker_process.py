@@ -101,11 +101,28 @@ class Process:
             if not self.alive:
                 pytest.fail(f"{note} exited with code {self.popen.poll()}:\n{self.output}")
             try:
-                if httpx.get(url, timeout=0.5).status_code == 200:
+                if local_get(url, timeout=0.5).status_code == 200:
                     return
             except httpx.HTTPError:
                 time.sleep(0.1)
         pytest.fail(f"{note} did not answer on {url} within {timeout}s:\n{self.output}")
+
+
+def local_get(url: str, **kwargs):
+    """One request to a process this test started itself: direct, never via an ambient proxy.
+
+    httpx reads the machine's proxy settings by default, so a developer with a local proxy tool
+    running would have every loopback call here sent to that proxy instead, and the service would
+    answer 404 to a percent-encoded copy of our own URL. The production worker client already
+    refuses the environment for exactly this reason.
+    """
+    kwargs.setdefault("trust_env", False)
+    return httpx.get(url, **kwargs)
+
+
+def local_client(**kwargs) -> httpx.Client:
+    kwargs.setdefault("trust_env", False)
+    return httpx.Client(**kwargs)
 
 
 def _free_port() -> int:
@@ -195,25 +212,27 @@ def rig(tmp_path_factory):
                        "--host", "127.0.0.1", "--port", str(port), "--origin", origin],
                       cwd=RUNTIME_DIR)
     context.processes.append(service)
-    _expect_answer(origin + PREFIX + "/projects", 401, service, "the collaboration service")
-    context.port = port
-    context.origin = origin
-    context.base = origin + PREFIX
-    context.http = httpx.Client(base_url=origin + PREFIX, timeout=20.0,
-                               headers={"Origin": origin})
-    # 负责人的会话经真实 socket 登录取得：调度节拍必须由服务进程自己执行，推送才来自主线代码。
-    login = context.http.post("/auth/login", json={"username": "owner", "password": PASSWORD})
-    assert login.status_code == 200, login.text
-    context.manager = {"Cookie": f"{COOKIE}={login.cookies.get(COOKIE)}",
-                       "X-CSRF-Token": login.json()["csrf_token"]}
-    context.dispatch = DispatchService(database, instances=context.instances,
-                                       requires_real_data=False)
     try:
+        _expect_answer(origin + PREFIX + "/projects", 401, service, "the collaboration service")
+        context.port = port
+        context.origin = origin
+        context.base = origin + PREFIX
+        context.http = local_client(base_url=origin + PREFIX, timeout=20.0,
+                                    headers={"Origin": origin})
+        # 负责人的会话经真实 socket 登录取得：调度节拍必须由服务进程自己执行，推送才来自主线代码。
+        login = context.http.post("/auth/login", json={"username": "owner", "password": PASSWORD})
+        assert login.status_code == 200, login.text
+        context.manager = {"Cookie": f"{COOKIE}={login.cookies.get(COOKIE)}",
+                           "X-CSRF-Token": login.json()["csrf_token"]}
+        context.dispatch = DispatchService(database, instances=context.instances,
+                                           requires_real_data=False)
         yield context
     finally:
+        # 起进程之后的任何一步失败都要把已起的进程收掉，否则一次失败的夹具会留下孤儿。
         for process in context.processes:
             process.stopped()
-        context.http.close()
+        if getattr(context, "http", None) is not None:
+            context.http.close()
 
 
 def tick(rig) -> httpx.Response:
@@ -229,7 +248,7 @@ def _expect_answer(url: str, status: int, process: Process, note: str) -> None:
         if not process.alive:
             pytest.fail(f"{note} exited with code {process.popen.poll()}:\n{process.output}")
         try:
-            if httpx.get(url, timeout=0.5).status_code == status:
+            if local_get(url, timeout=0.5).status_code == status:
                 return
         except httpx.HTTPError:
             time.sleep(0.1)
@@ -248,10 +267,9 @@ class Bundle:
         self.instance_token = instance_token
         self.port = port
         self.url = f"http://127.0.0.1:{port}/wake"
-        self.client = httpx.Client(timeout=20.0)
+        self.client = local_client(timeout=20.0)
         # 浏览器之外的写请求也必须带 Origin，这正是生产客户端每次都带的那一个。
-        self.raw = httpx.Client(base_url=rig.base, timeout=20.0,
-                                headers={"Origin": rig.origin})
+        self.raw = local_client(base_url=rig.base, timeout=20.0, headers={"Origin": rig.origin})
         self.process = Process(["collaboration_app.py", "serve", "--base-url", rig.base,
                                 "--state-dir", str(state_dir), "--host", "127.0.0.1",
                                 "--port", str(port), "--runner", "fake", "--capacity", "1",
@@ -385,7 +403,7 @@ def test_the_service_and_the_worker_complete_one_attempt_over_real_http(rig, mac
 
     # 产物归服务所有：Worker 进程关闭后仍能经真实 socket 下载。
     assert bundle.stop() is True
-    reader = httpx.Client(base_url=rig.base, timeout=20.0,
+    reader = local_client(base_url=rig.base, timeout=20.0,
                           headers={"X-Instance-Token": bundle.instance_token})
     listed = reader.get(f"/machine/attempts/{attempt.attempt_id}/artifacts")
     assert listed.status_code == 200
@@ -574,7 +592,7 @@ def test_another_projects_instance_cannot_reach_these_inputs(rig, machine):
                                                "allowed_tools": ["Read"], "env_allowlist": []}},
                               headers={"X-Node-Token": node_token})
     assert claimed.status_code == 201, claimed.text
-    foreign = httpx.Client(base_url=rig.base, timeout=20.0,
+    foreign = local_client(base_url=rig.base, timeout=20.0,
                            headers={"X-Instance-Token": claimed.json()["instance_token"]})
     for path in (f"/machine/attempts/{attempt.attempt_id}/package",
                  f"/machine/attempts/{attempt.attempt_id}/requirement",
@@ -583,9 +601,9 @@ def test_another_projects_instance_cannot_reach_these_inputs(rig, machine):
         assert foreign.get(path).status_code == 404, path
     assert foreign.get("/machine/instances/me/attempts").json() == []
 
-    anonymous = httpx.get(rig.base + f"/machine/attempts/{attempt.attempt_id}/package")
+    anonymous = local_get(rig.base + f"/machine/attempts/{attempt.attempt_id}/package")
     assert anonymous.status_code == 401
-    damaged = httpx.get(rig.base + f"/machine/attempts/{attempt.attempt_id}/package",
+    damaged = local_get(rig.base + f"/machine/attempts/{attempt.attempt_id}/package",
                         headers={"X-Instance-Token": bundle.instance_token[:-1]})
     assert damaged.status_code == 401
     foreign.close()

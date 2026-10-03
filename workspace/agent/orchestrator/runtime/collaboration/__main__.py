@@ -99,7 +99,7 @@ def main(argv=None) -> int:
         # Same services and the same wake transport the HTTP entry assembles, so the host cannot
         # hand out a lease the serving process would not honour.
         config = AppConfig(args.data_dir)
-        waker = httpx.Client(timeout=httpx.Timeout(10.0, connect=3.0))
+        waker = httpx.Client(timeout=httpx.Timeout(10.0, connect=3.0), trust_env=False)
         try:
             database = Database(config.data_dir / "metadata.sqlite3")
             database.initialize()
