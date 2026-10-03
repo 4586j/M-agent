@@ -2399,3 +2399,38 @@ def test_an_expired_lease_and_an_unconfirmed_withdrawal_become_to_dos(team):
             reason="看过执行机日志，进程已退出", expected_version=entry["expected_version"])
     assert settled.status == "cancelled" and todos(team, team.worker) == []
 
+
+def test_a_run_that_left_traces_behind_can_be_queued_again(team):
+    requirement, plan, _instance, token = reserved_plan(team, plan_item(team, "A", estimate=5))
+    project_id, requirement_id = requirement.project_id, requirement.requirement_id
+    item = work_item(team, plan, "A")
+    dispatch = team.make_dispatch(requires_real_data=False, lease_ttl=120.0)
+    first = dispatch.dispatch(project_id, item.work_item_id)
+    team.make_execution(lease_ttl=120.0).start(token, first.attempt_id, **claims(first))
+    team.clock.advance(121.0)
+    entry = listed(team, team.worker)[0]
+    with session(team, team.worker) as access:
+        team.reviews.cancel(access, project_id=project_id, work_item_id=entry["work_item_id"],
+                            reason="先停下来", expected_version=entry["expected_version"])
+    entry = listed(team, team.worker)[0]
+    with session(team, team.worker) as access:
+        settled = team.reviews.reconcile_attempt(
+            access, project_id=project_id, attempt_id=entry["attempt_id"], outcome="failed",
+            reason="执行机改过两个文件，已经落盘", expected_version=entry["expected_version"])
+    assert settled.status == "failed"
+    # 对账说「动过外面世界」，这项就不是被放弃而是失败：它回到可重排的那一侧，预留保持挂账。
+    assert team.store.get_work_item(project_id, item.work_item_id).status == "failed"
+    assert booked(team, "attempt", first.attempt_id) == []
+    assert todos(team, team.reviewer) == [(
+        "rework_queue", "rework_work_item",
+        f"/projects/{project_id}/work-items/{item.work_item_id}/rework")]
+    claimed_instance(team)
+    stale = team.store.get_work_item(project_id, item.work_item_id)
+    with session(team, team.reviewer) as access:
+        ready = team.reviews.rework(access, project_id=project_id, work_item_id=item.work_item_id,
+                                    expected_version=stale.version)
+    assert ready.status == "ready"
+    second = dispatch.dispatch(project_id, item.work_item_id)
+    assert (second.number, second.status) == (2, "assigned")
+    assert booked(team, "requirement", requirement_id) == [("reserve", 5)]
+

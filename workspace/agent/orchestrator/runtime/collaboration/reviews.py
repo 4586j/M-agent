@@ -364,7 +364,8 @@ class ReviewService:
         Revoking execution rights deliberately refuses any further report from the worker, so
         ``reconciliation_required`` can only be settled by the person who looked: ``cancelled``
         gives the reserved share back, ``failed`` keeps it charged as the cost of a run that did
-        touch the outside world.
+        touch the outside world. That verdict also decides whether the withdrawal stands as an
+        abandonment — ``failed`` puts the work item back where a manager can re-queue it.
         """
         choice = _choice(outcome, ("cancelled", "failed"), "outcome")
         explanation = self._reason(reason)
@@ -393,6 +394,13 @@ class ReviewService:
                                  requirement_id=attempt.requirement_id,
                                  attempt_id=attempt.attempt_id,
                                  reserved_units=item.estimated_units, created_at=now)
+        if choice == "failed" and item.status == "cancelled":
+            # The withdrawal wrote ``cancelled`` as the human's abandonment; a run that left
+            # traces behind was not abandoned, so the item returns to the re-queueable set.
+            moved = access.store.advance_work_item(item.work_item_id, status="failed",
+                                                   expected_version=item.version, updated_at=now)
+            record_audit(access.conn, now, access.user.user_id, "work_item.failed",
+                         item.work_item_id, project_id=project_id, target_version=moved.version)
         record_audit(access.conn, now, access.user.user_id, f"attempt.reconciled.{choice}",
                      attempt.attempt_id, project_id=project_id, target_version=updated.version)
         return updated

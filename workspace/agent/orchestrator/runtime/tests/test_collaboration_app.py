@@ -1808,6 +1808,38 @@ def test_cancelling_a_requirement_and_reconciling_its_attempt_over_http(api):
             for entry in accounts] == [("requirement", 0, 10)]
 
 
+def test_a_failed_reconciliation_puts_the_work_item_back_in_the_queue(api):
+    project, requirement_id, plan, attempt, _token = machine_attempt(api)
+    pid, wid = project["project_id"], plan["work_items"][0]["work_item_id"]
+    path = plans_path(project, requirement_id) + f"/{plan['plan']['plan_id']}"
+
+    def current_item():
+        detail = checked(api.send("manager", "GET", path))
+        return next(entry for entry in detail["work_items"] if entry["work_item_id"] == wid)
+
+    cancelled = checked(api.send("manager", "POST", f"/projects/{pid}/work-items/{wid}/cancel",
+                                 json={"expected_version": current_item()["version"],
+                                       "reason": "先停下来"}))
+    assert cancelled["status"] == "cancelled"
+    live = checked(api.send("manager", "GET", delivery_path(pid, attempt.attempt_id)))["attempt"]
+    settled = checked(api.send("manager", "POST",
+                               f"/projects/{pid}/attempts/{attempt.attempt_id}/reconcile",
+                               json={"outcome": "failed", "expected_version": live["version"],
+                                     "reason": "执行机改过两个文件，已经落盘"}))
+    assert settled["status"] == "failed"
+
+    # 对账说「动过外面世界」，这项就不是被放弃而是失败，于是它重新出现在可重排的那一侧。
+    assert current_item()["status"] == "failed"
+    requeued = checked(api.send("manager", "POST", f"/projects/{pid}/work-items/{wid}/rework",
+                                json={"expected_version": current_item()["version"]}))
+    assert requeued["status"] == "ready"
+    second = checked(api.send("manager", "POST", dispatch_path(pid, wid)))
+    assert (second["number"], second["status"]) == (2, "assigned")
+    # 重做已经排上，就不该再欠谁一次裁定。
+    assert [entry["item_type"] for entry in checked(api.send("manager", "GET", "/inbox"))
+            if not entry["item_type"].startswith("requirement_")] == []
+
+
 def test_the_requester_signs_for_the_requirement_delivery_over_http(api):
     project, requirement_id, plan, attempt, token = machine_attempt(api)
     pid = project["project_id"]
