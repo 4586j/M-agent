@@ -1048,8 +1048,9 @@ class CollaborationStore:
         """Every decision this member owes, across only the projects they are active in.
 
         The role rules repeated here are the ones the decision services enforce, so a to-do
-        never advertises an action the caller would be refused. ``expected_version`` travels
-        with the row so the decision is made against the state that was actually listed.
+        never advertises an action the caller would be refused. ``expected_version`` is the version
+        of the resource the listed action writes to, so the decision is made against the state that
+        was actually listed.
         """
         with self._read() as conn:
             rows = conn.execute(
@@ -1072,7 +1073,7 @@ class CollaborationStore:
                   AND (a.project_id IN (SELECT project_id FROM managed) OR a.assignee_user_id=?)
                 UNION ALL
                 SELECT 'worker_attention', a.project_id, a.requirement_id, a.work_item_id,
-                       a.attempt_id, a.binding_id, a.version, w.title, a.updated_at
+                       a.attempt_id, a.binding_id, w.version, w.title, a.updated_at
                 FROM attempts a JOIN work_items w ON w.work_item_id=a.work_item_id
                 WHERE a.status IN ('assigned','acked','running') AND a.lease_expires_at<=?
                   AND (a.project_id IN (SELECT project_id FROM managed) OR a.assignee_user_id=?)

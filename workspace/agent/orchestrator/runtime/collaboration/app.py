@@ -553,7 +553,11 @@ def create_app(config: AppConfig) -> FastAPI:
     @router.get("/projects/{pid}")
     def get_project(pid: str, request: Request):
         with _access(request, project_id=pid) as access:
-            return asdict(access.store.get_project(pid))
+            # The caller's own role, so a client can offer exactly the actions this project
+            # allows them instead of keeping a second copy of the permission rules.
+            member = access.store.get_member(pid, access.user.user_id)
+            return {**asdict(access.store.get_project(pid)),
+                    "access_role": member.access_role}
 
     @router.patch("/projects/{pid}")
     def update_project(pid: str, body: ProjectUpdate, request: Request):

@@ -246,8 +246,10 @@ def test_projects_members_agents_bindings_and_audit_round_trip(api):
     pid = project["project_id"]
     assert project["owner_id"] == api.identities["owner"]["user"]["user_id"]
     assert checked(api.send("owner", "GET", "/projects")) == [project]
-    assert checked(api.send("owner", "GET", f"/projects/{pid}")) == project
+    assert checked(api.send("owner", "GET", f"/projects/{pid}")) == {**project,
+                                                                     "access_role": "owner"}
     member = api.member(project)
+    assert checked(api.send("member", "GET", f"/projects/{pid}"))["access_role"] == "member"
     agent = api.agent()
     assert checked(api.send("member", "GET", "/agents")) == [agent]
     assert checked(api.send("owner", "GET", "/agents")) == []
@@ -511,7 +513,8 @@ def test_expected_version_is_strict_positive_integer(api, value):
     project = api.project()
     checked(api.send("owner", "PATCH", f"/projects/{project['project_id']}", json={
         "name": "Changed", "status": "active", "expected_version": value}), 422)
-    assert checked(api.send("owner", "GET", f"/projects/{project['project_id']}")) == project
+    assert checked(api.send("owner", "GET", f"/projects/{project['project_id']}")) == {
+        **project, "access_role": "owner"}
 
 
 @pytest.mark.parametrize("method,path,payload", [

@@ -2296,9 +2296,13 @@ def test_a_requirement_return_needs_a_carrier_while_items_can_still_come_back(te
 # --- inbox ------------------------------------------------------------------------
 
 def todos(team, actor):
+    return [(entry["item_type"], entry["action"], entry["href"])
+            for entry in listed(team, actor)]
+
+
+def listed(team, actor):
     with session(team, actor) as access:
-        return [(entry["item_type"], entry["action"], entry["href"])
-                for entry in InboxService(clock=team.clock).pending(access)]
+        return InboxService(clock=team.clock).pending(access)
 
 
 def test_the_inbox_offers_each_person_only_the_decisions_they_owe(team):
@@ -2370,17 +2374,28 @@ def test_an_expired_lease_and_an_unconfirmed_withdrawal_become_to_dos(team):
     execution.start(token, attempt.attempt_id, **claims(attempt))
     assert todos(team, team.worker) == [] and todos(team, team.reviewer) == []
     team.clock.advance(121.0)
-    assert todos(team, team.worker) == [(
-        "worker_attention", "inspect_worker",
-        f"/projects/{project_id}/agent-bindings/{attempt.binding_id}/instances")]
-    with session(team, team.reviewer) as access:
-        team.reviews.cancel(access, project_id=project_id, work_item_id=item.work_item_id,
-                            reason="先停下来", expected_version=team.store.get_work_item(
-                                project_id, item.work_item_id).version)
+    stale = [("worker_attention", "cancel_work_item",
+              f"/projects/{project_id}/work-items/{item.work_item_id}/cancel")]
+    assert todos(team, team.worker) == stale == todos(team, team.reviewer)
+    entry = listed(team, team.worker)[0]
+    assert entry["links"] == {
+        "instances": f"/projects/{project_id}/agent-bindings/{attempt.binding_id}/instances"}
+    # 失联要写的资源是工作项，所以随待办给出的版本就是工作项的版本：照着它撤销不需要先查一遍。
+    assert entry["expected_version"] == team.store.get_work_item(
+        project_id, item.work_item_id).version
+    with session(team, team.worker) as access:
+        team.reviews.cancel(access, project_id=project_id, work_item_id=entry["work_item_id"],
+                            reason="先停下来", expected_version=entry["expected_version"])
     pending = todos(team, team.reviewer)
     # 租约过期的提醒在对账之后不再重复：撤销未确认的执行本身就是要看的那一条。
     assert pending == [(
         "attempt_reconciliation", "reconcile_attempt",
         f"/projects/{project_id}/attempts/{attempt.attempt_id}/reconcile")]
     assert todos(team, team.worker) == pending
+    entry = listed(team, team.worker)[0]
+    with session(team, team.worker) as access:
+        settled = team.reviews.reconcile_attempt(
+            access, project_id=project_id, attempt_id=entry["attempt_id"], outcome="cancelled",
+            reason="看过执行机日志，进程已退出", expected_version=entry["expected_version"])
+    assert settled.status == "cancelled" and todos(team, team.worker) == []
 

@@ -18,6 +18,7 @@ button:disabled { opacity: .55; cursor: progress; }
 .kind { font-weight: 600; }
 .locator { color: #5b6675; font-size: 13px; }
 .form-row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; margin-top: 6px; }
+.evidence { border-left: 3px solid #d8dee7; padding-left: 10px; margin-top: 8px; }
 .original { background: #f6f8fa; border: 1px solid #d8dee7; border-radius: 6px;
   padding: 10px 12px; white-space: pre-wrap; word-break: break-word; }
 dl { margin: 6px 0; }
