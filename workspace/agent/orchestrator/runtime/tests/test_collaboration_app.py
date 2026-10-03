@@ -1914,3 +1914,25 @@ def test_inbox_to_dos_lead_to_working_endpoints(api):
                                                     "expected_version": waiting["version"]}))
     assert owed("member") == [] and owed("manager") == []
 
+
+def test_the_panel_is_static_and_gives_nobody_a_data_free_path(api):
+    def asset(path):
+        return api.client.request("GET", path, headers={"Origin": ORIGIN})
+
+    page = asset("/ui/")
+    assert page.status_code == 200 and page.headers["cache-control"] == "no-store"
+    assert 'id="todos"' in page.text and 'id="login-form"' in page.text
+    assert page.headers["content-type"].startswith("text/html")
+    assert asset("/ui/app.js").status_code == 200
+    assert asset("/ui/styles.css").status_code == 200
+    # The page is public, the data is not: without a session every read stays 401.
+    checked(api.send(None, "GET", "/inbox"), 401)
+    checked(api.send(None, "GET", "/projects"), 401)
+    for escape in ("/ui/../collab/v1/projects", "/ui/%2e%2e/collab/v1/projects",
+                   "/ui/../requirements", "/ui/../../../../etc/passwd"):
+        response = asset(escape)
+        # 点段在客户端就按 RFC 3986 归一化：落到 API 也要会话（401），否则 404；拿不到 200。
+        assert response.status_code in (400, 401, 404), (escape, response.status_code)
+    typed = asset("/ui")
+    assert typed.status_code == 200 and typed.url.path == "/ui/" and 'id="todos"' in typed.text
+

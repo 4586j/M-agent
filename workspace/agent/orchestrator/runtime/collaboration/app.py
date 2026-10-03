@@ -16,7 +16,8 @@ from fastapi.exceptions import RequestValidationError
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, SecretStr
 from starlette.exceptions import HTTPException
-from starlette.responses import JSONResponse
+from starlette.responses import JSONResponse, RedirectResponse
+from starlette.staticfiles import StaticFiles
 
 from .auth import AuthService, Unauthorized, Forbidden, RateLimited
 from .budgets import BudgetService
@@ -1062,5 +1063,13 @@ def create_app(config: AppConfig) -> FastAPI:
         with _access(request, project_id=pid, roles=MANAGERS) as access:
             return _audit_rows(access.conn, pid, limit)
 
+    @app.get("/ui", include_in_schema=False)
+    def panel_root_redirect():
+        return RedirectResponse("/ui/", status_code=307)
+
     app.include_router(router)
+    # The panel is static files: it holds no data and no session, so every read still goes
+    # through the same cookie-authenticated JSON API the page calls from the browser.
+    app.mount("/ui", StaticFiles(directory=Path(__file__).resolve().parent / "web",
+                                 html=True), name="ui")
     return app

@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>团队协作面板</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header>
+  <h1>团队协作面板</h1>
+  <div class="session">
+    <span id="who"></span>
+    <button id="logout" type="button" hidden>退出</button>
+  </div>
+</header>
+<main>
+  <section id="login" aria-labelledby="login-title">
+    <h2 id="login-title">登录</h2>
+    <form id="login-form">
+      <p><label for="username">用户名</label>
+        <input id="username" name="username" autocomplete="username" required></p>
+      <p><label for="password">密码</label>
+        <input id="password" name="password" type="password"
+               autocomplete="current-password" required></p>
+      <p><button type="submit">登录</button></p>
+    </form>
+  </section>
+
+  <section id="workspace" hidden>
+    <nav class="pickers">
+      <p><label for="project">项目</label><select id="project"></select></p>
+      <p><label for="requirement">需求</label><select id="requirement"></select></p>
+      <p><button id="refresh" type="button">刷新</button></p>
+    </nav>
+    <section id="inbox">
+      <h2>我的待办</h2>
+      <ul id="todos"></ul>
+    </section>
+    <section id="requirement-detail">
+      <h2>需求与交付证据</h2>
+      <div id="detail"></div>
+    </section>
+  </section>
+  <p id="status" role="status" aria-live="polite"></p>
+</main>
+<script src="app.js"></script>
+</body>
+</html>

@@ -1048,7 +1048,8 @@ class CollaborationStore:
         """Every decision this member owes, across only the projects they are active in.
 
         The role rules repeated here are the ones the decision services enforce, so a to-do
-        never advertises an action the caller would be refused.
+        never advertises an action the caller would be refused. ``expected_version`` travels
+        with the row so the decision is made against the state that was actually listed.
         """
         with self._read() as conn:
             rows = conn.execute(
@@ -1058,32 +1059,33 @@ class CollaborationStore:
                      managed AS (SELECT project_id FROM mine WHERE access_role IN
                                  ('owner','manager'))
                 SELECT 'delivery_confirmation' AS item_type, a.project_id, a.requirement_id,
-                       a.work_item_id, a.attempt_id, a.binding_id, w.title, a.updated_at
+                       a.work_item_id, a.attempt_id, a.binding_id, a.version AS expected_version,
+                       w.title, a.updated_at
                 FROM attempts a JOIN work_items w ON w.work_item_id=a.work_item_id
                 WHERE a.status='submitted'
                   AND (a.project_id IN (SELECT project_id FROM managed) OR a.assignee_user_id=?)
                 UNION ALL
                 SELECT 'attempt_reconciliation', a.project_id, a.requirement_id, a.work_item_id,
-                       a.attempt_id, a.binding_id, w.title, a.updated_at
+                       a.attempt_id, a.binding_id, a.version, w.title, a.updated_at
                 FROM attempts a JOIN work_items w ON w.work_item_id=a.work_item_id
                 WHERE a.status='reconciliation_required'
                   AND (a.project_id IN (SELECT project_id FROM managed) OR a.assignee_user_id=?)
                 UNION ALL
                 SELECT 'worker_attention', a.project_id, a.requirement_id, a.work_item_id,
-                       a.attempt_id, a.binding_id, w.title, a.updated_at
+                       a.attempt_id, a.binding_id, a.version, w.title, a.updated_at
                 FROM attempts a JOIN work_items w ON w.work_item_id=a.work_item_id
                 WHERE a.status IN ('assigned','acked','running') AND a.lease_expires_at<=?
                   AND (a.project_id IN (SELECT project_id FROM managed) OR a.assignee_user_id=?)
                 UNION ALL
                 SELECT CASE x.status WHEN 'submitted' THEN 'business_acceptance'
                        ELSE 'rework_queue' END, x.project_id, p.requirement_id, x.work_item_id,
-                       NULL, x.binding_id, x.title, x.updated_at
+                       NULL, x.binding_id, x.version, x.title, x.updated_at
                 FROM work_items x JOIN plans p ON p.plan_id=x.plan_id
                 WHERE x.status IN ('submitted','changes_requested','failed')
                   AND x.project_id IN (SELECT project_id FROM managed)
                 UNION ALL
                 SELECT 'final_acceptance', r.project_id, r.requirement_id, NULL, NULL, NULL,
-                       r.title, r.updated_at
+                       r.version, r.title, r.updated_at
                 FROM requirements r WHERE r.status='awaiting_acceptance' AND r.requester_id=?
                 """,
                 (user_id, user_id, user_id, now, user_id, user_id)).fetchall()
