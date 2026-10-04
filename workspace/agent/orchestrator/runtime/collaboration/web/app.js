@@ -24,6 +24,10 @@ const DECISIONS = {
                      hint: "写下你看到的实情（可留空）",
                      look: "instances", lookLabel: "查看执行机", submitLabel: "撤销执行权",
                      shown: renderInstance},
+  machine_absent: {title: "执行机整台没消息", field: null, reason: false, choices: [],
+                   hint: "禁用只表示不再等这一台：它不再领新的活，重新登记一台才能继续跑",
+                   look: "instances", lookLabel: "查看执行机", submitLabel: "禁用这台执行机",
+                   shown: renderInstance},
   requirement_review: {title: "需求评审（人工确认这一版原文）", field: "action", reason: true,
                        hint: "驳回时写下要改哪里",
                        choices: [["approve", "批准这一版"], ["reject", "驳回"]],
@@ -225,6 +229,10 @@ function renderTodo(entry) {
   }
   add(row, "div", "locator", `${projectNames[entry.project_id] ?? entry.project_id} · `
                              + `${entry.title} · ${entry.item_type} · 版本 ${entry.expected_version}`);
+  if (spec.hint && !spec.reason) {
+    // 没有理由输入框时 hint 无处可显：把这条待办的边界摊成一行字，免得"禁用"被读成"这轮作废"。
+    add(row, "div", "locator", spec.hint);
+  }
   const facts = add(row, "dl", "evidence");
   facts.hidden = true;
   const form = add(row, "div", "form-row");

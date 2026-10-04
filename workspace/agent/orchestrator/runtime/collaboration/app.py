@@ -522,7 +522,7 @@ def create_app(config: AppConfig) -> FastAPI:
                                                lease_ttl=config.lease_ttl,
                                                budgets=app.state.budgets)
         app.state.reviews = ReviewService(budgets=app.state.budgets)
-        app.state.inbox = InboxService()
+        app.state.inbox = InboxService(heartbeat_timeout=app.state.instances.heartbeat_timeout)
         app.state.scheduler = Scheduler(database, planning=app.state.planning,
                                         queue=app.state.queue, dispatch=app.state.dispatch,
                                         auto_dispatch=config.auto_dispatch)

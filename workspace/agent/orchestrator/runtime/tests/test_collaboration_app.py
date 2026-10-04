@@ -1901,6 +1901,54 @@ def test_a_tick_over_http_reclaims_an_expired_lease_and_reports_it_as_news(api):
                 if entry["work_item_id"] == wid)["status"] == "waiting_agent"
 
 
+def test_a_silent_machine_becomes_a_to_do_a_manager_can_close(api):
+    project, _requirement_id, _plan, attempt, _token = machine_attempt(api)
+    pid = project["project_id"]
+    instances = f"/projects/{pid}/agent-bindings/{attempt.binding_id}/instances"
+    disable = f"{instances}/{attempt.instance_id}/disable"
+    # 只把最后一次心跳推到窗口之外：租约还是新的，所以这一格说的确实是整台机器没了消息。
+    with api.database.transaction() as conn:
+        conn.execute("UPDATE execution_instances SET heartbeat_at=? WHERE instance_id=?",
+                     (time.time() - 121, attempt.instance_id))
+
+    def owed(actor):
+        return [entry for entry in checked(api.send(actor, "GET", "/inbox"))
+                if entry["item_type"] == "machine_absent"]
+
+    assert owed("outsider") == []
+    # 负责这个工作项的成员不欠这一格：禁用执行机在路由里是 roles=MANAGERS。
+    assert owed("member") == []
+    manager = owed("manager")
+    assert len(manager) == 1 and owed("owner") == manager
+    entry = manager[0]
+    live = checked(api.send("manager", "GET", f"{instances}"))
+    assert [(item["instance_id"], item["version"]) for item in live] == [
+        (attempt.instance_id, entry["expected_version"])]
+    assert (entry["action"], entry["href"], entry["links"]) == (
+        "disable_instance", disable, {"instances": instances})
+    assert entry["title"] == "My Agent · Project-specific duty"
+
+    checked(api.send("member", "POST", disable, json={"expected_version": entry["expected_version"]}),
+           403)
+    checked(api.send("outsider", "POST", disable, json={"expected_version": entry["expected_version"]}),
+            404)
+    checked(api.send("manager", "POST", disable,
+                     json={"expected_version": entry["expected_version"] + 3}), 409)
+    checked(api.send("manager", "POST", disable,
+                     json={"expected_version": entry["expected_version"]},
+                     headers={"X-CSRF-Token": None}), 403)
+    disabled = checked(api.send("manager", "POST", disable,
+                                json={"expected_version": entry["expected_version"]}))
+    assert disabled["status"] == "disabled"
+    assert owed("manager") == []
+    # 照着待办给的那一步写，就写进了同一份项目审计：这条待办指的不是界面自己造的记号。
+    audit = [row for row in checked(api.send("manager", "GET", f"/projects/{pid}/audit?limit=200"))
+             if row["action"] == "instance.disabled"]
+    assert [(row["target_id"], row["target_version"], row["actor_id"]) for row in audit] == [
+        (attempt.instance_id, disabled["version"],
+         api.identities["manager"]["user"]["user_id"])]
+
+
 def test_the_requester_signs_for_the_requirement_delivery_over_http(api):
     project, requirement_id, plan, attempt, token = machine_attempt(api)
     pid = project["project_id"]

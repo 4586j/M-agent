@@ -2957,6 +2957,8 @@ def test_an_expired_lease_and_an_unconfirmed_withdrawal_become_to_dos(team):
     execution.start(token, attempt.attempt_id, **claims(attempt))
     assert todos(team, team.worker) == [] and todos(team, team.reviewer) == []
     team.clock.advance(121.0)
+    # 机器照常报活，只是这一轮的租约过了：租约与心跳是两格，别把它们演成一件事。
+    team.instances.heartbeat(token)
     stale = [("worker_attention", "cancel_work_item",
               f"/projects/{project_id}/work-items/{item.work_item_id}/cancel")]
     assert todos(team, team.worker) == stale == todos(team, team.reviewer)
@@ -2991,6 +2993,7 @@ def test_a_run_that_left_traces_behind_can_be_queued_again(team):
     first = dispatch.dispatch(project_id, item.work_item_id)
     team.make_execution(lease_ttl=120.0).start(token, first.attempt_id, **claims(first))
     team.clock.advance(121.0)
+    team.instances.heartbeat(token)
     entry = listed(team, team.worker)[0]
     with session(team, team.worker) as access:
         team.reviews.cancel(access, project_id=project_id, work_item_id=entry["work_item_id"],
@@ -3033,6 +3036,7 @@ def test_a_tick_reclaims_an_expired_lease_and_leaves_the_verdict_to_a_person(tea
     execution.start(token, attempt.attempt_id, **claims(attempt))
     assert todos(team, team.worker) == [] and todos(team, team.reviewer) == []
     team.clock.advance(121.0)
+    team.instances.heartbeat(token)
     assert [entry[0] for entry in todos(team, team.worker)] == ["worker_attention"]
 
     queue = QueueService(team.database, heartbeat_timeout=120, clock=team.clock)
@@ -3151,6 +3155,108 @@ def test_a_paused_requirement_is_the_one_round_a_tick_does_not_take_over(team):
             expected_version=team.store.get_requirement(project_id, requirement_id).version)
     assert resumed.status == "executing"
     assert scheduler.tick(project_id)["attempts_reclaimed"] == 1
+    assert team.store.get_attempt(project_id, attempt.attempt_id).status == (
+        "reconciliation_required")
+
+
+def test_a_binding_whose_only_machine_went_silent_owes_a_decision(team):
+    """执行机整台没了消息、手里也没有在跑的尝试时，这件事要落到能处理它的人手上。
+
+    `worker_attention` 说的是「这一轮还在它手里」；一台安静下来、又没在跑东西的机器此前谁都不欠——
+    队列只会把工作项写成 waiting_agent 然后一直等。
+    """
+    requirement, plan, instance, _token = reserved_plan(team, plan_item(team, "A", estimate=5))
+    project_id = requirement.project_id
+    item = work_item(team, plan, "A")
+    assert todos(team, team.reviewer) == [] and todos(team, team.worker) == []
+    team.clock.advance(121.0)
+
+    entries = listed(team, team.reviewer)
+    absent = [entry for entry in entries if entry["item_type"] == "machine_absent"]
+    assert [(entry["action"], entry["title"], entry["expected_version"]) for entry in absent] == \
+        [("disable_instance", "丁的 Agent · 实现", instance.version)]
+    binding = team.binding.binding_id
+    assert absent[0]["href"] == f"/projects/{project_id}/agent-bindings/{binding}" \
+                                f"/instances/{instance.instance_id}/disable"
+    assert absent[0]["links"] == {"instances": f"/projects/{project_id}/agent-bindings"
+                                               f"/{binding}/instances"}
+    # 这一格只有管理者欠：禁用走的是 roles=MANAGERS 那条路由，待办不能把人引向必然被拒的写。
+    assert "machine_absent" not in [entry[0] for entry in todos(team, team.worker)]
+    # 队列对同一件事的读法一致：这项正在等一台可用的执行机。
+    queue = QueueService(team.database, heartbeat_timeout=120, clock=team.clock)
+    assert queue.advance(project_id)["work_items_changed"] == 1
+    assert team.store.get_work_item(project_id, item.work_item_id).status == "waiting_agent"
+
+    # 已读标记认的是那台机器，不是某条需求：同一台机器的提醒读过一次就安静一轮。
+    with session(team, team.reviewer) as access:
+        stamped = InboxService(clock=team.clock).stamp(access, entries)
+    assert [entry["key"] for entry in stamped if entry["item_type"] == "machine_absent"] == [
+        f"machine_absent:{project_id}:{instance.instance_id}"]
+
+    with session(team, team.reviewer) as access:
+        disabled = team.instances.disable(access, project_id=project_id, binding_id=binding,
+                                         instance_id=instance.instance_id,
+                                         expected_version=instance.version)
+    assert disabled.status == "disabled"
+    assert "machine_absent" not in [entry["item_type"] for entry in listed(team, team.reviewer)]
+    # 禁用语义到此为止：它不替人判定工作项，也不凭空变出一台机器来。
+    assert team.store.get_work_item(project_id, item.work_item_id).status == "waiting_agent"
+    assert queue.advance(project_id)["work_items_changed"] == 0
+
+
+def test_a_live_machine_is_the_answer_to_the_silent_one(team):
+    """同一绑定还有一台在报活，就不该再催禁用：那条待办说的是「这个绑定无机可派」。"""
+    requirement, plan, instance, _token = reserved_plan(team, plan_item(team, "A", estimate=5))
+    project_id = requirement.project_id
+    item = work_item(team, plan, "A")
+    team.clock.advance(121.0)
+    queue = QueueService(team.database, heartbeat_timeout=120, clock=team.clock)
+    assert queue.advance(project_id)["work_items_changed"] == 1
+    assert team.store.get_work_item(project_id, item.work_item_id).status == "waiting_agent"
+    assert [entry["item_type"] for entry in listed(team, team.reviewer)
+            if entry["item_type"] == "machine_absent"] == ["machine_absent"]
+
+    replacement, _fresh_token = claimed_instance(team)
+    assert "machine_absent" not in [entry["item_type"] for entry in listed(team, team.reviewer)]
+    # 队列那侧同一件事的读法也翻过来了：有机可派，这项就回到 ready 等派发。
+    assert queue.advance(project_id)["work_items_changed"] == 1
+    assert team.store.get_work_item(project_id, item.work_item_id).status == "ready"
+    # 那台安静下来的机器还在账上，只是不再是要人决定的事。
+    assert team.store.get_instance(project_id, instance.instance_id).status == "active"
+    assert replacement.status == "active"
+
+
+def test_disabling_a_silent_machine_does_not_settle_the_round_it_left(team):
+    """机器静下来、手里还有一轮在跑：两条待办各说一件事，禁用不能替人对账。"""
+    requirement, plan, instance, token = reserved_plan(team, plan_item(team, "A", estimate=5))
+    project_id = requirement.project_id
+    item = work_item(team, plan, "A")
+    attempt = team.make_dispatch(requires_real_data=False, lease_ttl=120.0).dispatch(
+        project_id, item.work_item_id)
+    team.make_execution(lease_ttl=120.0).start(token, attempt.attempt_id, **claims(attempt))
+    team.clock.advance(121.0)
+
+    manager = [(entry[0], entry[1]) for entry in todos(team, team.reviewer)]
+    assert manager == [("machine_absent", "disable_instance"),
+                       ("worker_attention", "cancel_work_item")]
+    # 成员只欠那一轮：整台机器要不要禁用不是他的写。
+    assert [entry[0] for entry in todos(team, team.worker)] == ["worker_attention"]
+
+    binding = team.binding.binding_id
+    with session(team, team.reviewer) as access:
+        team.instances.disable(access, project_id=project_id, binding_id=binding,
+                               instance_id=instance.instance_id,
+                               expected_version=instance.version)
+    assert [entry[0] for entry in todos(team, team.reviewer)] == ["worker_attention"]
+    still = team.store.get_attempt(project_id, attempt.attempt_id)
+    assert (still.status, still.control_epoch) == ("running", attempt.control_epoch)
+    assert team.store.get_instance(project_id, instance.instance_id).control_epoch == \
+        instance.control_epoch + 1
+    # 那一轮仍归人判：撤销之后转对账，禁用没有替它下结论。
+    with session(team, team.reviewer) as access:
+        team.reviews.cancel(access, project_id=project_id, work_item_id=item.work_item_id,
+                            expected_version=team.store.get_work_item(
+                                project_id, item.work_item_id).version, reason="先停下来")
     assert team.store.get_attempt(project_id, attempt.attempt_id).status == (
         "reconciliation_required")
 

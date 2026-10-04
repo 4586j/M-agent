@@ -14,11 +14,12 @@ from .models import ValidationError
 def _identity(entry: dict) -> str:
     """One name for one decision owed, so seeing it today means it stays seen after a refresh.
 
-    The most specific resource names it: an attempt, else a work item, else the requirement.
-    A drafting to-do also carries the revision it asks to be reviewed, because reviewing a second
-    revision is a second decision even though the requirement is the same one.
+    The most specific resource names it: an attempt, else a work item, else an instance, else the
+    requirement. A drafting to-do also carries the revision it asks to be reviewed, because
+    reviewing a second revision is a second decision even though the requirement is the same one.
     """
     resource = next(value for value in (entry.get("attempt_id"), entry.get("work_item_id"),
+                                        entry.get("instance_id"),
                                         entry.get("requirement_id")) if value)
     parts = [entry["item_type"], entry["project_id"], resource]
     if entry["item_type"].startswith("requirement_"):
@@ -39,6 +40,15 @@ ACTIONS = {
                          "/projects/{project_id}/work-items/{work_item_id}/cancel",
                          {"instances":
                           "/projects/{project_id}/agent-bindings/{binding_id}/instances"}),
+    # Nothing is in flight and no machine is answering for this binding: the one write a manager
+    # owes here is to say whether that machine is still coming back, which is recorded by
+    # disabling it. Bringing another one up stays a node-side action, because only a node token
+    # can claim a slot, and issuing machine credentials through the browser is a wider door.
+    "machine_absent": ("disable_instance",
+                       "/projects/{project_id}/agent-bindings/{binding_id}"
+                       "/instances/{instance_id}/disable",
+                       {"instances":
+                        "/projects/{project_id}/agent-bindings/{binding_id}/instances"}),
     "business_acceptance": ("accept_work_item",
                             "/projects/{project_id}/work-items/{work_item_id}/accept", {}),
     "rework_queue": ("rework_work_item",
@@ -56,7 +66,7 @@ ACTIONS = {
 }
 
 # The drafting to-dos come from a different projection, so they arrive as bare requirement rows
-# without an action to take. They get the same promise as the seven above: this is the write that
+# without an action to take. They get the same promise as the eight above: this is the write that
 # clears me, and this is the version of mine that it has to be made against. Both of them are
 # decided on the reviews endpoint, and both of them link to the text the decision is made about.
 DRAFT_ACTIONS = {
@@ -80,11 +90,16 @@ class InboxService:
     somebody, and an acknowledgement only says that person has seen it.
     """
 
-    def __init__(self, *, clock=time.time):
+    def __init__(self, *, clock=time.time, heartbeat_timeout: float = 120):
         self.clock = clock
+        # The same window the queue uses to decide a binding has no machine to run on, so the
+        # to-do and the ``waiting_agent`` status cannot disagree about who is absent.
+        self.heartbeat_timeout = heartbeat_timeout
 
     def pending(self, access: Access) -> list[dict]:
-        rows = access.store.pending_actions(access.user.user_id, now=self.clock())
+        now = self.clock()
+        rows = access.store.pending_actions(access.user.user_id, now=now,
+                                            fresh_since=now - self.heartbeat_timeout)
         entries = []
         for row in rows:
             action, template, links = ACTIONS[row["item_type"]]
