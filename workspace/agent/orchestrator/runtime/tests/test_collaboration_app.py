@@ -2273,6 +2273,64 @@ def test_the_drafting_todos_advertise_a_review_action_that_works(api):
     assert drafting("manager") == [] and drafting("member") == []
 
 
+def test_the_feed_delivers_news_to_the_people_it_belongs_to(api):
+    # 动态按归属发：提出人、被点名的审核人、被派到活的人；自己按下的按钮不是给自己的新闻。
+    project, requirement_id, plan, attempt, token = machine_attempt(api)
+    pid = project["project_id"]
+    manager = api.identities["manager"]["user"]["user_id"]
+    member = api.identities["member"]["user"]["user_id"]
+
+    def feed(actor):
+        return [(entry["action"], entry["project_id"], entry["actor_id"], entry["label"])
+                for entry in checked(api.send(actor, "GET", "/feed?limit=200"))]
+
+    requester = feed("member")
+    assert [(entry[0], entry[2], entry[3]) for entry in requester] == [
+        ("attempt.assigned", manager, "第 1 次尝试 · A"),
+        ("requirement.executing", manager, "需求本身"),
+        ("plan.published", manager, "拆解计划"),
+        ("requirement.review_approved", manager, "需求本身")]
+    assert {entry[1] for entry in requester} == {pid}
+    # 审核人看到的是他要批的那份文本的完整来历：归属按需求算，不按「点名那一刻之后」切。
+    # 他自己做的那些（批准、发布计划、派发）不再报给他一遍。
+    assert [(entry[0], entry[2], entry[3]) for entry in feed("manager")] == [
+        ("requirement.review_requested", member, "需求本身"),
+        ("requirement.revision_saved", member, "第 1 版原文"),
+        ("requirement.created", member, "需求本身")]
+    assert feed("owner") == [] and feed("outsider") == []
+    # 续租仍不进动态：两份读视图共用同一张排除表，不各写一份。
+    checked(api.send(None, "POST", f"/machine/attempts/{attempt.attempt_id}/lease",
+                     json=machine_claims(attempt), headers={"X-Instance-Token": token}))
+    assert feed("member") == requester
+
+
+def test_a_feed_entry_is_acked_once_and_only_by_its_reader(api):
+    project, requirement_id, plan, attempt, token = machine_attempt(api)
+    mine = checked(api.send("member", "GET", "/feed?limit=200"))
+    owed = [entry["key"] for entry in checked(api.send("member", "GET", "/inbox"))]
+    assert [entry["unread"] for entry in mine] == [True] * len(mine)
+    assert all(entry["key"] == f"activity:{entry['event_id']}" for entry in mine)
+    first = mine[0]
+    checked(api.send("manager", "POST", "/inbox/ack", json={"item_key": first["key"]}), 422)
+    checked(api.send("member", "POST", "/inbox/ack",
+                     json={"item_key": "activity:" + "0" * 32}), 422)
+    checked(api.send("member", "POST", "/inbox/ack", json={"item_key": first["key"]}), 204)
+    after = checked(api.send("member", "GET", "/feed?limit=200"))
+    assert [(entry["action"], entry["unread"]) for entry in after] == [
+        (entry["action"], entry["key"] != first["key"]) for entry in mine]
+    # 已读不是裁定：标过一条动态，不该顺手清掉任何一件还欠着的决定。
+    assert [entry["key"] for entry in checked(api.send("member", "GET", "/inbox"))] == owed
+
+
+def test_the_feed_spans_the_projects_a_person_belongs_to(api):
+    first, _, _, first_requirement = approval_setup(api)
+    second, _, _, second_requirement = approval_setup(api)
+    rows = checked(api.send("member", "GET", "/feed?limit=200"))
+    assert [(entry["action"], entry["project_id"], entry["requirement_id"]) for entry in rows] == [
+        ("requirement.review_approved", second["project_id"], second_requirement),
+        ("requirement.review_approved", first["project_id"], first_requirement)]
+
+
 def test_the_panel_is_static_and_gives_nobody_a_data_free_path(api):
     def asset(path):
         return api.client.request("GET", path, headers={"Origin": ORIGIN})
@@ -2281,6 +2339,8 @@ def test_the_panel_is_static_and_gives_nobody_a_data_free_path(api):
     assert page.status_code == 200 and page.headers["cache-control"] == "no-store"
     assert 'id="todos"' in page.text and 'id="login-form"' in page.text
     assert 'id="todoCount"' in page.text and 'id="createBox"' in page.text
+    # 动态栏缺一个元素，刷新就会在 renderFeed 里抛错：整块面板跟着空白，所以这里钉住。
+    assert 'id="feedList"' in page.text and 'id="feedCount"' in page.text
     assert page.headers["content-type"].startswith("text/html")
     assert asset("/ui/app.js").status_code == 200
     assert asset("/ui/styles.css").status_code == 200
@@ -2375,8 +2435,8 @@ def test_the_pause_reason_the_panel_banner_shows_is_readable_by_every_member(api
         "先别派，我要改一条验收项", api.identities["member"]["user"]["user_id"])
 
 
-def test_the_panel_names_every_action_the_requirement_timeline_can_show(api):
-    # 动态读的是审计：新动作一出现就自己冒到时间线上，界面得有词称呼它，否则人只看到机器名。
+def test_the_panel_names_every_action_either_read_view_can_show(api):
+    # 动态读的是审计：新动作一出现就自己冒到时间线与「我的动态」上，界面得有词称呼它。
     source = (RUNTIME / "collaboration" / "web" / "app.js").read_text(encoding="utf-8")
     block = source.split("const NEWS = {", 1)[1].split("\n};", 1)[0]
     named = set(re.findall(r'^  "([\w.]+)":', block, re.MULTILINE))
@@ -2384,5 +2444,7 @@ def test_the_panel_names_every_action_the_requirement_timeline_can_show(api):
     rows = checked(api.send("member", "GET",
                             f"/projects/{seen.project['project_id']}/requirements"
                             f"/{seen.requirement_id}/activity?limit=200"))
+    feed = checked(api.send("member", "GET", "/feed?limit=200"))
     assert {entry["action"] for entry in rows} <= named
+    assert {entry["action"] for entry in feed} <= named
 

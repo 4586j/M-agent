@@ -73,6 +73,7 @@ const NEWS = {
   "attempt.reconciled.failed": "对账为已产生副作用",
 };
 const ACTIVITY_LIMIT = 20;
+const FEED_LIMIT = 20;
 
 let csrf = null;
 let me = null;
@@ -84,7 +85,7 @@ let controller = new AbortController();
 
 const fields = {};
 for (const id of ["login", "workspace", "who", "logout", "project", "requirement", "todos",
-                  "todoCount", "createBox", "detail", "status"]) {
+                  "todoCount", "feedList", "feedCount", "createBox", "detail", "status"]) {
   fields[id] = document.getElementById(id);
 }
 
@@ -157,14 +158,18 @@ async function refresh() {
   role = null;
   roster = [];
   fields.todos.replaceChildren();
+  fields.feedList.replaceChildren();
   fields.createBox.replaceChildren();
   fields.detail.replaceChildren();
   text(fields.todoCount, "");
+  text(fields.feedCount, "");
   say("");
-  if (!projectId) {
-    return true;
-  }
   try {
+    // 动态跨项目，跟着人走，所以它不等项目选出来才加载；待办与详情才按项目取。
+    renderFeed(await get(`/feed?limit=${FEED_LIMIT}`));
+    if (!projectId) {
+      return true;
+    }
     role = (await get(`/projects/${projectId}`)).access_role;
     roster = await get(`/projects/${projectId}/members`);
     const inbox = await get("/inbox");
@@ -232,7 +237,7 @@ function renderTodo(entry) {
     renderChoice(form, entry, spec);
   }
   if (entry.unread) {
-    ackButton(form, entry);
+    ackButton(form, entry, "已记下你看过了这条待办；裁定仍然挂着。");
   }
 }
 
@@ -425,7 +430,7 @@ function draftButton(form, label, kind, run) {
   });
 }
 
-function ackButton(form, entry) {
+function ackButton(form, entry, note) {
   // 读过不等于裁定：标记之后这条待办仍然挂着，直到写下决定。
   const seen = add(form, "button", "soft", "标记已读");
   seen.type = "button";
@@ -433,7 +438,7 @@ function ackButton(form, entry) {
     seen.disabled = true;
     try {
       await post("/inbox/ack", {item_key: entry.key});
-      await report("已记下你看过了这条待办；裁定仍然挂着。");
+      await report(note);
     } catch (error) {
       seen.disabled = false;
       if (error.name !== "AbortError") {
@@ -484,6 +489,56 @@ function renderActivity(block, entries) {
   if (entries.length === ACTIVITY_LIMIT) {
     add(block, "dd", "locator", `只列最近 ${ACTIVITY_LIMIT} 条，更早的动态没有消失，界面不自动翻页。`);
   }
+}
+
+function jumpButton(form, entry) {
+  const button = add(form, "button", "soft", "跳到这条需求");
+  button.type = "button";
+  button.addEventListener("click", async () => {
+    if (![...fields.project.options].some(option => option.value === entry.project_id)) {
+      // 宁可说一句「这个项目不在你的列表里」，也不静默把选择器清空，让人以为面板坏了。
+      say("这条动态所在的项目已不在你的项目列表里。", "error");
+      return;
+    }
+    button.disabled = true;
+    try {
+      pendingRequirement = entry.requirement_id;
+      fields.project.value = entry.project_id;
+      await loadRequirements();
+    } catch (error) {
+      button.disabled = false;
+      if (error.name !== "AbortError") {
+        say(`跳转失败：${error.message}`, "error");
+      }
+    }
+  });
+}
+
+function renderFeed(entries) {
+  // 动态是不请自来的那一半：不代人决定，只把已经发生的事送到眼前，并给一步跳过去的出口。
+  fields.feedList.replaceChildren();
+  text(fields.feedCount, "");
+  if (!entries.length) {
+    add(fields.feedList, "li", null, "还没有发给你的动态。");
+    return;
+  }
+  for (const entry of entries) {
+    const row = add(fields.feedList, "li");
+    const head = add(row, "div", "kind", `${entry.label}：${NEWS[entry.action] || entry.action}`);
+    if (entry.unread) {
+      add(head, "span", "unread", "未读");
+    }
+    add(row, "div", "locator", `${when(entry.created_at)} · `
+        + `${entry.actor_name || entry.actor_id || "系统"} · `
+        + `${projectNames[entry.project_id] ?? entry.project_id} · ${entry.requirement_title}`);
+    const form = add(row, "div", "form-row");
+    jumpButton(form, entry);
+    if (entry.unread) {
+      ackButton(form, entry, "已记下你看过了这条动态；它不欠你一个决定。");
+    }
+  }
+  const unread = entries.filter(entry => entry.unread).length;
+  text(fields.feedCount, unread ? `（未读 ${unread}）` : "");
 }
 
 async function renderRequirement(projectId, requirementId) {
@@ -826,6 +881,8 @@ fields.logout.addEventListener("click", async () => {
   fields.requirement.replaceChildren();
   fields.todos.replaceChildren();
   text(fields.todoCount, "");
+  fields.feedList.replaceChildren();
+  text(fields.feedCount, "");
   fields.detail.replaceChildren();
   text(fields.who, "");
   say("");

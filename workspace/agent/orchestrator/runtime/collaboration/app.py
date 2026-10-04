@@ -436,6 +436,53 @@ def _activity_rows(conn, project_id: str, requirement_id: str, limit: int):
     return [dict(row) for row in rows]
 
 
+def _feed_rows(conn, user_id: str, limit: int):
+    """News addressed to one person, across the projects they are active in, newest first.
+
+    Same audit trail and same subject wording as ``_activity_rows`` (the tests keep the two in
+    step); what differs is the audience, so this is the half that can arrive unasked: events on a
+    requirement the person owns, was named to review, or is assigned to work on. An event they
+    caused is not news to them, so their own writes are left out, and the audience is read from
+    the durable review rows rather than from ``requirements.reviewer_id`` alone: a decision that
+    gets made must not erase the news that somebody was asked to make it.
+    """
+    denied = ",".join("?" * len(_ACTIVITY_DENIED))
+    rows = conn.execute(
+        f"""
+        WITH mine AS (SELECT project_id FROM project_members
+                      WHERE user_id=? AND status='active'),
+             subject(id, requirement_id, label) AS (
+                SELECT requirement_id, requirement_id, '需求本身' FROM requirements
+                    WHERE project_id IN mine
+                UNION ALL SELECT revision_id, requirement_id, '第 ' || number || ' 版原文'
+                    FROM requirement_revisions WHERE project_id IN mine
+                UNION ALL SELECT plan_id, requirement_id, '拆解计划' FROM plans WHERE project_id IN mine
+                UNION ALL SELECT w.work_item_id, p.requirement_id, '工作项 ' || w.key
+                    FROM work_items w JOIN plans p ON p.plan_id=w.plan_id WHERE w.project_id IN mine
+                UNION ALL SELECT a.attempt_id, a.requirement_id, '第 ' || a.number || ' 次尝试 · ' || w.key
+                    FROM attempts a JOIN work_items w ON w.work_item_id=a.work_item_id
+                    WHERE a.project_id IN mine)
+        SELECT e.event_id,e.project_id,e.actor_id,actor.display_name AS actor_name,
+               e.action,e.created_at,e.target_id,
+               s.requirement_id,r.title AS requirement_title,s.label
+        FROM collaboration_audit e
+        JOIN subject s ON s.id=e.target_id
+        JOIN requirements r ON r.requirement_id=s.requirement_id
+        LEFT JOIN users actor ON actor.user_id=e.actor_id
+        LEFT JOIN work_items owed_item ON owed_item.work_item_id=s.id
+        LEFT JOIN attempts owed_attempt ON owed_attempt.attempt_id=s.id
+        WHERE e.project_id IN (SELECT project_id FROM mine) AND e.action NOT IN ({denied})
+          AND (e.actor_id IS NULL OR e.actor_id<>?)
+          AND (r.requester_id=? OR r.reviewer_id=?
+               OR owed_item.assignee_user_id=? OR owed_attempt.assignee_user_id=?
+               OR EXISTS (SELECT 1 FROM requirement_reviews named
+                          WHERE named.requirement_id=s.requirement_id AND named.reviewer_id=?))
+        ORDER BY e.created_at DESC,e.rowid DESC LIMIT ?
+        """,
+        (user_id, *_ACTIVITY_DENIED, user_id, user_id, user_id, user_id, user_id, user_id, limit))
+    return [dict(row) for row in rows]
+
+
 def _wake(client: httpx.Client, url: str, payload: dict) -> None:
     """Advisory wake-up of a registered worker; failure only delays its next pull."""
     response = client.post(url, json=payload, headers={"x-collab-wake": "1"})
@@ -1144,12 +1191,34 @@ def create_app(config: AppConfig) -> FastAPI:
         with _access(request) as access:
             return _inbox(access)
 
+    def _stamped_feed(access, limit: int) -> list[dict]:
+        """The news list with this reader's unread flag on it; read state, so it may lag."""
+        rows = _feed_rows(access.conn, access.user.user_id, limit)
+        seen = access.store.inbox_acks(access.user.user_id)
+        for row in rows:
+            row["key"] = f"activity:{row['event_id']}"
+            row["unread"] = row["key"] not in seen
+        return rows
+
+    @router.get("/feed")
+    def my_feed(request: Request, limit: AuditLimit = 20):
+        """News for this person across their projects: what moved, not what they owe.
+
+        The to-do list is a decision with a name on it; this is the same audit trail read from the
+        other side, so a requester learns the plan was published without opening every requirement.
+        """
+        with _access(request) as access:
+            return _stamped_feed(access, limit)
+
     @router.post("/inbox/ack", status_code=204)
     def ack_inbox_todo(body: InboxAck, request: Request):
-        """Say "I have seen this" about a to-do the caller really owes; it stays owed."""
+        """Say "I have seen this" about a to-do or a news item the caller really is owed."""
         with _access(request, write=True) as access:
-            app.state.inbox.ack(access, item_key=body.item_key,
-                                known={entry["key"] for entry in _inbox(access)})
+            known = {entry["key"] for entry in _inbox(access)}
+            # Widest window the read view allows: an acknowledgement must not fail because the
+            # person was looking at a longer list than this request happens to carry.
+            known |= {row["key"] for row in _stamped_feed(access, 200)}
+            app.state.inbox.ack(access, item_key=body.item_key, known=known)
 
     @router.get("/projects/{pid}/audit")
     def project_audit(pid: str, request: Request, limit: AuditLimit = 100):
