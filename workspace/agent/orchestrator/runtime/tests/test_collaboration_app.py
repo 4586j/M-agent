@@ -2544,3 +2544,53 @@ def test_the_panel_names_every_action_either_read_view_can_show(api):
     assert {entry["action"] for entry in rows} <= named
     assert {entry["action"] for entry in feed} <= named
 
+
+def test_the_coverage_report_travels_with_the_two_signatures(api):
+    # 签字的人不该只看见状态变了：覆盖映射与「谁核对过」要摆在要签的那一个人眼前。
+    seen = delivered(api)
+    pid = seen.project["project_id"]
+    wid = seen.plan["work_items"][0]["work_item_id"]
+    base = f"/projects/{pid}/requirements/{seen.requirement_id}"
+    checked(api.send("member", "POST", delivery_path(pid, seen.attempt.attempt_id),
+                     json={"decision": "confirmed", "expected_version": seen.reported["version"]}))
+    item = checked(api.send("manager", "GET", plans_path(seen.project, seen.requirement_id)
+                            + f"/{seen.plan['plan']['plan_id']}"))["work_items"][0]
+    checked(api.send("manager", "POST", f"/projects/{pid}/work-items/{wid}/accept",
+                     json={"decision": "accepted", "expected_version": item["version"]}))
+    requirement = checked(api.send("member", "GET", base))
+    stopping = checked(api.send("member", "POST", f"{base}/actions",
+                                json={"action": "advance",
+                                      "expected_version": requirement["version"]}))
+    coverage = {"coverage": f"{base}/integration"}
+
+    def link_of(actor, item_type):
+        rows = [entry for entry in checked(api.send(actor, "GET", "/inbox"))
+                if entry["item_type"] == item_type]
+        assert len(rows) == 1
+        return rows[0]["links"]
+
+    assert stopping["status"] == "integrating"
+    # 核对待办把报告一起递到手边：管理者签之前读的就是这份映射，不用自己去拼路径。
+    assert link_of("manager", "integration_check") == coverage
+    checked(api.send("manager", "POST", f"{base}/integration",
+                     json={"decision": "passed", "expected_version": stopping["version"]}))
+    # 提出人的签字待办带同一份报告：他签的是「有人核过的这一版交付」，不是「系统说完成了」。
+    assert link_of("member", "final_acceptance") == coverage
+    view = checked(api.send("member", "GET", f"{base}/integration"))
+    assert [(entry["decision"], entry["actor_user_id"]) for entry in view["verdicts"]] == [
+        ("passed", api.identities["manager"]["user"]["user_id"])]
+
+
+def test_the_panel_opens_the_coverage_report_where_a_signature_is_asked():
+    # 后端给了链接而界面没有出口，报告就只活在 API 里：这一条钉住那半步。
+    source = (RUNTIME / "collaboration" / "web" / "app.js").read_text(encoding="utf-8")
+    block = source.split("const DECISIONS = {", 1)[1].split("\n};", 1)[0]
+    parts = re.split(r"^  (\w+): \{", block, flags=re.MULTILINE)
+    specs = {parts[index]: parts[index + 1] for index in range(1, len(parts) - 1, 2)}
+    for kind in ("final_acceptance", "integration_check"):
+        assert 'look: "coverage"' in specs[kind], kind
+        assert "shown: showCoverage" in specs[kind], kind
+    # 需求详情区也摊开同一份报告：不签字的相关人（例如另一位管理者）也读得到核对痕迹。
+    assert 'add(block, "dt", null, "覆盖核对' in source
+    assert "showCoverage(block, await get(`${path}/integration`))" in source
+

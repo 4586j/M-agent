@@ -44,7 +44,9 @@ ACTIONS = {
     "rework_queue": ("rework_work_item",
                      "/projects/{project_id}/work-items/{work_item_id}/rework", {}),
     "final_acceptance": ("accept_requirement",
-                         "/projects/{project_id}/requirements/{requirement_id}/acceptance", {}),
+                         "/projects/{project_id}/requirements/{requirement_id}/acceptance",
+                         {"coverage": "/projects/{project_id}/requirements/{requirement_id}"
+                                       "/integration"}),
     # A delivery that has stopped being somebody's work has to become somebody's check: it is
     # owed to the project's managers, who are the only ones allowed to record the verdict.
     "integration_check": ("record_integration",

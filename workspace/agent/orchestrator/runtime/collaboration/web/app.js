@@ -13,7 +13,8 @@ const DECISIONS = {
                                      ["failed", "已产生副作用"]]},
   final_acceptance: {title: "最终验收", field: "decision", reason: true,
                      hint: "退回时必填：写下整篇交付缺了什么",
-                     choices: [["accepted", "签字验收"], ["changes_requested", "退回整篇交付"]]},
+                     choices: [["accepted", "签字验收"], ["changes_requested", "退回整篇交付"]],
+                     look: "coverage", lookLabel: "查看覆盖核对", shown: showCoverage},
   integration_check: {title: "集成核对", field: "decision",
                       reason: true, hint: "退回时必填：写下缺了哪一条验收",
                       choices: [["passed", "核对通过，交给提出人"], ["returned", "退回返工"]],
@@ -281,6 +282,11 @@ function showMessage(parent, message) {
                           + `${when(message.created_at)} · ${message.content}`);
 }
 
+function personName(userId) {
+  const found = roster.find(entry => entry.user_id === userId);
+  return found ? found.display_name : userId;
+}
+
 function showCoverage(parent, view) {
   // 核对的是"原文的每一条验收有没有被这份交付盖住"，所以两边都要摊开：映射，和已经签过的裁定。
   for (const item of view.report.acceptance) {
@@ -288,8 +294,12 @@ function showCoverage(parent, view) {
         + (item.covered_by.length ? `由 ${item.covered_by.join("、")} 交付` : "没有已验收的工作项覆盖"));
   }
   add(parent, "dd", "locator", `本次交付摘要 ${view.report.evidence_hash}`);
+  if (!view.verdicts.length) {
+    add(parent, "dd", null, "还没有人核对过这一版交付。");
+  }
   for (const verdict of view.verdicts) {
-    add(parent, "dd", null, `${verdict.decision === "passed" ? "核对通过" : "退回返工"} · `
+    add(parent, "dd", null, `${personName(verdict.actor_user_id)} `
+        + `${verdict.decision === "passed" ? "核对通过" : "退回返工"} · `
         + `摘要 ${verdict.evidence_hash} · ${when(verdict.created_at)}`
         + ` · ${verdict.reason || "没有留下理由"}`);
   }
@@ -676,6 +686,15 @@ async function renderRequirement(projectId, requirementId) {
     } catch (error) {
       if (error.name !== "AbortError") {
         add(block, "p", "locator", `交付视图暂不可用：${error.message}`);
+      }
+    }
+    // 签字的人要看得见"谁核对了、签在哪一份交付摘要上"，而不是只知道状态变了。
+    try {
+      add(block, "dt", null, "覆盖核对（验收项 → 已验收工作项）");
+      showCoverage(block, await get(`${path}/integration`));
+    } catch (error) {
+      if (error.name !== "AbortError") {
+        add(block, "p", "locator", `覆盖核对暂不可用：${error.message}`);
       }
     }
   }
