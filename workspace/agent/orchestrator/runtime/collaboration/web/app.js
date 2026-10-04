@@ -71,6 +71,7 @@ const NEWS = {
   "work_item.requeued": "重新排队",
   "work_item.cancelled": "被取消",
   "attempt.assigned": "已派发",
+  "attempt.lease_reclaimed": "租约过期，服务端收回了执行权",
   "attempt.ack": "执行机确认接到",
   "attempt.start": "执行机开始运行",
   "attempt.result": "执行机回报了结果",

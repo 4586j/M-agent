@@ -41,6 +41,9 @@ POST_APPROVAL_STATUSES = (
 # An attempt holds the work item while it is in one of these statuses; only one
 # attempt per work item may be open at a time (partial unique index).
 OPEN_ATTEMPT_STATUSES = ("assigned", "acked", "running", "reconciliation_required")
+# A lease says a machine is still answering; an attempt already parked for a person is excluded,
+# because re-claiming it every round would rewrite the same lost run over and over.
+LEASED_ATTEMPT_STATUSES = ("assigned", "acked", "running")
 ATTEMPT_TERMINAL_STATUSES = ("accepted", "changes_requested", "failed", "cancelled")
 ATTEMPT_STATUSES = OPEN_ATTEMPT_STATUSES + ATTEMPT_TERMINAL_STATUSES + ("submitted",)
 REPORT_STAGES = ("ack", "start", "lease", "artifact", "result", "cancel")

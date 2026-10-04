@@ -369,13 +369,15 @@ class ReviewService:
 
     def reconcile_attempt(self, access: Access, *, project_id: str, attempt_id: str,
                           outcome: str, expected_version: int, reason: str = "") -> Attempt:
-        """Close an attempt a withdrawal left unconfirmed, with what a human actually checked.
+        """Close an attempt a withdrawal or an expired lease left unconfirmed, on what a human checked.
 
         Revoking execution rights deliberately refuses any further report from the worker, so
         ``reconciliation_required`` can only be settled by the person who looked: ``cancelled``
-        gives the reserved share back, ``failed`` keeps it charged as the cost of a run that did
-        touch the outside world. That verdict also decides whether the withdrawal stands as an
-        abandonment — ``failed`` puts the work item back where a manager can re-queue it.
+        gives a given-up-on item's reserved share back, ``failed`` keeps it charged as the cost of
+        a run that did touch the outside world. The verdict also decides where the work item goes.
+        One the human cancelled comes back only on ``failed``; one still holding a round the
+        service reclaimed moves to a manager to re-queue on ``failed``, or back to the queue to
+        wait for another machine on ``cancelled``.
         """
         choice = _choice(outcome, ("cancelled", "failed"), "outcome")
         explanation = self._reason(reason)
@@ -399,17 +401,29 @@ class ReviewService:
             payload=json.dumps({"reason": explanation, "actor_user_id": access.user.user_id,
                                 "outcome": choice}, ensure_ascii=False, sort_keys=True),
             accepted=True, reason="reconciled by human", created_at=now)
-        if choice == "cancelled" and updated.number == 1 and item.estimated_units:
+        if (choice == "cancelled" and item.status == "cancelled"
+                and updated.number == 1 and item.estimated_units):
+            # The share only goes back when the item itself was given up on. A round the service
+            # reclaimed after the lease ran out leaves the item standing, and the next attempt is
+            # expected to spend that same reservation.
             self.budgets.release(access.store, project_id=project_id,
                                  requirement_id=attempt.requirement_id,
                                  attempt_id=attempt.attempt_id,
                                  reserved_units=item.estimated_units, created_at=now)
-        if choice == "failed" and item.status == "cancelled":
+        target = None
+        if item.status == "cancelled" and choice == "failed":
             # The withdrawal wrote ``cancelled`` as the human's abandonment; a run that left
             # traces behind was not abandoned, so the item returns to the re-queueable set.
-            moved = access.store.advance_work_item(item.work_item_id, status="failed",
+            target = "failed"
+        elif item.status == "running":
+            # A lease ran out under this item and the service took the reporting right back, so
+            # the round is lost rather than given up on: ``failed`` puts it in front of a manager
+            # to re-queue, ``cancelled`` hands it back to the queue to wait for a machine.
+            target = "failed" if choice == "failed" else "waiting_agent"
+        if target is not None:
+            moved = access.store.advance_work_item(item.work_item_id, status=target,
                                                    expected_version=item.version, updated_at=now)
-            record_audit(access.conn, now, access.user.user_id, "work_item.failed",
+            record_audit(access.conn, now, access.user.user_id, f"work_item.{target}",
                          item.work_item_id, project_id=project_id, target_version=moved.version)
         record_audit(access.conn, now, access.user.user_id, f"attempt.reconciled.{choice}",
                      attempt.attempt_id, project_id=project_id, target_version=updated.version)

@@ -1134,7 +1134,8 @@ def test_scheduler_tick_and_outbox_over_http(api):
     checked(api.send("member", "POST", tick_path), 403)
     checked(api.send("outsider", "POST", tick_path), 404)
     tick = checked(api.send("manager", "POST", tick_path))
-    assert tick == {"claimed": 1, "delivered": 1, "deferred": 0, "work_items_changed": 1}
+    assert tick == {"claimed": 1, "delivered": 1, "deferred": 0, "work_items_changed": 1,
+                    "attempts_reclaimed": 0}
     assert checked(api.send("member", "GET",
                             f"/projects/{pid}/requirements/{requirement_id}"))["status"] == \
         "executing"
@@ -1841,6 +1842,65 @@ def test_a_failed_reconciliation_puts_the_work_item_back_in_the_queue(api):
             if not entry["item_type"].startswith("requirement_")] == []
 
 
+def test_a_tick_over_http_reclaims_an_expired_lease_and_reports_it_as_news(api):
+    project, requirement_id, plan, attempt, token = machine_attempt(api)
+    pid, wid = project["project_id"], plan["work_items"][0]["work_item_id"]
+    base = f"/machine/attempts/{attempt.attempt_id}"
+    headers = {"X-Instance-Token": token}
+    started = checked(api.send(None, "POST", base + "/start", json=machine_claims(attempt),
+                               headers=headers))
+    # 租约按服务端的真实时钟到期：这里不改任何状态，只是把那一格推到过去。
+    with api.database.transaction() as conn:
+        conn.execute("UPDATE attempts SET lease_expires_at=? WHERE attempt_id=?",
+                     (time.time() - 1, attempt.attempt_id))
+
+    tick_path = f"/projects/{pid}/scheduler/tick"
+    checked(api.send("member", "POST", tick_path), 403)
+    checked(api.send("outsider", "POST", tick_path), 404)
+    assert checked(api.send("manager", "POST", tick_path))["attempts_reclaimed"] == 1
+
+    live = checked(api.send("member", "GET", delivery_path(pid, attempt.attempt_id)))["attempt"]
+    assert (live["status"], live["control_epoch"], live["version"]) == (
+        "reconciliation_required", started["attempt"]["control_epoch"] + 1,
+        started["attempt"]["version"] + 2)
+    # 接管只收回写权：拉输入与下载证据仍然认这个实例。
+    assert checked(api.send(None, "GET", base + "/package",
+                            headers=headers))["work_item_id"] == wid
+    for stage, body in (("ack", {}),
+                        ("result", {"status": "submitted", "summary": "迟到的结果",
+                                    "artifacts": [], "usage_units": 1}),
+                        ("cancel", {"reason": "迟到的停止确认"})):
+        checked(api.send(None, "POST", f"{base}/{stage}",
+                         json={**machine_claims(live), **body}, headers=headers), 409)
+    # 待办不再要求人去点撤销：它直接指向对账，版本就是尝试当前的版本。
+    owed = [entry for entry in checked(api.send("member", "GET", "/inbox"))
+            if entry["item_type"] in ("worker_attention", "attempt_reconciliation")]
+    assert [(entry["item_type"], entry["action"], entry["expected_version"])
+            for entry in owed] == [
+        ("attempt_reconciliation", "reconcile_attempt", live["version"])]
+    # 这一步是新闻：机器静下来这件事要出现在需求时间线与「我的动态」里，谓语读得出中文。
+    activity = checked(api.send("member", "GET",
+                                f"/projects/{pid}/requirements/{requirement_id}/activity?limit=200"))
+    assert "attempt.lease_reclaimed" in {entry["action"] for entry in activity}
+    assert [entry["label"] for entry in activity if entry["action"] == "attempt.lease_reclaimed"] \
+        == ["第 1 次尝试 · A"]
+    assert activity[[entry["action"] for entry in activity].index("attempt.lease_reclaimed")][
+        "actor_id"] is None
+    feed = checked(api.send("member", "GET", "/feed?limit=200"))
+    assert "attempt.lease_reclaimed" in {entry["action"] for entry in feed}
+
+    # 裁定「没动过外面世界」之后，这项回到队列那一侧，不是停在 running 等谁去点撤销。
+    settled = checked(api.send("member", "POST",
+                               f"/projects/{pid}/attempts/{attempt.attempt_id}/reconcile",
+                               json={"outcome": "cancelled", "expected_version": live["version"],
+                                     "reason": "看过那台机器，只读到输入没写过东西"}))
+    assert settled["status"] == "cancelled"
+    detail = checked(api.send("member", "GET",
+                              plans_path(project, requirement_id) + f"/{plan['plan']['plan_id']}"))
+    assert next(entry for entry in detail["work_items"]
+                if entry["work_item_id"] == wid)["status"] == "waiting_agent"
+
+
 def test_the_requester_signs_for_the_requirement_delivery_over_http(api):
     project, requirement_id, plan, attempt, token = machine_attempt(api)
     pid = project["project_id"]
@@ -2543,6 +2603,8 @@ def test_the_panel_names_every_action_either_read_view_can_show(api):
     feed = checked(api.send("member", "GET", "/feed?limit=200"))
     assert {entry["action"] for entry in rows} <= named
     assert {entry["action"] for entry in feed} <= named
+    # 租约到点由服务端自己收回执行权，没有谁按下按钮：这一格同样要有中文谓语，不能等谁来补。
+    assert "attempt.lease_reclaimed" in named
 
 
 def test_the_coverage_report_travels_with_the_two_signatures(api):

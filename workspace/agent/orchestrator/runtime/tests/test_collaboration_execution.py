@@ -3018,6 +3018,143 @@ def test_a_run_that_left_traces_behind_can_be_queued_again(team):
     assert booked(team, "requirement", requirement_id) == [("reserve", 5)]
 
 
+def test_a_tick_reclaims_an_expired_lease_and_leaves_the_verdict_to_a_person(team):
+    """租约到点不等于「这一轮算了」，而是「这台机器不再被信任继续写」：接管由调度轮次发起。
+
+    18.14 的撤销与 18.20 的对账都从人按下按钮开始；这一段没有人在场，服务端自己收回执行权，
+    然后停下——退预留、写结果、判工作项都不归它。
+    """
+    requirement, plan, instance, token = reserved_plan(team, plan_item(team, "A", estimate=5))
+    project_id, requirement_id = requirement.project_id, requirement.requirement_id
+    item = work_item(team, plan, "A")
+    dispatch = team.make_dispatch(requires_real_data=False, lease_ttl=120.0)
+    attempt = dispatch.dispatch(project_id, item.work_item_id)
+    execution = team.make_execution(lease_ttl=120.0)
+    execution.start(token, attempt.attempt_id, **claims(attempt))
+    assert todos(team, team.worker) == [] and todos(team, team.reviewer) == []
+    team.clock.advance(121.0)
+    assert [entry[0] for entry in todos(team, team.worker)] == ["worker_attention"]
+
+    queue = QueueService(team.database, heartbeat_timeout=120, clock=team.clock)
+    scheduler = Scheduler(team.database, planning=SimpleNamespace(), queue=queue,
+                          dispatch=dispatch, clock=team.clock)
+    assert scheduler.tick(project_id)["attempts_reclaimed"] == 1
+
+    parked = team.store.get_attempt(project_id, attempt.attempt_id)
+    assert parked.status == "reconciliation_required"
+    # 收回的是执行权本身：控制代次抬到实例之上，此后来自那台机器的回传只能留证据。
+    assert parked.control_epoch == instance.control_epoch + 1
+    assert parked.lease_expires_at == attempt.lease_expires_at
+    # 工作项仍握着这一轮：是丢了运行，不是被放弃，所以既不入队也不退回预留。
+    assert team.store.get_work_item(project_id, item.work_item_id).status == "running"
+    assert booked(team, "attempt", attempt.attempt_id) == []
+    assert booked(team, "requirement", requirement_id) == [("reserve", 5)]
+    assert ("cancel", True, "execution right reclaimed after lease expiry") in stored_reports(
+        team, project_id, attempt.attempt_id)
+    assert "attempt.lease_reclaimed" in audited(team, attempt.attempt_id)
+    assert [event.topic for event in team.store.list_events(project_id)].count(
+        TOPIC_ATTEMPT_REVOKED) == 1
+
+    with pytest.raises(Conflict):
+        execution.ack(token, attempt.attempt_id, **claims(parked))
+    assert [report for report in team.store.list_attempt_reports(project_id, attempt.attempt_id)
+            if report.stage == "ack" and not report.accepted]
+
+    pending = todos(team, team.worker)
+    assert pending == [("attempt_reconciliation", "reconcile_attempt",
+                        f"/projects/{project_id}/attempts/{attempt.attempt_id}/reconcile")]
+    assert todos(team, team.reviewer) == pending
+    # 第二轮调度不再重复接管：停在等人看的那一格就够了，重写会把同一轮丢失抹成流水噪音。
+    assert scheduler.tick(project_id)["attempts_reclaimed"] == 0
+    assert team.store.get_attempt(project_id, attempt.attempt_id).version == parked.version
+
+
+def test_a_reclaimed_round_goes_back_whichever_way_the_person_settles_it(team):
+    """被接管的轮次两种裁定各回哪一侧：动过外面世界去管理人，什么都没动过回队列。"""
+    requirement, plan, _instance, token = reserved_plan(team, plan_item(team, "A", estimate=5),
+                                                        plan_item(team, "B", estimate=5))
+    project_id = requirement.project_id
+    items = {key: work_item(team, plan, key) for key in ("A", "B")}
+    dispatch = team.make_dispatch(requires_real_data=False, lease_ttl=120.0)
+    execution = team.make_execution(lease_ttl=120.0)
+    attempts = {}
+    for key in ("A", "B"):
+        attempt = dispatch.dispatch(project_id, items[key].work_item_id)
+        execution.start(token, attempt.attempt_id, **claims(attempt))
+        attempts[key] = attempt
+    team.clock.advance(121.0)
+    scheduler = Scheduler(team.database, planning=SimpleNamespace(),
+                          queue=QueueService(team.database, heartbeat_timeout=120,
+                                             clock=team.clock),
+                          dispatch=dispatch, clock=team.clock)
+    assert scheduler.tick(project_id)["attempts_reclaimed"] == 2
+
+    # 裁定「那台机器没动过外面世界」：这一轮不算成本，预留留给下一轮，工作项回队列等机器。
+    owed = {entry["work_item_id"]: entry for entry in listed(team, team.worker)}
+    with session(team, team.worker) as access:
+        entry = owed[items["A"].work_item_id]
+        settled = team.reviews.reconcile_attempt(
+            access, project_id=project_id, attempt_id=entry["attempt_id"], outcome="cancelled",
+            reason="看过那台机器，只读到输入没写过东西", expected_version=entry["expected_version"])
+    assert settled.status == "cancelled"
+    assert team.store.get_work_item(project_id, items["A"].work_item_id).status == "waiting_agent"
+    assert booked(team, "attempt", attempts["A"].attempt_id) == []
+
+    # 裁定「它改过外面的文件」：这项归管理人重排队，与 18.20 的人工撤销之后同一侧。
+    owed = {entry["work_item_id"]: entry for entry in listed(team, team.worker)}
+    with session(team, team.worker) as access:
+        entry = owed[items["B"].work_item_id]
+        team.reviews.reconcile_attempt(
+            access, project_id=project_id, attempt_id=entry["attempt_id"], outcome="failed",
+            reason="执行机改过两个文件，已经落盘", expected_version=entry["expected_version"])
+    assert team.store.get_work_item(project_id, items["B"].work_item_id).status == "failed"
+    assert ("rework_queue", "rework_work_item",
+            f"/projects/{project_id}/work-items/{items['B'].work_item_id}/rework") in todos(
+        team, team.reviewer)
+
+    claimed_instance(team)
+    queue = QueueService(team.database, heartbeat_timeout=120, clock=team.clock)
+    # 队列只管那一侧回来了的项：`failed` 不在队列状态里，它等的是管理人点重排队，不是自动复活。
+    assert queue.advance(project_id)["work_items_changed"] == 1
+    assert team.store.get_work_item(project_id, items["A"].work_item_id).status == "ready"
+    third = dispatch.dispatch(project_id, items["A"].work_item_id)
+    assert (third.number, third.status) == (2, "assigned")
+
+
+def test_a_paused_requirement_is_the_one_round_a_tick_does_not_take_over(team):
+    """暂停说的是「正在跑的不动」（18.27）：租约到点也不成为例外，接管等恢复之后。"""
+    requirement, plan, _instance, token = reserved_plan(team, plan_item(team, "A", estimate=5))
+    project_id, requirement_id = requirement.project_id, requirement.requirement_id
+    item = work_item(team, plan, "A")
+    dispatch = team.make_dispatch(requires_real_data=False, lease_ttl=120.0)
+    attempt = dispatch.dispatch(project_id, item.work_item_id)
+    team.make_execution(lease_ttl=120.0).start(token, attempt.attempt_id, **claims(attempt))
+    with session(team, team.reviewer) as access:
+        team.reviews.pause_requirement(access, project_id=project_id,
+                                       requirement_id=requirement_id,
+                                       expected_version=team.store.get_requirement(
+                                           project_id, requirement_id).version,
+                                       reason="等一次外部确认")
+    team.clock.advance(121.0)
+    scheduler = Scheduler(team.database, planning=SimpleNamespace(),
+                          queue=QueueService(team.database, heartbeat_timeout=120,
+                                             clock=team.clock),
+                          dispatch=dispatch, clock=team.clock)
+    assert scheduler.tick(project_id)["attempts_reclaimed"] == 0
+    assert team.store.get_attempt(project_id, attempt.attempt_id).status == "running"
+    # 暂停期间这一格仍摆在人面前，只是那条待办要的是人去点撤销，而不是服务端替它决定。
+    assert [entry[0] for entry in todos(team, team.worker)] == ["worker_attention"]
+
+    with session(team, team.reviewer) as access:
+        resumed = team.reviews.resume_requirement(
+            access, project_id=project_id, requirement_id=requirement_id,
+            expected_version=team.store.get_requirement(project_id, requirement_id).version)
+    assert resumed.status == "executing"
+    assert scheduler.tick(project_id)["attempts_reclaimed"] == 1
+    assert team.store.get_attempt(project_id, attempt.attempt_id).status == (
+        "reconciliation_required")
+
+
 def test_a_seen_to_do_is_still_owed_until_someone_rules(team):
     requirement, plan, _instance, token = reserved_plan(team, plan_item(team, "A", estimate=5))
     project_id = requirement.project_id

@@ -172,8 +172,12 @@ class Scheduler:
         return dispatched
 
     def tick(self, project_id: str | None = None) -> dict:
+        # Reclaiming runs first so the wake-up that tells the machine to stop belongs to this
+        # same round instead of waiting for the next one.
+        recovery = (self.dispatch.reclaim_expired_leases(project_id) if self.dispatch is not None
+                    else {"attempts_reclaimed": 0})
         delivery = self.dispatcher.dispatch_once(project_id=project_id)
         queue = self.queue.advance(project_id=project_id)
         if self.dispatch is not None and self.auto_dispatch:
             queue["attempts_dispatched"] = self._dispatch_ready(project_id)
-        return {**delivery, **queue}
+        return {**delivery, **queue, **recovery}

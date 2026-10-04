@@ -13,7 +13,7 @@ import time
 
 from .auth import record_audit
 from .instances import AdmissionDenied, InstanceService
-from .models import Attempt, Conflict, InvalidState, ValidationError
+from .models import LEASED_ATTEMPT_STATUSES, Attempt, Conflict, InvalidState, ValidationError
 from .store import CollaborationStore
 
 PACKAGE_SCHEMA_VERSION = "collab-package-v1"
@@ -226,6 +226,53 @@ class DispatchService:
             record_audit(conn, now, actor_id, "attempt.assigned", attempt.attempt_id,
                          project_id=project_id, target_version=attempt.version)
             return attempt
+
+    def reclaim_expired_leases(self, project_id: str | None = None) -> dict:
+        """Take the reporting right back from a machine that stopped answering; decide nothing.
+
+        A lease is the only proof the service has that a run is still alive. When it runs out, the
+        attempt is parked as ``reconciliation_required`` under a revoked control epoch, so a worker
+        that answers late can still leave evidence but cannot advance the work item — the same
+        shape a human withdrawal already produces, reached here without anyone pressing a button.
+        The service deliberately does not claim the outside world was untouched: no reservation is
+        given back, no result is written and the work item keeps holding the round, because whether
+        it cost something is what the person who checks that machine settles.
+        """
+        now = self.clock()
+        reclaimed = 0
+        listed = CollaborationStore(self.database).leased_attempts(now=now, project_id=project_id)
+        for entry in listed:
+            with self.database.transaction() as conn:
+                store = CollaborationStore(self.database, connection=conn)
+                attempt = store.get_attempt(entry.project_id, entry.attempt_id)
+                if (attempt.status not in LEASED_ATTEMPT_STATUSES
+                        or attempt.lease_expires_at > self.clock()):
+                    continue
+                if store.get_requirement(attempt.project_id,
+                                         attempt.requirement_id).status == "paused":
+                    # 18.27 的规则不因租约到点而改写：暂停留正在跑的不动。失联提醒照旧给到人，
+                    # 人要撤销随时可以撤销；这条轮次只是等恢复之后才由服务端自己接管。
+                    continue
+                parked = store.advance_attempt(attempt.attempt_id, status="reconciliation_required",
+                                               expected_version=attempt.version, updated_at=now)
+                parked = store.revoke_attempt_execution_right(parked.attempt_id,
+                                                              expected_version=parked.version,
+                                                              updated_at=now)
+                store.record_attempt_report(
+                    parked.attempt_id, stage="cancel", lease_epoch=parked.lease_epoch,
+                    control_epoch=parked.control_epoch, input_hash=parked.input_hash,
+                    payload=_canonical({"lease_expires_at": attempt.lease_expires_at,
+                                        "actor_user_id": None}),
+                    accepted=True, reason="execution right reclaimed after lease expiry",
+                    created_at=now)
+                store.enqueue_event(parked.project_id, TOPIC_ATTEMPT_REVOKED, {
+                    "attempt_id": parked.attempt_id, "work_item_id": parked.work_item_id,
+                    "instance_id": parked.instance_id, "input_hash": parked.input_hash,
+                    "control_epoch": parked.control_epoch}, now)
+                record_audit(conn, now, None, "attempt.lease_reclaimed", parked.attempt_id,
+                             project_id=parked.project_id, target_version=parked.version)
+                reclaimed += 1
+        return {"attempts_reclaimed": reclaimed}
 
     def wake(self, event) -> None:
         """Outbox handler: advisory wake-up of the instance that owns the attempt."""

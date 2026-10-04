@@ -13,6 +13,7 @@ from .models import (
     Agent, AgentProjectBinding, ATTEMPT_STATUSES, AcceptanceReview, Attempt, AttemptArtifact,
     AttemptReport, BudgetAccount,
     BudgetEntry, Conflict, ExecutionInstance, ExecutionNode, InvalidState, NotFound, OutboxEvent,
+    LEASED_ATTEMPT_STATUSES,
     OPEN_ATTEMPT_STATUSES, OwnerReview, Plan, POST_APPROVAL_STATUSES, Project, ProjectMember,
     Requirement,
     RequirementAcceptance, RequirementIntegration, RequirementMessage, RequirementPause,
@@ -1375,6 +1376,25 @@ class CollaborationStore:
                 f"AND status IN ({placeholders}) ORDER BY number LIMIT 1",
                 (work_item_id, *OPEN_ATTEMPT_STATUSES)).fetchone()
             return None if row is None else _record(Attempt, row)
+
+    def leased_attempts(self, *, now: float,
+                        project_id: str | None = None) -> list[Attempt]:
+        """Attempts whose lease ran out while still holding execution rights.
+
+        The same predicate the ``worker_attention`` to-do uses, so the round that reclaims a
+        silent machine is the round that would have reminded a person about it.
+        """
+        placeholders = ",".join("?" * len(LEASED_ATTEMPT_STATUSES))
+        with self._read() as conn:
+            where = f"status IN ({placeholders}) AND lease_expires_at<=?"
+            values: list = [*LEASED_ATTEMPT_STATUSES, now]
+            if project_id is not None:
+                where += " AND project_id=?"
+                values.append(project_id)
+            rows = conn.execute(
+                f"SELECT {_ATTEMPT_COLUMNS} FROM attempts WHERE {where} "
+                "ORDER BY lease_expires_at,rowid", values).fetchall()
+            return [_record(Attempt, row) for row in rows]
 
     def next_attempt_number(self, work_item_id: str) -> int:
         with self._read() as conn:

@@ -702,7 +702,8 @@ def test_queue_and_dispatch_are_project_scoped(team):
     requirement = approved_requirement(team)
     plan = manual_plan(team, requirement, {"items": [item(team, "A")]})
     result = team.scheduler.tick(project_id=team.project_b.project_id)
-    assert result == {"claimed": 0, "delivered": 0, "deferred": 0, "work_items_changed": 0}
+    assert result == {"claimed": 0, "delivered": 0, "deferred": 0, "work_items_changed": 0,
+                      "attempts_reclaimed": 0}
     assert team.store.list_work_items(requirement.project_id, plan.plan_id)[0].status == "ready"
     assert team.store.list_events(team.project_b.project_id) == []
 
@@ -794,7 +795,8 @@ def test_scheduler_tick_plans_after_approval_and_queues_work_items(team):
     requirement = approved_requirement(team)
     team.planning.planner = lambda context: {"items": [item(team, "A", estimate=2)]}
     first = team.scheduler.tick(project_id=requirement.project_id)
-    assert first == {"claimed": 1, "delivered": 1, "deferred": 0, "work_items_changed": 1}
+    assert first == {"claimed": 1, "delivered": 1, "deferred": 0, "work_items_changed": 1,
+                     "attempts_reclaimed": 0}
     assert current(team, requirement).status == "executing"
     plan = team.store.published_plan(requirement.project_id, requirement.requirement_id)
     assert plan is not None and plan.total_units == 2
