@@ -15,7 +15,8 @@ from .models import (
     BudgetEntry, Conflict, ExecutionInstance, ExecutionNode, InvalidState, NotFound, OutboxEvent,
     OPEN_ATTEMPT_STATUSES, OwnerReview, Plan, POST_APPROVAL_STATUSES, Project, ProjectMember,
     Requirement,
-    RequirementAcceptance, RequirementMessage, RequirementPause, RequirementReview,
+    RequirementAcceptance, RequirementIntegration, RequirementMessage, RequirementPause,
+    RequirementReview,
     RequirementRevision,
     REPORT_STAGES, RevisionAcceptanceItem,
     SecurityGrant, SecurityReview, User, ValidationError, WorkItem, WorkItemDependency,
@@ -28,21 +29,23 @@ WORK_ITEM_STATUSES = (
     "pending_dependency", "ready", "waiting_agent", "running", "awaiting_owner_review",
     "submitted", "accepted", "changes_requested", "blocked", "failed", "cancelled",
 )
-# A requirement only moves through a named action, never by a free write. ``integrating`` is
-# absent on purpose: no integration work item is implemented yet, so asking for it is refused
-# instead of faking a journey. ``paused`` is reached by the pause action and left by the resume
-# action, which re-derives the target from the work items rather than trusting a remembered one.
+# A requirement only moves through a named action, never by a free write. ``paused`` is reached by
+# the pause action and left by the resume action, which re-derives the target from the work items
+# rather than trusting a remembered one. ``integrating`` is the step where an accepted delivery
+# waits for somebody to record the coverage check; it claims no merge and no run of project code,
+# because nothing here executes anything.
 REQUIREMENT_TRANSITIONS: dict[str, tuple[str, ...]] = {
     "planning_blocked": ("approved", "planning", "planning_blocked"),
-    "executing": ("approved", "planning", "planning_blocked", "rework", "paused"),
-    "rework": ("executing", "awaiting_acceptance", "rework", "paused"),
-    "awaiting_acceptance": ("executing", "rework", "paused"),
-    "paused": ("executing", "rework"),
+    "executing": ("approved", "planning", "planning_blocked", "rework", "integrating", "paused"),
+    "integrating": ("executing", "rework", "paused"),
+    "rework": ("executing", "awaiting_acceptance", "integrating", "rework", "paused"),
+    "awaiting_acceptance": ("executing", "rework", "integrating", "paused"),
+    "paused": ("executing", "rework", "integrating"),
     "completed": ("awaiting_acceptance",),
     "cancelling": ("approved", "planning", "planning_blocked", "executing", "rework",
-                   "awaiting_acceptance", "cancelling", "paused"),
+                   "integrating", "awaiting_acceptance", "cancelling", "paused"),
     "cancelled": ("approved", "planning", "planning_blocked", "executing", "rework",
-                  "awaiting_acceptance", "cancelling", "paused"),
+                  "integrating", "awaiting_acceptance", "cancelling", "paused"),
 }
 
 
@@ -180,6 +183,10 @@ _REQUIREMENT_ACCEPTANCE_COLUMNS = (
 )
 _REQUIREMENT_PAUSE_COLUMNS = (
     "pause_id,project_id,requirement_id,actor_user_id,action,reason,created_at"
+)
+_REQUIREMENT_INTEGRATION_COLUMNS = (
+    "integration_id,project_id,requirement_id,actor_user_id,decision,evidence_hash,reason,"
+    "created_at"
 )
 _SECURITY_REVIEW_COLUMNS = (
     "security_review_id,attempt_id,project_id,rule_key,input_hash,requirement_id,revision_id,"
@@ -1121,6 +1128,11 @@ class CollaborationStore:
                 SELECT 'final_acceptance', r.project_id, r.requirement_id, NULL, NULL, NULL,
                        r.version, r.title, r.updated_at
                 FROM requirements r WHERE r.status='awaiting_acceptance' AND r.requester_id=?
+                UNION ALL
+                SELECT 'integration_check', r.project_id, r.requirement_id, NULL, NULL, NULL,
+                       r.version, r.title, r.updated_at
+                FROM requirements r WHERE r.status='integrating'
+                  AND r.project_id IN (SELECT project_id FROM managed)
                 """,
                 (user_id, user_id, user_id, now, user_id, user_id)).fetchall()
         return [dict(row) for row in rows]
@@ -1650,6 +1662,43 @@ class CollaborationStore:
             return [_record(RequirementPause, row) for row in conn.execute(
                 f"SELECT {_REQUIREMENT_PAUSE_COLUMNS} FROM requirement_pauses WHERE project_id=? "
                 "AND requirement_id=? ORDER BY created_at,rowid", (project_id, requirement_id))]
+
+    def add_requirement_integration(self, project_id: str, requirement_id: str, *,
+                                    actor_user_id: str, decision: str, evidence_hash: str,
+                                    reason: str, created_at: float) -> RequirementIntegration:
+        """One manager's verdict on one concrete bundle: it passed the check, or it goes back."""
+        _choice(decision, ("passed", "returned"), "decision")
+        _digest(evidence_hash, "evidence_hash")
+        integration_id = uuid4().hex
+        with self._write() as conn:
+            requirement = self._requirement(conn, project_id, requirement_id)
+            conn.execute(
+                "INSERT INTO requirement_integrations(integration_id,project_id,requirement_id,"
+                "actor_user_id,decision,evidence_hash,reason,created_at) VALUES(?,?,?,?,?,?,?,?)",
+                (integration_id, requirement.project_id, requirement_id, actor_user_id, decision,
+                 evidence_hash, reason, created_at))
+            return _one(conn, RequirementIntegration,
+                        f"SELECT {_REQUIREMENT_INTEGRATION_COLUMNS} FROM requirement_integrations "
+                        "WHERE integration_id=?", (integration_id,))
+
+    def list_requirement_integrations(self, project_id: str,
+                                      requirement_id: str) -> list[RequirementIntegration]:
+        """Every integration verdict this requirement has been given, oldest first."""
+        with self._read() as conn:
+            return [_record(RequirementIntegration, row) for row in conn.execute(
+                f"SELECT {_REQUIREMENT_INTEGRATION_COLUMNS} FROM requirement_integrations "
+                "WHERE project_id=? AND requirement_id=? ORDER BY created_at,rowid",
+                (project_id, requirement_id))]
+
+    def latest_requirement_integration(self, project_id: str,
+                                       requirement_id: str) -> RequirementIntegration | None:
+        """The verdict a later round has to answer to, if anybody has given one yet."""
+        with self._read() as conn:
+            return _maybe(conn, RequirementIntegration,
+                          f"SELECT {_REQUIREMENT_INTEGRATION_COLUMNS} FROM requirement_integrations"
+                          " WHERE project_id=? AND requirement_id=?"
+                          " ORDER BY created_at DESC,rowid DESC LIMIT 1",
+                          (project_id, requirement_id))
 
     # --- security gate ----------------------------------------------------------
 

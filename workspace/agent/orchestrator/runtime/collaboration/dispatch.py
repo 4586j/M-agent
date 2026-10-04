@@ -82,7 +82,9 @@ class DispatchService:
 
         Both the owner's confirmation and the business acceptance can send one delivery back, and
         the requester's verdict on the whole requirement sends every accepted delivery of the plan
-        back at once. All three are notes the next attempt has to read, so they share one list.
+        back at once. So can a manager's integration check, which is the one return that says the
+        bundle as a whole does not cover the original text. All four are notes the next attempt has
+        to read, so they share one list.
         The attempt number orders the per-delivery notes because a clock can hand two reviewers the
         same second; a requirement verdict has no attempt of its own, so within one second it
         comes after the deliveries it covered.
@@ -103,6 +105,12 @@ class DispatchService:
                 notes.append({"kind": "requirement_acceptance", "attempt_id": None,
                               "attempt_number": None, "reason": entry.reason,
                               "reviewed_by": entry.reviewer_user_id,
+                              "reviewed_at": entry.created_at})
+        for entry in store.list_requirement_integrations(project_id, requirement_id):
+            if entry.decision == "returned":
+                notes.append({"kind": "requirement_integration", "attempt_id": None,
+                              "attempt_number": None, "reason": entry.reason,
+                              "reviewed_by": entry.actor_user_id,
                               "reviewed_at": entry.created_at})
         return sorted(notes, key=lambda note: (note["reviewed_at"],
                                                float("inf") if note["attempt_number"] is None

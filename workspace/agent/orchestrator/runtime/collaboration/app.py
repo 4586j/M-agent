@@ -275,6 +275,12 @@ class RequirementAcceptanceCreate(Input):
     reason: Annotated[str, Field(max_length=2048)] = ""
 
 
+class IntegrationDecision(Input):
+    decision: Literal["passed", "returned"]
+    expected_version: Version
+    reason: Annotated[str, Field(max_length=2048)] = ""
+
+
 class AttemptReconcile(Input):
     outcome: Literal["cancelled", "failed"]
     reason: Annotated[str, Field(min_length=1, max_length=2048)]
@@ -1003,6 +1009,29 @@ def create_app(config: AppConfig) -> FastAPI:
         with _access(request, project_id=pid) as access:
             access.store.get_requirement(pid, rid)
             return _activity_rows(access.conn, pid, rid, limit)
+
+    @router.get("/projects/{pid}/requirements/{rid}/integration")
+    def requirement_integration(pid: str, rid: str, request: Request):
+        """Which acceptance items the accepted deliveries cover, and who checked this bundle.
+
+        The requester should not be the one to notice that a covered acceptance item went
+        uncovered: this is the reading of the bundle a manager makes before it is put in front of
+        anybody else, so both halves are shown here rather than only the yes.
+        """
+        with _access(request, project_id=pid) as access:
+            access.store.get_requirement(pid, rid)
+            return {"report": app.state.reviews.integration_report(access.store, pid, rid),
+                    "verdicts": [asdict(entry) for entry in
+                                 access.store.list_requirement_integrations(pid, rid)]}
+
+    @router.post("/projects/{pid}/requirements/{rid}/integration")
+    def record_integration(pid: str, rid: str, body: IntegrationDecision, request: Request):
+        """A manager says whether this exact bundle is fit to be signed for, or goes back."""
+        with _access(request, project_id=pid, write=True) as access:
+            requirement = app.state.reviews.record_integration(
+                access, project_id=pid, requirement_id=rid, decision=body.decision,
+                reason=body.reason, expected_version=body.expected_version)
+            return asdict(requirement)
 
     @router.get("/projects/{pid}/requirements/{rid}/delivery")
     def requirement_delivery(pid: str, rid: str, request: Request):

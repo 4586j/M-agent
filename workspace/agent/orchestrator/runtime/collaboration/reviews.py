@@ -22,13 +22,15 @@ from .store import REQUIREMENT_TRANSITIONS, CollaborationStore, _choice, _text, 
 CAPABILITY = "security:approve"
 CONFIRM_DECISIONS = ("confirmed", "changes_requested")
 ACCEPT_DECISIONS = ("accepted", "changes_requested")
+INTEGRATION_DECISIONS = ("passed", "returned")
 # Both of these send a work item back to the queue: a returned delivery carries its note to
 # the next attempt, while a failed one is retried with the very same frozen inputs.
 REWORKABLE_STATUSES = ("changes_requested", "failed")
 # A requirement is still delivering while its own work items can move it. This is exactly the set
 # the resident host re-derives on a timer, and the only set a person may advance by hand, so the
-# two paths cannot disagree about what "in progress" means.
-DELIVERING_STATUSES = ("executing", "rework", "awaiting_acceptance")
+# two paths cannot disagree about what "in progress" means. ``integrating`` belongs here: an
+# accepted delivery that nobody has checked yet is still the team's business, not the requester's.
+DELIVERING_STATUSES = ("executing", "rework", "integrating", "awaiting_acceptance")
 # Only these two states hold dispatch authority, so they are the only ones a pause can stop:
 # ``planning_blocked`` has nothing to dispatch, and ``awaiting_acceptance`` is waiting on a person
 # rather than on work.
@@ -558,6 +560,37 @@ class ReviewService:
                     _canonical({"items": entries}).encode("utf-8")).hexdigest(),
                 "items": entries}
 
+    def _coverage(self, store: CollaborationStore, project_id: str, requirement_id: str,
+                  bundle: dict) -> dict:
+        """Which acceptance items the accepted deliveries cover, and which nobody covers.
+
+        A published plan covers every acceptance item of its revision, so while a requirement
+        really sits in ``integrating`` this list comes out fully covered — the value of reading it
+        is that the person signing sees the mapping instead of taking it on faith. It starts
+        showing gaps as soon as a covering delivery stops being accepted, which is what a return
+        or a cancellation does, and that is what the requester should not have to notice by
+        reading the original text against the bundle themselves.
+        """
+        plan = store.published_plan(project_id, requirement_id)
+        covered: dict[str, list[str]] = {}
+        for entry in bundle["items"]:
+            if entry["status"] != "accepted":
+                continue
+            for item in entry["acceptance"]:
+                covered.setdefault(item["item_id"], []).append(entry["key"])
+        acceptance = [{"item_id": item.item_id, "text": item.text,
+                       "covered_by": sorted(covered.get(item.item_id, []))}
+                      for item in store.list_acceptance_items(project_id, requirement_id,
+                                                              plan.revision_id)]
+        return {"evidence_hash": bundle["evidence_hash"], "revision_id": plan.revision_id,
+                "acceptance": acceptance,
+                "uncovered": [entry["item_id"] for entry in acceptance if not entry["covered_by"]]}
+
+    def integration_report(self, store: CollaborationStore, project_id: str,
+                           requirement_id: str) -> dict:
+        return self._coverage(store, project_id, requirement_id,
+                              self.delivery_bundle(store, project_id, requirement_id))
+
     def requirement_target(self, store: CollaborationStore, project_id: str,
                            requirement_id: str) -> str:
         """What this requirement's own work items say right now.
@@ -565,11 +598,17 @@ class ReviewService:
         One rule serves both the person who asks from the panel and the host that asks on a
         timer, so an automatic round can never disagree with the manual one. ``delivery_bundle``
         refuses a requirement without a published plan, so only delivered work answers here.
+        Everything accepted is not yet the requester's turn: it stops at ``integrating`` until a
+        manager has put a signature against this exact bundle digest.
         """
-        statuses = {entry["status"] for entry in
-                    self.delivery_bundle(store, project_id, requirement_id)["items"]}
+        bundle = self.delivery_bundle(store, project_id, requirement_id)
+        statuses = {entry["status"] for entry in bundle["items"]}
         if statuses == {"accepted"}:
-            return "awaiting_acceptance"
+            verdict = store.latest_requirement_integration(project_id, requirement_id)
+            if (verdict is not None and verdict.decision == "passed"
+                    and verdict.evidence_hash == bundle["evidence_hash"]):
+                return "awaiting_acceptance"
+            return "integrating"
         if statuses & set(REWORKABLE_STATUSES):
             return "rework"
         return "executing"
@@ -592,6 +631,66 @@ class ReviewService:
         record_audit(access.conn, now, access.user.user_id, f"requirement.{target}",
                      requirement_id, project_id=project_id, target_version=updated.version)
         return updated
+
+    def record_integration(self, access: Access, *, project_id: str, requirement_id: str,
+                           decision: str, expected_version: int, reason: str = "") -> Requirement:
+        """A manager says whether this bundle is fit to be put in front of the requester.
+
+        The verdict is bound to the bundle digest it was made against, so an earlier sign-off
+        cannot carry a later round: new accepted work moves the digest and the requirement comes
+        back here. A return re-opens every accepted item, the same way the requester's own return
+        does, because the published plan already carries the next round and the original text is
+        not rewritten. Which acceptance item the bundle covers is a fact the plan already
+        guarantees here — a published plan covers every one of them and this step is only reached
+        once all of them are accepted — so the check is shown by ``integration_report`` rather
+        than enforced by this write.
+        """
+        verdict = _choice(decision, INTEGRATION_DECISIONS, "decision")
+        explanation = self._reason(reason)
+        if verdict == "returned" and not explanation.strip():
+            raise ValidationError("A returned integration must say what the delivery missed")
+        member = self._member(access, project_id)
+        if member.access_role not in MANAGER_ROLES:
+            raise Forbidden("Only a project manager can record the integration check")
+        requirement = access.store.get_requirement(project_id, requirement_id)
+        bundle = self.delivery_bundle(access.store, project_id, requirement_id)
+        if self._integrated_already(access, requirement, verdict, bundle["evidence_hash"]):
+            return requirement
+        if requirement.status != "integrating":
+            raise InvalidState("Requirement is not awaiting an integration check")
+        _version(requirement.version, expected_version)
+        now = self.clock()
+        if verdict == "returned":
+            for entry in bundle["items"]:
+                stored = access.store.get_work_item(project_id, entry["work_item_id"])
+                reopened = access.store.advance_work_item(entry["work_item_id"],
+                                                          status="changes_requested",
+                                                          expected_version=stored.version,
+                                                          updated_at=now)
+                record_audit(access.conn, now, access.user.user_id, "work_item.changes_requested",
+                             entry["work_item_id"], project_id=project_id,
+                             target_version=reopened.version)
+        target = "awaiting_acceptance" if verdict == "passed" else "rework"
+        updated = access.store.set_requirement_status(project_id, requirement_id, status=target,
+                                                      expected_version=requirement.version,
+                                                      updated_at=now)
+        access.store.add_requirement_integration(
+            project_id, requirement_id, actor_user_id=access.user.user_id, decision=verdict,
+            evidence_hash=bundle["evidence_hash"], reason=explanation, created_at=now)
+        record_audit(access.conn, now, access.user.user_id, f"integration.{verdict}",
+                     requirement_id, project_id=project_id, target_version=updated.version)
+        return updated
+
+    def _integrated_already(self, access: Access, requirement: Requirement, verdict: str,
+                            evidence_hash: str) -> bool:
+        """Is this the verdict this bundle already got? Then the retry writes nothing: a second
+        click must not reopen work that is already back in the queue."""
+        if requirement.status != ("awaiting_acceptance" if verdict == "passed" else "rework"):
+            return False
+        latest = access.store.latest_requirement_integration(requirement.project_id,
+                                                             requirement.requirement_id)
+        return (latest is not None and latest.decision == verdict
+                and latest.evidence_hash == evidence_hash)
 
     def accept_requirement(self, access: Access, *, project_id: str, requirement_id: str,
                            decision: str, expected_version: int, reason: str = "") -> Requirement:

@@ -1849,6 +1849,7 @@ def test_the_requester_signs_for_the_requirement_delivery_over_http(api):
     wid = plan["work_items"][0]["work_item_id"]
     actions = f"/projects/{pid}/requirements/{requirement_id}/actions"
     delivery = f"/projects/{pid}/requirements/{requirement_id}/delivery"
+    integration = f"/projects/{pid}/requirements/{requirement_id}/integration"
     acceptance = f"/projects/{pid}/requirements/{requirement_id}/acceptance"
 
     reported = checked(api.send(None, "POST", base + "/result",
@@ -1874,20 +1875,48 @@ def test_the_requester_signs_for_the_requirement_delivery_over_http(api):
               409)
     checked(api.send("outsider", "POST", actions,
                      json={"action": "advance", "expected_version": requirement["version"]}), 404)
-    waiting = checked(api.send("member", "POST", actions,
-                               json={"action": "advance",
-                                     "expected_version": requirement["version"]}))
-    assert waiting["status"] == "awaiting_acceptance"
+    stopping = checked(api.send("member", "POST", actions,
+                                json={"action": "advance",
+                                      "expected_version": requirement["version"]}))
+    # 交付齐了先停在 integrating：提出人签字之前，得有人对着原文核过一次覆盖。
+    assert stopping["status"] == "integrating"
     checked(api.send("member", "POST", actions,
-                     json={"action": "advance", "expected_version": waiting["version"]}))
+                     json={"action": "advance", "expected_version": stopping["version"]}))
     checked(api.send("outsider", "GET", delivery), 404)
     view = checked(api.send("member", "GET", delivery))
-    assert (view["requirement"]["status"], view["acceptances"]) == ("awaiting_acceptance", [])
+    assert (view["requirement"]["status"], view["acceptances"]) == ("integrating", [])
     assert [(entry["key"], entry["status"], entry["attempt_number"], entry["artifacts"])
             for entry in view["delivery"]["items"]] == [("A", "accepted", 1, [])]
     assert view["delivery"]["items"][0]["acceptance"] == [
         {"item_id": "AC-001", "text": "第一条验收"}]
     assert view["delivery"]["items"][0]["result_hash"] == reported["attempt"]["result_hash"]
+
+    # 核对报告把「哪条验收由哪个工作项交付」摆出来，签的人不用自己对着原文数。
+    report = checked(api.send("member", "GET", integration))
+    assert report["report"] == {"evidence_hash": view["delivery"]["evidence_hash"],
+                                "revision_id": plan["plan"]["revision_id"],
+                                "acceptance": [{"item_id": "AC-001", "text": "第一条验收",
+                                                "covered_by": ["A"]}], "uncovered": []}
+    assert report["verdicts"] == []
+
+    checked(api.send("outsider", "POST", integration,
+                     json={"decision": "passed", "expected_version": stopping["version"]}), 404)
+    checked(api.send("member", "POST", integration,
+                     json={"decision": "passed", "expected_version": stopping["version"]}), 403)
+    checked(api.send("manager", "POST", integration,
+                     json={"decision": "approved", "expected_version": stopping["version"]}), 422)
+    # 退回要写清缺了哪一条：下一轮执行的人只能照着这句话改。
+    checked(api.send("manager", "POST", integration,
+                     json={"decision": "returned", "expected_version": stopping["version"]}), 422)
+    checked(api.send("manager", "POST", integration,
+                     json={"decision": "passed", "expected_version": stopping["version"] + 3}), 409)
+    waiting = checked(api.send("manager", "POST", integration,
+                               json={"decision": "passed",
+                                     "expected_version": stopping["version"]}))
+    assert waiting["status"] == "awaiting_acceptance"
+    assert [(entry["decision"], entry["actor_user_id"], entry["reason"]) for entry in
+            checked(api.send("member", "GET", integration))["verdicts"]] == [
+        ("passed", api.identities["manager"]["user"]["user_id"], "")]
 
     checked(api.send("manager", "POST", acceptance,
                      json={"decision": "accepted", "expected_version": waiting["version"]}), 403)
@@ -1937,10 +1966,13 @@ def test_a_returned_requirement_reopens_its_items_and_informs_the_next_attempt(a
     checked(api.send("manager", "POST", f"/projects/{pid}/work-items/{wid}/accept",
                      json={"decision": "accepted", "expected_version": item["version"]}))
     requirement = checked(api.send("member", "GET", base))
-    waiting = checked(api.send("member", "POST", actions,
-                               json={"action": "advance",
-                                     "expected_version": requirement["version"]}))
-    assert waiting["status"] == "awaiting_acceptance"
+    stopping = checked(api.send("member", "POST", actions,
+                                json={"action": "advance",
+                                      "expected_version": requirement["version"]}))
+    waiting = checked(api.send("manager", "POST", f"{base}/integration",
+                               json={"decision": "passed",
+                                     "expected_version": stopping["version"]}))
+    assert (stopping["status"], waiting["status"]) == ("integrating", "awaiting_acceptance")
     refused = checked(api.send("member", "GET", delivery))["delivery"]["evidence_hash"]
 
     checked(api.send("outsider", "POST", sign,
@@ -2116,14 +2148,78 @@ def test_inbox_to_dos_lead_to_working_endpoints(api):
                                                       "expected_version": item["version"]}))
     assert owed("manager") == []
     requirement = checked(api.send("member", "GET", base))
-    checked(api.send("member", "POST", f"{base}/actions",
-                     json={"action": "advance", "expected_version": requirement["version"]}))
+    stopping = checked(api.send("member", "POST", f"{base}/actions",
+                                json={"action": "advance",
+                                      "expected_version": requirement["version"]}))
+    assert stopping["status"] == "integrating"
+    check = f"{base}/integration"
+    # 交付停在 integrating 时，欠的是项目管理者的一次覆盖核对，不是提出人的签字。
+    assert owed("manager") == [("integration_check", "record_integration", check)]
+    assert owed("member") == []
+    checked(api.send("manager", "POST", check, json={"decision": "passed",
+                                                     "expected_version": stopping["version"]}))
     final = f"{base}/acceptance"
     assert owed("member") == [("final_acceptance", "accept_requirement", final)]
+    assert owed("manager") == []
     waiting = checked(api.send("member", "GET", base))
     checked(api.send("member", "POST", final, json={"decision": "accepted",
                                                     "expected_version": waiting["version"]}))
     assert owed("member") == [] and owed("manager") == []
+
+
+def test_an_integration_return_reopens_the_delivery_and_tells_the_people(api):
+    # 核对退回去的是整份交付：待办换到执行侧，原文一个字不改，动态里说得出是谁退的。
+    seen = delivered(api)
+    pid = seen.project["project_id"]
+    wid = seen.plan["work_items"][0]["work_item_id"]
+    base = f"/projects/{pid}/requirements/{seen.requirement_id}"
+
+    def owed(actor):
+        return [(entry["item_type"], entry["action"], entry["href"]) for entry in
+                checked(api.send(actor, "GET", "/inbox"))
+                if not entry["item_type"].startswith("requirement_")]
+
+    checked(api.send("member", "POST", delivery_path(pid, seen.attempt.attempt_id),
+                     json={"decision": "confirmed", "expected_version": seen.reported["version"]}))
+    item = checked(api.send("manager", "GET", plans_path(seen.project, seen.requirement_id)
+                            + f"/{seen.plan['plan']['plan_id']}"))["work_items"][0]
+    checked(api.send("manager", "POST", f"/projects/{pid}/work-items/{wid}/accept",
+                     json={"decision": "accepted", "expected_version": item["version"]}))
+    requirement = checked(api.send("member", "GET", base))
+    stopping = checked(api.send("member", "POST", f"{base}/actions",
+                                json={"action": "advance",
+                                      "expected_version": requirement["version"]}))
+    assert stopping["status"] == "integrating"
+
+    returned = checked(api.send("manager", "POST", f"{base}/integration",
+                                json={"decision": "returned", "reason": "灰度开关整条没做",
+                                      "expected_version": stopping["version"]}))
+    assert (returned["status"], returned["version"]) == ("rework", stopping["version"] + 1)
+    assert work_item_statuses(api, seen.project, seen.requirement_id, seen.plan) == [
+        "changes_requested"]
+    assert owed("manager") == [(
+        "rework_queue", "rework_work_item", f"/projects/{pid}/work-items/{wid}/rework")]
+    assert owed("member") == []
+    after = checked(api.send("member", "GET", base))
+    assert after["current_revision_id"] == requirement["current_revision_id"]
+
+    rows = checked(api.send("member", "GET", f"{base}/activity?limit=200"))
+    actions = {entry["action"] for entry in rows}
+    assert {"requirement.integrating", "integration.returned"} <= actions
+    source = (RUNTIME / "collaboration" / "web" / "app.js").read_text(encoding="utf-8")
+    block = source.split("const NEWS = {", 1)[1].split("\n};", 1)[0]
+    named = set(re.findall(r'^  "([\w.]+)":', block, re.MULTILINE))
+    assert actions <= named
+    # 提出人没签这一次退回，但退回的消息是他的：动态把它送到眼前，不用他刷新页面去猜。
+    assert "integration.returned" in {entry["action"] for entry in
+                                      checked(api.send("member", "GET", "/feed?limit=200"))}
+    # 交付被退回后报告如实说"没有已验收的工作项盖住这一条"：它列事实，不替人判断。
+    view = checked(api.send("member", "GET", f"{base}/integration"))
+    assert [entry["decision"] for entry in view["verdicts"]] == ["returned"]
+    assert view["verdicts"][0]["reason"] == "灰度开关整条没做"
+    assert view["report"]["acceptance"] == [
+        {"item_id": "AC-001", "text": "第一条验收", "covered_by": []}]
+    assert view["report"]["uncovered"] == ["AC-001"]
 
 
 def test_a_to_do_stays_owed_after_the_person_marks_it_read(api):

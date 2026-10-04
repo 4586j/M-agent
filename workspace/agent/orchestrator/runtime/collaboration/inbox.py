@@ -45,10 +45,16 @@ ACTIONS = {
                      "/projects/{project_id}/work-items/{work_item_id}/rework", {}),
     "final_acceptance": ("accept_requirement",
                          "/projects/{project_id}/requirements/{requirement_id}/acceptance", {}),
+    # A delivery that has stopped being somebody's work has to become somebody's check: it is
+    # owed to the project's managers, who are the only ones allowed to record the verdict.
+    "integration_check": ("record_integration",
+                          "/projects/{project_id}/requirements/{requirement_id}/integration",
+                          {"coverage": "/projects/{project_id}/requirements/{requirement_id}"
+                                       "/integration"}),
 }
 
 # The drafting to-dos come from a different projection, so they arrive as bare requirement rows
-# without an action to take. They get the same promise as the six above: this is the write that
+# without an action to take. They get the same promise as the seven above: this is the write that
 # clears me, and this is the version of mine that it has to be made against. Both of them are
 # decided on the reviews endpoint, and both of them link to the text the decision is made about.
 DRAFT_ACTIONS = {

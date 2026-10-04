@@ -209,6 +209,18 @@ class RequirementPause:
 
 
 @dataclass(frozen=True)
+class RequirementIntegration:
+    integration_id: str
+    project_id: str
+    requirement_id: str
+    actor_user_id: str
+    decision: str
+    evidence_hash: str
+    reason: str = ""
+    created_at: float = 0.0
+
+
+@dataclass(frozen=True)
 class RevisionAcceptanceItem:
     revision_id: str
     requirement_id: str

@@ -14,6 +14,10 @@ const DECISIONS = {
   final_acceptance: {title: "最终验收", field: "decision", reason: true,
                      hint: "退回时必填：写下整篇交付缺了什么",
                      choices: [["accepted", "签字验收"], ["changes_requested", "退回整篇交付"]]},
+  integration_check: {title: "集成核对", field: "decision",
+                      reason: true, hint: "退回时必填：写下缺了哪一条验收",
+                      choices: [["passed", "核对通过，交给提出人"], ["returned", "退回返工"]],
+                      look: "coverage", lookLabel: "查看覆盖核对", shown: showCoverage},
   rework_queue: {title: "重新排队", field: null, reason: false, choices: []},
   worker_attention: {title: "执行机失联（租约已过期）", field: null, reason: true, choices: [],
                      hint: "写下你看到的实情（可留空）",
@@ -42,6 +46,9 @@ const NEWS = {
   "requirement.executing": "进入执行",
   "requirement.awaiting_acceptance": "整篇交付等提出人签字",
   "requirement.rework": "退回返工",
+  "requirement.integrating": "交付齐了，等人核对覆盖",
+  "integration.passed": "核对过覆盖，可以签字了",
+  "integration.returned": "被核对退回，说清了缺哪一条",
   "requirement.completed": "已签字验收",
   "requirement.cancelling": "进入取消流程",
   "requirement.cancelled": "已取消",
@@ -272,6 +279,20 @@ function showRevision(parent, revision) {
 function showMessage(parent, message) {
   add(parent, "dd", null, `${message.role === "user" ? "提出人" : "助手"} · `
                           + `${when(message.created_at)} · ${message.content}`);
+}
+
+function showCoverage(parent, view) {
+  // 核对的是"原文的每一条验收有没有被这份交付盖住"，所以两边都要摊开：映射，和已经签过的裁定。
+  for (const item of view.report.acceptance) {
+    add(parent, "dd", null, `${item.item_id} · ${item.text} · `
+        + (item.covered_by.length ? `由 ${item.covered_by.join("、")} 交付` : "没有已验收的工作项覆盖"));
+  }
+  add(parent, "dd", "locator", `本次交付摘要 ${view.report.evidence_hash}`);
+  for (const verdict of view.verdicts) {
+    add(parent, "dd", null, `${verdict.decision === "passed" ? "核对通过" : "退回返工"} · `
+        + `摘要 ${verdict.evidence_hash} · ${when(verdict.created_at)}`
+        + ` · ${verdict.reason || "没有留下理由"}`);
+  }
 }
 
 function renderChoice(form, entry, spec) {
@@ -554,7 +575,7 @@ async function renderRequirement(projectId, requirementId) {
   if (["executing", "rework", "paused"].includes(requirement.status)) {
     renderPauseState(block, requirement, await get(`${path}/pauses`));
   }
-  if (["executing", "rework", "awaiting_acceptance"].includes(requirement.status)) {
+  if (["executing", "rework", "integrating", "awaiting_acceptance"].includes(requirement.status)) {
     const advance = add(block, "button", null, "按工作项事实汇总需求进度");
     advance.type = "button";
     advance.addEventListener("click", async () => {

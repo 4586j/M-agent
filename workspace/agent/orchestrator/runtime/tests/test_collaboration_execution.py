@@ -480,6 +480,82 @@ def test_v10_migration_failure_leaves_the_file_untouched(tmp_path, monkeypatch):
     assert CollaborationStore(Database(path)).get_user("old-user").version == 1
 
 
+def make_v10_database(path):
+    """A v10 file that already holds one pause entry, so v10 -> v11 is what gets tested."""
+    make_v9_database(path)
+    with closing(sqlite3.connect(path, isolation_level=None)) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        for statement in database_module._PAUSE_SCHEMA:
+            conn.execute(statement)
+        conn.execute("INSERT INTO requirement_pauses(pause_id,project_id,requirement_id,"
+                     "actor_user_id,action,reason,created_at) "
+                     "VALUES('old-pause','old-project','old-requirement','old-user','paused',"
+                     "'等外部接口答复',3600.0)")
+        conn.execute("PRAGMA user_version=10")
+        conn.commit()
+
+
+def test_v10_database_upgrades_to_v11_without_losing_the_pause_journal(tmp_path):
+    path = tmp_path / "v11.sqlite3"
+    make_v10_database(path)
+    database = Database(path)
+    with pytest.raises(database_module.SchemaVersionError):
+        with database.read():
+            pytest.fail("Migration must be explicit")
+    database.initialize()
+    with database.read() as conn:
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+        assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+        assert "requirement_integrations" in {row[0] for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+        assert conn.execute("SELECT reason FROM requirement_pauses "
+                            "WHERE pause_id='old-pause'").fetchone()[0] == "等外部接口答复"
+        stored = conn.execute("SELECT decision,reason FROM requirement_acceptance "
+                              "WHERE acceptance_id='old-signature'").fetchone()
+    assert (stored["decision"], stored["reason"]) == ("accepted", "全部验收项已核对")
+    with database.transaction() as conn:
+        conn.execute("INSERT INTO requirement_integrations(integration_id,project_id,"
+                     "requirement_id,actor_user_id,decision,evidence_hash,reason,created_at) "
+                     "VALUES('old-integration','old-project','old-requirement','old-user','passed',"
+                     "?, '',3700.0)", ("f" * 64,))
+    # 裁定是证据：写进去就不能改写、不能删，也不能挂到一个不属于该项目的成员上。
+    with pytest.raises(sqlite3.IntegrityError):
+        with database.transaction() as conn:
+            conn.execute("UPDATE requirement_integrations SET decision='returned' "
+                         "WHERE integration_id='old-integration'")
+    with pytest.raises(sqlite3.IntegrityError):
+        with database.transaction() as conn:
+            conn.execute("DELETE FROM requirement_integrations WHERE integration_id="
+                         "'old-integration'")
+    with pytest.raises(sqlite3.IntegrityError):
+        with database.transaction() as conn:
+            conn.execute("INSERT INTO requirement_integrations(integration_id,project_id,"
+                         "requirement_id,actor_user_id,decision,evidence_hash,reason,created_at) "
+                         "VALUES('x','old-project','old-requirement','no-such-user','passed',?,'',"
+                         "3700.0)", ("f" * 64,))
+    # 摘要不是装饰：一条不完整的哈希签不了任何一份交付。
+    with pytest.raises(sqlite3.IntegrityError):
+        with database.transaction() as conn:
+            conn.execute("INSERT INTO requirement_integrations(integration_id,project_id,"
+                         "requirement_id,actor_user_id,decision,evidence_hash,reason,created_at) "
+                         "VALUES('x','old-project','old-requirement','old-user','passed','短','',"
+                         "3700.0)")
+
+
+def test_v11_migration_failure_leaves_the_file_untouched(tmp_path, monkeypatch):
+    path = tmp_path / "v10.sqlite3"
+    make_v10_database(path)
+    before = path.read_bytes()
+    with monkeypatch.context() as patch:
+        patch.setattr(database_module, "_INTEGRATION_SCHEMA",
+                      database_module._INTEGRATION_SCHEMA[:1] + ("INVALID SQL",))
+        with pytest.raises(sqlite3.OperationalError):
+            Database(path).initialize()
+    assert path.read_bytes() == before
+    Database(path).initialize()
+    assert CollaborationStore(Database(path)).get_user("old-user").version == 1
+
+
 # --- instance registration ----------------------------------------------------
 
 def test_worker_url_is_registered_and_rejects_extra_callback_targets(team):
@@ -2087,6 +2163,15 @@ def accept_item(team, project_id, item, token, *, attempt=None, summary="已按�
     return team.store.get_attempt(project_id, reported.attempt.attempt_id)
 
 
+def integrated(team, project_id, requirement_id, *, decision="passed", reason="", who=None):
+    """A manager records the coverage check on the delivered bundle, the gate before signing."""
+    with session(team, who or team.reviewer) as access:
+        current = access.store.get_requirement(project_id, requirement_id)
+        return team.reviews.record_integration(access, project_id=project_id,
+                                               requirement_id=requirement_id, decision=decision,
+                                               reason=reason, expected_version=current.version)
+
+
 def test_cancelling_a_requirement_stops_in_flight_work_and_returns_the_unspent_share(team):
     outsider = team.store.create_user("局外人")
     requirement, plan, _instance, token = reserved_plan(
@@ -2290,9 +2375,12 @@ def test_the_requirement_aggregates_to_acceptance_and_the_requester_signs(team):
     assert unchanged == requirement
     accept_item(team, project_id, item_b, token)
     with session(team, team.requester) as access:
-        waiting = team.reviews.advance_requirement(access, project_id=project_id,
-                                                   requirement_id=requirement_id,
-                                                   expected_version=unchanged.version)
+        stopping = team.reviews.advance_requirement(access, project_id=project_id,
+                                                    requirement_id=requirement_id,
+                                                    expected_version=unchanged.version)
+    # 全部 accepted 只说明"活干完了"，不说明"有人对着原文核过覆盖"：交付先停在 integrating。
+    assert stopping.status == "integrating"
+    waiting = integrated(team, project_id, requirement_id)
     assert waiting.status == "awaiting_acceptance"
     with session(team, team.requester) as access:
         bundle = team.reviews.delivery_bundle(access.store, project_id, requirement_id)
@@ -2359,6 +2447,161 @@ def test_the_requirement_aggregates_to_acceptance_and_the_requester_signs(team):
                          (rows[0].acceptance_id,))
 
 
+def test_an_accepted_bundle_waits_for_a_manager_before_the_requester_signs(team):
+    requirement, plan, _instance, token = reserved_plan(team, plan_item(team, "A", estimate=5))
+    project_id, requirement_id = requirement.project_id, requirement.requirement_id
+    item = work_item(team, plan, "A")
+    accept_item(team, project_id, item, token)
+    with session(team, team.requester) as access:
+        stopping = team.reviews.advance_requirement(access, project_id=project_id,
+                                                    requirement_id=requirement_id,
+                                                    expected_version=requirement.version)
+        bundle = team.reviews.delivery_bundle(access.store, project_id, requirement_id)
+    assert stopping.status == "integrating"
+    # 提出人此刻手里还没有签核对象：字要等在有人对着原文核过这一版交付的覆盖之后才签。
+    assert todos(team, team.requester) == []
+    outsider = team.store.create_user("局外人")
+    with session(team, outsider) as access, pytest.raises(NotFound):
+        team.reviews.record_integration(access, project_id=project_id,
+                                        requirement_id=requirement_id, decision="passed",
+                                        expected_version=stopping.version)
+    with session(team, team.requester) as access:
+        # 核对由项目管理者签：提出人不能替项目签这一步，否则签字就成了自我确认。
+        with pytest.raises(Forbidden):
+            team.reviews.record_integration(access, project_id=project_id,
+                                            requirement_id=requirement_id, decision="passed",
+                                            expected_version=stopping.version)
+        with pytest.raises(ValidationError):
+            team.reviews.record_integration(access, project_id=project_id,
+                                            requirement_id=requirement_id, decision="approved",
+                                            expected_version=stopping.version)
+    with session(team, team.reviewer) as access:
+        # 管理者也得对着当前版本签：版本不对就拒掉，而不是把一份陈旧视图写成裁定。
+        with pytest.raises(Conflict):
+            team.reviews.record_integration(access, project_id=project_id,
+                                            requirement_id=requirement_id, decision="passed",
+                                            expected_version=stopping.version + 2)
+        # 退回要写清缺了哪一条：下一轮执行的人只能照着这句话改。
+        with pytest.raises(ValidationError):
+            team.reviews.record_integration(access, project_id=project_id,
+                                            requirement_id=requirement_id, decision="returned",
+                                            expected_version=stopping.version)
+    waiting = integrated(team, project_id, requirement_id, reason="对照原文，两条验收都在")
+    assert (waiting.status, waiting.version) == ("awaiting_acceptance", stopping.version + 1)
+    rows = team.store.list_requirement_integrations(project_id, requirement_id)
+    assert [(row.decision, row.actor_user_id, row.evidence_hash, row.reason) for row in rows] == [
+        ("passed", team.reviewer.user_id, bundle["evidence_hash"], "对照原文，两条验收都在")]
+    assert (rows[0].project_id, rows[0].requirement_id) == (project_id, requirement_id)
+    assert audited(team, requirement_id)[-1] == "integration.passed"
+    # 同一个裁定重一次不多写一行，也不推版本：界面刷新不该把已经通过的交付退回队列。
+    replay = integrated(team, project_id, requirement_id)
+    assert (replay.status, replay.version) == ("awaiting_acceptance", waiting.version)
+    assert len(team.store.list_requirement_integrations(project_id, requirement_id)) == 1
+    with session(team, team.reviewer) as access:
+        report = team.reviews.integration_report(access.store, project_id, requirement_id)
+    assert report["evidence_hash"] == bundle["evidence_hash"]
+    assert report["acceptance"] == [{"item_id": "AC-001", "text": "第一条验收", "covered_by": ["A"]},
+                                    {"item_id": "AC-002", "text": "第二条验收", "covered_by": ["A"]}]
+    assert report["uncovered"] == []
+
+
+def test_a_returned_integration_reopens_the_delivery_and_tells_the_next_attempt(team):
+    requirement, plan, _instance, token = reserved_plan(team, plan_item(team, "A", estimate=5))
+    project_id, requirement_id = requirement.project_id, requirement.requirement_id
+    item = work_item(team, plan, "A")
+    first = accept_item(team, project_id, item, token)
+    with session(team, team.requester) as access:
+        stopping = team.reviews.advance_requirement(access, project_id=project_id,
+                                                    requirement_id=requirement_id,
+                                                    expected_version=requirement.version)
+    delivered_version = team.store.get_work_item(project_id, item.work_item_id).version
+    returned = integrated(team, project_id, requirement_id, decision="returned",
+                          reason="第二条验收没做，缺灰度开关")
+    assert (returned.status, returned.version) == ("rework", stopping.version + 1)
+    reopened = team.store.get_work_item(project_id, item.work_item_id)
+    assert (reopened.status, reopened.version) == ("changes_requested", delivered_version + 1)
+    rows = team.store.list_requirement_integrations(project_id, requirement_id)
+    assert [(row.decision, row.reason) for row in rows] == [
+        ("returned", "第二条验收没做，缺灰度开关")]
+    assert audited(team, requirement_id)[-1] == "integration.returned"
+    # 核对退回去的是工作，不是签字：欠的下一条待办是重新排队，提出人手里仍然没有对象。
+    assert todos(team, team.requester) == []
+    assert todos(team, team.reviewer) == [(
+        "rework_queue", "rework_work_item",
+        f"/projects/{project_id}/work-items/{item.work_item_id}/rework")]
+
+    with session(team, team.reviewer) as access:
+        team.reviews.rework(access, project_id=project_id, work_item_id=item.work_item_id,
+                            expected_version=reopened.version)
+    second = team.make_dispatch(requires_real_data=False).dispatch(project_id, item.work_item_id)
+    payload = json.loads(team.make_execution().package(token, second.attempt_id)[0])
+    assert [(entry["kind"], entry["attempt_number"], entry["reason"], entry["attempt_id"],
+             entry["reviewed_by"]) for entry in payload["rework"]] == [
+        ("requirement_integration", None, "第二条验收没做，缺灰度开关", None, team.reviewer.user_id)]
+    assert second.input_hash != first.input_hash
+
+
+def test_an_integration_verdict_carries_only_the_bundle_it_was_made_against(team):
+    requirement, plan, _instance, token = reserved_plan(team, plan_item(team, "A", estimate=5))
+    project_id, requirement_id = requirement.project_id, requirement.requirement_id
+    item = work_item(team, plan, "A")
+    accept_item(team, project_id, item, token)
+    with session(team, team.requester) as access:
+        stopping = team.reviews.advance_requirement(access, project_id=project_id,
+                                                    requirement_id=requirement_id,
+                                                    expected_version=requirement.version)
+    waiting = integrated(team, project_id, requirement_id)
+    assert (stopping.status, waiting.status) == ("integrating", "awaiting_acceptance")
+    with session(team, team.requester) as access:
+        returned = team.reviews.accept_requirement(access, project_id=project_id,
+                                                   requirement_id=requirement_id,
+                                                   decision="changes_requested", reason="再来一轮",
+                                                   expected_version=waiting.version)
+    with session(team, team.reviewer) as access:
+        reopened = team.store.get_work_item(project_id, item.work_item_id)
+        team.reviews.rework(access, project_id=project_id, work_item_id=item.work_item_id,
+                            expected_version=reopened.version)
+    second = team.make_dispatch(requires_real_data=False).dispatch(project_id, item.work_item_id)
+    accept_item(team, project_id, item, token, attempt=second)
+    with session(team, team.requester) as access:
+        again = team.reviews.advance_requirement(access, project_id=project_id,
+                                                 requirement_id=requirement_id,
+                                                 expected_version=returned.version)
+    # 旧的"核对通过"绑的是上一版的交付摘要：新尝试换了哈希，签名不会替它放行。
+    assert again.status == "integrating"
+    assert todos(team, team.requester) == []
+    assert len(team.store.list_requirement_integrations(project_id, requirement_id)) == 1
+    waiting_again = integrated(team, project_id, requirement_id)
+    rows = team.store.list_requirement_integrations(project_id, requirement_id)
+    assert [row.decision for row in rows] == ["passed", "passed"]
+    assert rows[1].evidence_hash != rows[0].evidence_hash
+    assert waiting_again.status == "awaiting_acceptance"
+
+
+def test_an_integrating_requirement_can_be_cancelled_but_not_paused(team):
+    requirement, plan, _instance, token = reserved_plan(team, plan_item(team, "A", estimate=5))
+    project_id, requirement_id = requirement.project_id, requirement.requirement_id
+    accept_item(team, project_id, work_item(team, plan, "A"), token)
+    with session(team, team.requester) as access:
+        stopping = team.reviews.advance_requirement(access, project_id=project_id,
+                                                    requirement_id=requirement_id,
+                                                    expected_version=requirement.version)
+    # 暂停停的是"还没开始的派发"，核对这一步本来就不派发，所以没有可停的手。
+    with session(team, team.requester) as access, pytest.raises(InvalidState):
+        team.reviews.pause_requirement(access, project_id=project_id, requirement_id=requirement_id,
+                                       reason="等一次演示", expected_version=stopping.version)
+    with session(team, team.reviewer) as access:
+        cancelled = team.reviews.cancel_requirement(access, project_id=project_id,
+                                                   requirement_id=requirement_id,
+                                                   reason="决定不做了",
+                                                   expected_version=stopping.version)
+        with pytest.raises(InvalidState):
+            team.reviews.record_integration(access, project_id=project_id,
+                                            requirement_id=requirement_id, decision="passed",
+                                            expected_version=cancelled.version)
+    assert cancelled.status == "cancelled"
+
+
 def test_a_requirement_return_is_refused_while_a_delivery_is_still_in_play(team):
     requirement, plan, _instance, token = reserved_plan(
         team, plan_item(team, "A", estimate=5), plan_item(team, "B", estimate=3))
@@ -2398,11 +2641,14 @@ def test_a_requirement_return_is_refused_while_a_delivery_is_still_in_play(team)
         again = team.reviews.advance_requirement(access, project_id=project_id,
                                                  requirement_id=requirement_id,
                                                  expected_version=reworking.version)
+    waiting = integrated(team, project_id, requirement_id)
+    with session(team, team.requester) as access:
         signed = team.reviews.accept_requirement(access, project_id=project_id,
                                                  requirement_id=requirement_id,
                                                  decision="accepted",
-                                                 expected_version=again.version)
-    assert (again.status, signed.status) == ("awaiting_acceptance", "completed")
+                                                 expected_version=waiting.version)
+    assert (again.status, waiting.status, signed.status) == (
+        "integrating", "awaiting_acceptance", "completed")
     second_b = team.store.list_attempts(project_id, item_b.work_item_id)[-1]
     with session(team, team.reviewer) as access:
         final = team.reviews.delivery_bundle(access.store, project_id, requirement_id)
@@ -2425,10 +2671,14 @@ def test_a_requirement_return_reopens_every_accepted_item_and_carries_the_next_r
     versions = {key: team.store.get_work_item(project_id, item.work_item_id).version
                 for key, item in (("A", item_a), ("B", item_b))}
     with session(team, team.requester) as access:
-        waiting = team.reviews.advance_requirement(access, project_id=project_id,
-                                                   requirement_id=requirement_id,
-                                                   expected_version=requirement.version)
+        stopping = team.reviews.advance_requirement(access, project_id=project_id,
+                                                    requirement_id=requirement_id,
+                                                    expected_version=requirement.version)
         bundle = team.reviews.delivery_bundle(access.store, project_id, requirement_id)
+    assert stopping.status == "integrating"
+    waiting = integrated(team, project_id, requirement_id)
+    assert waiting.status == "awaiting_acceptance"
+    with session(team, team.requester) as access:
         # 退回必须写清缺了什么：下一轮执行的人只能照着这句话改。
         with pytest.raises(ValidationError):
             team.reviews.accept_requirement(access, project_id=project_id,
@@ -2502,7 +2752,12 @@ def test_a_requirement_return_reopens_every_accepted_item_and_carries_the_next_r
         second_round = team.reviews.advance_requirement(access, project_id=project_id,
                                                         requirement_id=requirement_id,
                                                         expected_version=returned.version)
-    assert second_round.status == "awaiting_acceptance"
+    # 上一轮那次"核对通过"绑的是旧交付摘要：第二轮交付了新的尝试，摘要变了就得重新核一遍，
+    # 所以提出人此时还没有签核对象，直到有人在这份新交付上再签一次。
+    assert second_round.status == "integrating"
+    assert todos(team, team.requester) == []
+    waiting = integrated(team, project_id, requirement_id)
+    assert waiting.status == "awaiting_acceptance"
     assert todos(team, team.requester) == [
         ("final_acceptance", "accept_requirement",
          f"/projects/{project_id}/requirements/{requirement_id}/acceptance")]
@@ -2510,7 +2765,7 @@ def test_a_requirement_return_reopens_every_accepted_item_and_carries_the_next_r
         signed = team.reviews.accept_requirement(access, project_id=project_id,
                                                  requirement_id=requirement_id,
                                                  decision="accepted",
-                                                 expected_version=second_round.version)
+                                                 expected_version=waiting.version)
     assert signed.status == "completed"
     final = team.store.list_requirement_acceptances(project_id, requirement_id)
     assert [entry.decision for entry in final] == ["changes_requested", "accepted"]
@@ -2584,7 +2839,8 @@ def test_a_pause_stops_new_attempts_and_resume_re_reads_the_work_items(team):
         signed_off = team.reviews.resume_requirement(access, project_id=project_id,
                                                      requirement_id=requirement_id,
                                                      expected_version=paused_again.version)
-    assert signed_off.status == "awaiting_acceptance"
+    # 那一格是 integrating：交付收齐了但还没人核对覆盖，还没轮到提出人签字。
+    assert signed_off.status == "integrating"
     with session(team, team.requester) as access, pytest.raises(InvalidState):
         team.reviews.pause_requirement(access, project_id=project_id, requirement_id=requirement_id,
                                        reason="等着人签字，没有在跑",
@@ -2671,6 +2927,14 @@ def test_the_inbox_offers_each_person_only_the_decisions_they_owe(team):
         waiting = team.reviews.advance_requirement(access, project_id=project_id,
                                                   requirement_id=requirement_id,
                                                   expected_version=waiting_for.version)
+    assert waiting.status == "integrating"
+    # 交付停在 integrating 时，欠的不是提出人的签字而是管理者的核对：待办要说清谁欠什么。
+    assert todos(team, team.requester) == []
+    assert todos(team, team.reviewer) == [(
+        "integration_check", "record_integration",
+        f"/projects/{project_id}/requirements/{requirement_id}/integration")]
+    assert todos(team, team.worker) == []
+    waiting = integrated(team, project_id, requirement_id)
     assert waiting.status == "awaiting_acceptance"
     assert todos(team, team.requester) == [(
         "final_acceptance", "accept_requirement",
@@ -2797,7 +3061,7 @@ def host_for(team, *, dispatch=None):
         team.database, reviews=team.reviews, clock=team.clock)
 
 
-def test_the_host_carries_a_finished_delivery_to_the_requester_without_a_click(team):
+def test_the_host_carries_a_finished_delivery_to_the_integration_check_without_a_click(team):
     requirement, plan, _instance, token = reserved_plan(
         team, plan_item(team, "A", estimate=5), plan_item(team, "B", estimate=3))
     project_id, requirement_id = requirement.project_id, requirement.requirement_id
@@ -2807,18 +3071,29 @@ def test_the_host_carries_a_finished_delivery_to_the_requester_without_a_click(t
 
     host = host_for(team)
     assert host.tick(project_id)["requirements_changed"] == 1
-    waiting = team.store.get_requirement(project_id, requirement_id)
-    assert waiting.status == "awaiting_acceptance"
-    assert todos(team, team.requester) == [
-        ("final_acceptance", "accept_requirement",
-         f"/projects/{project_id}/requirements/{requirement_id}/acceptance")]
+    stopping = team.store.get_requirement(project_id, requirement_id)
+    # 宿主把"活都验收了"收敛到 integrating 就停手：核对覆盖是人的裁定，它不代人签。
+    assert stopping.status == "integrating"
+    assert todos(team, team.requester) == []
+    assert todos(team, team.reviewer) == [(
+        "integration_check", "record_integration",
+        f"/projects/{project_id}/requirements/{requirement_id}/integration")]
     with team.database.read() as conn:
         assert conn.execute("SELECT actor_id FROM collaboration_audit WHERE target_id=? "
-                            "AND action='requirement.awaiting_acceptance'",
+                            "AND action='requirement.integrating'",
                             (requirement_id,)).fetchone()[0] is None
     # 第二轮没有新事实就不推版本：宿主收敛的是工作项已经造成的变化，不是自己的心跳。
     assert host.tick(project_id)["requirements_changed"] == 0
-    assert team.store.get_requirement(project_id, requirement_id).version == waiting.version
+    assert team.store.get_requirement(project_id, requirement_id).version == stopping.version
+
+    integrated(team, project_id, requirement_id)
+    # 提出人这一步是管理者的裁定写下的，不是宿主推出来的；宿主随后确认已经没有未收的进度。
+    waiting = team.store.get_requirement(project_id, requirement_id)
+    assert waiting.status == "awaiting_acceptance"
+    assert host.tick(project_id)["requirements_changed"] == 0
+    assert todos(team, team.requester) == [
+        ("final_acceptance", "accept_requirement",
+         f"/projects/{project_id}/requirements/{requirement_id}/acceptance")]
 
 
 class _Rounds:
@@ -2859,7 +3134,7 @@ def test_the_scheduler_command_runs_one_real_round_over_the_seeded_database(team
     assert host_main(["scheduler", "--data-dir", data_dir, "--iterations", "1"]) == 0
     assert capsys.readouterr().out.strip() == "1"
     moved = CollaborationStore(Database(team.database.path.parent / "metadata.sqlite3"))
-    assert moved.get_requirement(project_id, requirement_id).status == "awaiting_acceptance"
+    assert moved.get_requirement(project_id, requirement_id).status == "integrating"
     # 命令行那一轮只写了副本：宿主不碰原库，就不可能把测试里那份需求的状态顺手改掉。
     assert team.store.get_requirement(project_id, requirement_id).status == "executing"
 
