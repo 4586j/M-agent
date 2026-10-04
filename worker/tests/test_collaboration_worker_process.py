@@ -395,6 +395,16 @@ def wait_rejected(rig, attempt_id: str, stage: str, *, timeout=45.0):
     pytest.fail(f"no refused {stage} callback was recorded for {attempt_id}")
 
 
+def wait_lease_expired(attempt, *, timeout=30.0) -> float:
+    """Let the wall clock pass the lease this attempt was granted, and say by how much."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if time.time() > attempt.lease_expires_at:
+            return time.time() - attempt.lease_expires_at
+        time.sleep(0.1)
+    pytest.fail(f"the lease of {attempt.attempt_id} never ran out on its own")
+
+
 # --- 闭环 -------------------------------------------------------------------------------
 
 def test_the_service_and_the_worker_complete_one_attempt_over_real_http(rig, machine):
@@ -759,3 +769,73 @@ def test_a_lost_run_is_reconciled_and_the_delivery_still_reaches_the_requester(r
     assert trail.count("attempt.assigned") == 2
     assert trail.index("work_item.cancelled") < trail.index("work_item.requeued")
     assert trail[-2:] == ["integration.passed", "requirement.completed"]
+
+
+def test_the_service_process_takes_back_a_lease_that_ran_out_on_its_own(rig, machine):
+    """接管不需要谁按下按钮：真实时钟走到租约之后，一次 tick 就由服务进程自己收回执行权。
+
+    18.34 那一格是在能推进时钟的服务层用例里演的；这一条把同一件事交给墙钟和另一个进程：
+    那台机器停在待批的安全规则前（所以既不续租也不交结果），租约自然到点，服务进程在
+    同一轮里把停止提示送回去，而那台机器回报「我停了」被拒。
+    """
+    bundle = machine(name="silent")
+    requirement = approved_requirement(rig)
+    item = published_plan(rig, requirement.requirement_id, requirement.approved_revision_id,
+                          requirement.approved_revision_hash, keys=("S",))["S"]
+    # 租约按服务层的既有下限给到一秒：剩下的就是墙钟自己走。
+    first = DispatchService(rig.database, instances=rig.instances, requires_real_data=False,
+                            lease_ttl=1.0).dispatch(rig.project.project_id, item.work_item_id)
+    with human(rig, rig.reviewer) as access:
+        rig.reviews.record_rule(access, project_id=rig.project.project_id,
+                                attempt_id=first.attempt_id, rule_key="dangerous_command")
+    bundle.notify(first)
+    wait_local(bundle, first.attempt_id, PAUSED_GATE)
+    assert stored(rig, first.attempt_id).status == "assigned"
+    overdue = wait_lease_expired(first)
+
+    delivery = tick(rig)
+    assert delivery.status_code == 200, delivery.text
+    assert delivery.json()["delivered"] >= 1, delivery.text
+    parked = stored(rig, first.attempt_id)
+    assert (parked.status, parked.lease_expires_at) == ("reconciliation_required",
+                                                        first.lease_expires_at)
+    instance = rig.store.get_instance(rig.project.project_id, first.instance_id)
+    assert parked.control_epoch == instance.control_epoch + 1
+    assert overdue > 0
+    # 这一行是服务端自己写的：没有 actor，也只有这一句理由。
+    with rig.database.read() as conn:
+        row = conn.execute("SELECT actor_id FROM collaboration_audit "
+                           "WHERE action='attempt.lease_reclaimed' AND target_id=?",
+                           (first.attempt_id,)).fetchone()
+    assert row["actor_id"] is None
+    assert ("cancel", True, "execution right reclaimed after lease expiry") in [
+        (report.stage, bool(report.accepted), report.reason) for report in
+        rig.store.list_attempt_reports(rig.project.project_id, first.attempt_id)]
+
+    # 同一轮里撤销提示送到了那台机器：它本地转入对账，回报停止却被服务端拒收。
+    wait_local(bundle, first.attempt_id, "reconciling",
+               reason_contains="stop confirmation was not accepted")
+    refused = wait_rejected(rig, first.attempt_id, "cancel")
+    assert {entry.reason for entry in refused} == {"execution right revoked"}
+    assert stored(rig, first.attempt_id).status == "reconciliation_required"
+
+    # 到点不等于判完：动过什么仍由看过那台机器的人说，这一轮判失败之后工作项才回到可重排那侧。
+    with human(rig, rig.owner) as access:
+        settled = rig.reviews.reconcile_attempt(
+            access, project_id=rig.project.project_id, attempt_id=first.attempt_id,
+            outcome="failed", reason="核对过那台机器：任务包与原文被取回去过，规则没批所以没执行",
+            expected_version=parked.version)
+    moved = rig.store.get_work_item(rig.project.project_id, item.work_item_id)
+    assert (settled.status, moved.status) == ("failed", "failed")
+    with human(rig, rig.owner) as access:
+        rig.reviews.rework(access, project_id=rig.project.project_id,
+                           work_item_id=moved.work_item_id, expected_version=moved.version)
+
+    second = rig.dispatch.dispatch(rig.project.project_id, item.work_item_id)
+    assert second.number == 2
+    bundle.notify(second)
+    wait_status(rig, second.attempt_id, "submitted")
+    assert accepted_stages(rig, second.attempt_id) == ["ack", "start", "artifact", "result"]
+    # 交回来的东西等的是负责人确认，不是自动变成「已提交产出」。
+    assert rig.store.get_work_item(rig.project.project_id,
+                                   item.work_item_id).status == "awaiting_owner_review"
