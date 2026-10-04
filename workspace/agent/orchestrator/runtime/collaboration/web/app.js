@@ -88,6 +88,7 @@ const NEWS = {
 const ACTIVITY_LIMIT = 20;
 const FEED_LIMIT = 20;
 const TODO_LIMIT = 20;
+const SELECTION_KEY = "collab.panel.selection";
 
 let csrf = null;
 let me = null;
@@ -95,6 +96,7 @@ let role = null;
 let roster = [];
 let projectNames = {};
 let pendingRequirement = null;
+let pendingNotice = null;
 let controller = new AbortController();
 // 待办一次只摊一屏，这三个数说的是屏幕上这一叠，不是服务端一共欠谁多少条。
 let todoShown = 0;
@@ -127,6 +129,38 @@ function add(parent, tag, className, value) {
 function say(message, kind) {
   text(fields.status, message);
   fields.status.className = kind || "";
+}
+
+// 有一句只在下一次重画开始时才说得出来说：refresh 一开头就把状态条清空，先 say 出来会被抹掉。
+function note(message) {
+  pendingNotice = message;
+}
+
+function flushNotice() {
+  if (pendingNotice) {
+    say(pendingNotice, "note");
+    pendingNotice = null;
+  } else {
+    say("");
+  }
+}
+
+// 只存两个 id：这台浏览器上次停在哪一格。存不下或读不出都不该拦住面板开起来。
+function remembered() {
+  try {
+    return JSON.parse(localStorage.getItem(SELECTION_KEY) || "{}") || {};
+  } catch (error) {
+    return {};
+  }
+}
+
+function remember(projectId, requirementId) {
+  try {
+    localStorage.setItem(SELECTION_KEY, JSON.stringify({project: projectId,
+                                                        requirement: requirementId}));
+  } catch (error) {
+    say("这台浏览器存不住上次选的项目，刷新后会回到第一项。", "note");
+  }
 }
 
 function when(seconds) {
@@ -239,7 +273,12 @@ async function refresh() {
   fields.createBox.replaceChildren();
   fields.detail.replaceChildren();
   text(fields.feedCount, "");
-  say("");
+  flushNotice();
+  if (projectId) {
+    // 每一次真正开始看都记一笔：换项目、换需求、点刷新、跳转都走这条路，恢复的才是最后停的那一格。
+    // 记在清空状态条之后，否则「这台浏览器存不住」那句会被自己抹掉。
+    remember(projectId, requirementId);
+  }
   try {
     // 动态跨项目，跟着人走，所以它不等项目选出来才加载；待办与详情才按项目取。
     renderFeed(await get(`/feed?limit=${FEED_LIMIT}`));
@@ -881,7 +920,7 @@ async function report(message) {
 }
 
 async function loadProjects() {
-  const kept = fields.project.value;
+  const kept = fields.project.value || remembered().project;
   const projects = await get("/projects");
   projectNames = {};
   fields.project.replaceChildren();
@@ -894,16 +933,20 @@ async function loadProjects() {
   }
   if ([...fields.project.options].some(option => option.value === kept)) {
     fields.project.value = kept;
+  } else if (kept) {
+    // 记着的位置这一轮拿不回来（项目被移出或改名前没了）：说一声回到第一项，别静默换地方。
+    note("上次看的那个项目这一轮不在你的列表里，先回到第一项。");
   }
   return loadRequirements();
 }
 
 async function loadRequirements() {
   // 刚创建的需求要能被自动选中，否则用户写完原文却找不到它落在哪一行。
-  const kept = pendingRequirement || fields.requirement.value;
+  const kept = pendingRequirement || fields.requirement.value || remembered().requirement;
   pendingRequirement = null;
   fields.requirement.replaceChildren();
   if (!fields.project.value) {
+    flushNotice();   // 一个项目都没有时不会再往下走，那句话更得在这里说出口。
     return true;
   }
   const list = await get(`/projects/${fields.project.value}/requirements`);
@@ -987,6 +1030,7 @@ fields.logout.addEventListener("click", async () => {
   text(fields.feedCount, "");
   fields.detail.replaceChildren();
   text(fields.who, "");
+  remember("", "");   // 退出是把屏幕交回去：下一个人不该接着看到上一个人停的那一格。
   say("");
 });
 

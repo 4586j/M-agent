@@ -32,5 +32,6 @@ dt { font-weight: 600; margin-top: 8px; }
 dd { margin: 0 0 4px 16px; color: #33404f; overflow-wrap: anywhere; }
 .error { color: #a32020; }
 .ok { color: #14603a; }
+.note { color: #6b4a10; font-weight: 600; }
 code { background: #eef1f5; padding: 1px 4px; border-radius: 3px; word-break: break-all; }
 [hidden] { display: none !important; }

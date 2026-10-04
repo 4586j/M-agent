@@ -2663,6 +2663,24 @@ def test_the_panel_asks_for_a_page_of_todos_and_says_what_it_left_out():
     assert re.search(r"add\(row, \"button\", \"soft\", \"再看一批\"\)", source)
 
 
+def test_the_panel_remembers_which_project_and_requirement_were_open():
+    # 刷新不该把人看东西的位置丢掉：选择器重建时先认这台浏览器上次停在哪一格。
+    source = (RUNTIME / "collaboration" / "web" / "app.js").read_text(encoding="utf-8")
+    assert "collab.panel.selection" in source
+    assert "fields.project.value || remembered().project" in source
+    assert "fields.requirement.value || remembered().requirement" in source
+    assert "remember(projectId, requirementId)" in source
+    # 那一格这一轮拿不回来要说一声，而不是静默换到第一项；退出时这把位置要交回去。
+    assert 'note("上次看的那个项目这一轮不在你的列表里，先回到第一项。")' in source
+    assert re.search(r"remember\(\"\", \"\"\)", source)
+    # 状态条只经 flushNotice 清：谁在重画之前埋下一句话，那句话就不该被 say("") 抹掉。
+    # 全文件只允许两处直接清空——flushNotice 自己，和退出登录那一次交回屏幕。
+    assert source.count('say("");') == 2
+    # 界面用了一个样式类而样式表里没有它，那句话说出来就跟正文一个颜色，没人会去读它。
+    styles = (RUNTIME / "collaboration" / "web" / "styles.css").read_text(encoding="utf-8")
+    assert ".note {" in styles
+
+
 def test_the_panel_offers_every_action_the_requirement_endpoint_accepts():
     # 后端多一个需求动作而面板没有按钮，等待的人就只剩命令行能停手或恢复——这条守住那道接缝。
     from typing import get_args
