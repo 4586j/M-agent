@@ -9,7 +9,7 @@ from pathlib import Path
 import re
 import sqlite3
 from typing import Annotated, Literal
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 from fastapi import APIRouter, FastAPI, Path as PathParameter, Query, Request, Response
 from fastapi.exceptions import RequestValidationError
@@ -379,6 +379,18 @@ def _artifact_view(artifact) -> dict:
     return {"artifact_id": artifact.artifact_id, "name": artifact.name,
             "media_type": artifact.media_type, "sha256": artifact.sha256,
             "size_bytes": artifact.size_bytes, "href": f"artifacts/{artifact.artifact_id}"}
+
+
+def _attachment(artifact) -> str:
+    """A download name that cannot smuggle quotes or control characters into a header.
+
+    The machine chose this filename, so it is data: the ASCII fallback is the record's own id and
+    the readable name rides percent-encoded.
+    """
+    cleaned = "".join(char for char in artifact.name if char.isprintable()
+                      and char not in '"\\;')[:120]
+    return (f'attachment; filename="{artifact.artifact_id}"; '
+            f"filename*=UTF-8''{quote(cleaned or artifact.artifact_id, safe='')}")
 
 
 def _claims(body: MachineCallback) -> dict:
@@ -1143,6 +1155,39 @@ def create_app(config: AppConfig) -> FastAPI:
                     "acceptance_items": [{"item_id": item_id, "text": text} for item_id, text in
                                          access.store.list_work_item_acceptance(
                                              attempt.work_item_id)]}
+
+    @router.get("/projects/{pid}/attempts/{aid}/artifacts")
+    def attempt_artifacts(pid: str, aid: str, request: Request):
+        """What one attempt produced, listed for the people who have to judge it.
+
+        The machine protocol already hands these out, but only to the instance that owns the
+        attempt. A verdict is made against files, so the same records have to be readable by the
+        person signing — with the same scoping the delivery view uses, and no wider.
+        """
+        with _access(request, project_id=pid) as access:
+            return [{"artifact_id": entry.artifact_id, "name": entry.name,
+                     "media_type": entry.media_type, "sha256": entry.sha256,
+                     "size_bytes": entry.size_bytes,
+                     "href": f"/projects/{pid}/attempts/{aid}/artifacts/{entry.artifact_id}"}
+                    for entry in app.state.execution.listed_for_member(pid, aid)]
+
+    @router.get("/projects/{pid}/attempts/{aid}/artifacts/{artifact_id}")
+    def attempt_artifact_body(pid: str, aid: str, artifact_id: str, request: Request):
+        """The bytes behind one record, and only ever as a download.
+
+        A machine named this file and declared its type, so the type is data about the artifact,
+        not a licence to render it inside this origin: an HTML or SVG "report" opened in a tab
+        would run as this site. The digest is re-checked on the way out, because what a person is
+        about to read is the evidence somebody else will sign.
+        """
+        with _access(request, project_id=pid) as access:
+            content, artifact = app.state.execution.body_for_member(pid, aid, artifact_id)
+        return Response(content=content, media_type=artifact.media_type, headers={
+            "Content-Disposition": _attachment(artifact),
+            "X-Content-Type-Options": "nosniff",
+            "Content-Security-Policy": "default-src 'none'; sandbox",
+            "Referrer-Policy": "no-referrer",
+            "X-Content-Hash": artifact.sha256})
 
     @router.post("/projects/{pid}/attempts/{aid}/security-reviews", status_code=201)
     def record_security_rule(pid: str, aid: str, body: SecurityRuleCreate, request: Request):

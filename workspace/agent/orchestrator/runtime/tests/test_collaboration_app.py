@@ -13,6 +13,7 @@ import subprocess
 import sys
 import time
 from types import SimpleNamespace
+from urllib.parse import unquote
 
 import httpx
 import pytest
@@ -1949,6 +1950,62 @@ def test_a_silent_machine_becomes_a_to_do_a_manager_can_close(api):
          api.identities["manager"]["user"]["user_id"])]
 
 
+def test_the_people_judging_a_delivery_can_read_the_files_behind_it(api, monkeypatch):
+    project, _requirement_id, _plan, attempt, token = machine_attempt(api)
+    pid = project["project_id"]
+    headers = {"X-Instance-Token": token}
+    base = f"/machine/attempts/{attempt.attempt_id}"
+    started = checked(api.send(None, "POST", base + "/start", json=machine_claims(attempt),
+                               headers=headers))
+    name = "结果 说明.md"
+    content = "# 交付说明\n第二行".encode("utf-8")
+    digest = hashlib.sha256(content).hexdigest()
+    uploaded = checked(api.send(None, "POST", base + "/artifacts", headers=headers, json={
+        **machine_claims(started["attempt"]), "name": name, "media_type": "text/markdown",
+        "sha256": digest, "content": base64.b64encode(content).decode("ascii")}), 201)
+    artifact_id = uploaded["artifact"]["artifact_id"]
+    human = f"/projects/{pid}/attempts/{attempt.attempt_id}/artifacts"
+
+    listed = checked(api.send("member", "GET", human))
+    assert [(entry["name"], entry["media_type"], entry["sha256"], entry["size_bytes"],
+             entry["href"]) for entry in listed] == [
+        (name, "text/markdown", digest, len(content), f"{human}/{artifact_id}")]
+    # 局外人连清单都取不到，回答与「这条尝试不在这个项目里」同一种；产物不跟着 id 跨项目跑。
+    checked(api.send("outsider", "GET", human), 404)
+    checked(api.send("outsider", "GET", f"{human}/{artifact_id}"), 404)
+    checked(api.send("member", "GET", f"{human}/{'f' * 32}"), 404)
+    checked(api.send("member", "GET",
+                     f"/projects/{pid}/attempts/{'f' * 32}/artifacts/{artifact_id}"), 404)
+
+    response = api.send("member", "GET", f"{human}/{artifact_id}")
+    assert (response.status_code, response.content) == (200, content)
+    assert response.headers["cache-control"] == "no-store"
+    assert response.headers["x-content-hash"] == digest
+    assert response.headers["content-type"].startswith("text/markdown")
+    # 类型是机器自报的，所以它只是关于文件的资料，不是在本源里渲染它的许可：只给下载。
+    assert response.headers["x-content-type-options"] == "nosniff"
+    assert response.headers["content-security-policy"] == "default-src 'none'; sandbox"
+    assert response.headers["referrer-policy"] == "no-referrer"
+    disposition = response.headers["content-disposition"]
+    # 文件名是自由文本：原始字符不进头部，ASCII 兜底用记录自己的 id。
+    assert disposition.startswith(f'attachment; filename="{artifact_id}"; ')
+    assert name not in disposition
+    assert unquote(disposition.split("filename*=UTF-8''")[1]) == name
+
+    # 证据改不动：append-only 触发器先拦下任何 SQL 改写，所以「字节与摘要不符」只能来自文件损坏。
+    with api.database.transaction() as conn, pytest.raises(sqlite3.IntegrityError):
+        conn.execute("UPDATE attempt_artifacts SET content=? WHERE artifact_id=?",
+                     (b"tampered bytes", artifact_id))
+    # 那一格仍然要拒：这里替换的是读出结果，模拟的是坏掉的文件，不是模拟判定逻辑本身。
+    def rotted(_self, project_id, artifact):
+        return b"tampered bytes"
+
+    monkeypatch.setattr(CollaborationStore, "get_artifact_content", rotted)
+    checked(api.send("member", "GET", f"{human}/{artifact_id}"), 409)
+    # 清单照旧可读：它不碰字节，报的是「机器交回了什么」。
+    assert [entry["sha256"] for entry in checked(api.send("member", "GET", human))] == [digest]
+
+
 def test_the_requester_signs_for_the_requirement_delivery_over_http(api):
     project, requirement_id, plan, attempt, token = machine_attempt(api)
     pid = project["project_id"]
@@ -2679,6 +2736,19 @@ def test_the_panel_remembers_which_project_and_requirement_were_open():
     # 界面用了一个样式类而样式表里没有它，那句话说出来就跟正文一个颜色，没人会去读它。
     styles = (RUNTIME / "collaboration" / "web" / "styles.css").read_text(encoding="utf-8")
     assert ".note {" in styles
+
+
+def test_the_panel_leads_from_a_verdict_to_the_files_it_signed():
+    # 后端给了按尝试读产物的出口而界面没有出口，裁定行就仍然是一串要逐位比的十六进制。
+    source = (RUNTIME / "collaboration" / "web" / "app.js").read_text(encoding="utf-8")
+    assert "/artifacts" in source
+    assert "artifactPeek(row, projectId, item)" in source
+    assert "看那一次的产物" in source
+    # 下载走服务端给的 href，不在界面里拿 id 拼路径。
+    assert "link.href = API + entry.href;" in source
+    assert "signedSameBundle(verdict.evidence_hash" in source
+    assert "签的就是屏幕上这一份" in source
+    assert "签的是另一份交付" in source
 
 
 def test_the_panel_offers_every_action_the_requirement_endpoint_accepts():

@@ -312,6 +312,39 @@ function renderInstance(parent, instance) {
                         + `${instance.isolation_verified ? "是" : "否"}`);
 }
 
+function artifactPeek(parent, projectId, item) {
+  // 交付证据那一行只有产物名；裁定要落到文件上，所以给一次「按尝试取清单」的出口。
+  if (!item.attempt_id) {
+    return;
+  }
+  const button = add(parent, "dd", null);
+  const trigger = add(button, "button", "soft", "看那一次的产物");
+  trigger.type = "button";
+  const facts = add(parent, "dl", "evidence");
+  facts.hidden = true;
+  trigger.addEventListener("click", async () => {
+    try {
+      const listed = await get(`/projects/${projectId}/attempts/${item.attempt_id}/artifacts`);
+      facts.replaceChildren();
+      if (!listed.length) {
+        add(facts, "dd", null, "那一次尝试没有交回任何产物。");
+      }
+      for (const entry of listed) {
+        const line = add(facts, "dd", null, `${entry.name} · ${entry.media_type} · `
+            + `${entry.size_bytes} 字节 · 摘要 ${entry.sha256} · `);
+        const link = add(line, "a", null, "下载");
+        link.href = API + entry.href;
+        link.rel = "noopener";
+      }
+      facts.hidden = false;
+    } catch (error) {
+      if (error.name !== "AbortError") {
+        say(`产物清单取不回：${error.message}`, "error");
+      }
+    }
+  });
+}
+
 function renderTodo(entry) {
   const spec = DECISIONS[entry.item_type];
   const row = add(fields.todos, "li");
@@ -402,9 +435,16 @@ function showCoverage(parent, view) {
   for (const verdict of view.verdicts) {
     add(parent, "dd", null, `${personName(verdict.actor_user_id)} `
         + `${verdict.decision === "passed" ? "核对通过" : "退回返工"} · `
-        + `摘要 ${verdict.evidence_hash} · ${when(verdict.created_at)}`
-        + ` · ${verdict.reason || "没有留下理由"}`);
+        + `摘要 ${verdict.evidence_hash} · ${signedSameBundle(verdict.evidence_hash,
+                                                              view.report.evidence_hash)} · `
+        + `${when(verdict.created_at)} · ${verdict.reason || "没有留下理由"}`);
   }
+}
+
+// 裁定签的是摘要，不是「那一版」这个词：64 位十六进制摊在人面前，还得他自己逐位比。
+function signedSameBundle(signed, current) {
+  return signed === current ? "签的就是屏幕上这一份"
+                            : "签的是另一份交付，屏幕上列出的不是它";
 }
 
 function renderChoice(form, entry, spec) {
@@ -781,9 +821,13 @@ async function renderRequirement(projectId, requirementId) {
         add(row, "dd", null,
             `验收项：${item.acceptance.map(entry => entry.text).join("、") || "无"}`);
         add(row, "dd", null, `产物：${item.artifacts.map(entry => entry.name).join("、") || "无"}`);
+        artifactPeek(row, projectId, item);
       }
+      add(block, "dd", "locator", `本次交付摘要 ${delivery.delivery.evidence_hash}`);
       for (const verdict of delivery.acceptances) {
-        add(block, "dd", null, `提出人裁定：${verdict.decision} · ${verdict.reason || "无理由文本"}`);
+        add(block, "dd", null, `提出人裁定：${verdict.decision} · `
+            + `${verdict.reason || "无理由文本"} · `
+            + signedSameBundle(verdict.evidence_hash, delivery.delivery.evidence_hash));
       }
     } catch (error) {
       if (error.name !== "AbortError") {

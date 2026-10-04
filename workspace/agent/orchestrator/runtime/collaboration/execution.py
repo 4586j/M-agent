@@ -136,6 +136,32 @@ class ExecutionService:
             _instance, _binding, attempt = self._owned(store, instance_token, attempt_id)
             return store.list_artifacts(attempt.project_id, attempt.attempt_id)
 
+    def listed_for_member(self, project_id: str, attempt_id: str) -> list[AttemptArtifact]:
+        """One attempt's output, listed for the people who have to judge it."""
+        with self.database.read() as conn:
+            store = CollaborationStore(self.database, connection=conn)
+            return store.list_artifacts(project_id, store.get_attempt(project_id, attempt_id)
+                                        .attempt_id)
+
+    def body_for_member(self, project_id: str, attempt_id: str,
+                        artifact_id: str) -> tuple[bytes, AttemptArtifact]:
+        """The bytes behind one record, verified the same way the machine path verifies them.
+
+        A person signs for these files, so a record whose content no longer matches its stored
+        digest is refused rather than handed over as if it were still the evidence.
+        """
+        with self.database.read() as conn:
+            store = CollaborationStore(self.database, connection=conn)
+            attempt = store.get_attempt(project_id, attempt_id)
+            artifact = next((entry for entry in store.list_artifacts(project_id, attempt.attempt_id)
+                             if entry.artifact_id == artifact_id), None)
+            if artifact is None:
+                raise NotFound("Resource not found")
+            content = store.get_artifact_content(project_id, artifact.artifact_id)
+            if _digest_of(content) != artifact.sha256 or len(content) != artifact.size_bytes:
+                raise Conflict("Artifact content does not match its recorded digest")
+            return content, artifact
+
     def artifact_content(self, instance_token: str | None, attempt_id: str,
                          artifact_id: str) -> tuple[bytes, AttemptArtifact]:
         """Own output, or an upstream artifact the frozen package declared by id and digest."""
