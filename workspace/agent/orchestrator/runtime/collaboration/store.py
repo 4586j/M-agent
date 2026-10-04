@@ -79,6 +79,21 @@ def _digest(value: str, field: str) -> str:
     return value
 
 
+def _return_scope(items) -> str:
+    """Which work items a return names, in the text its verdict row carries.
+
+    An empty list keeps the older meaning: every accepted item of that bundle went back. How many
+    names one request may carry is the decision service's bound, not this column's.
+    """
+    if not isinstance(items, (list, tuple)):
+        raise ValidationError("Invalid returned_items")
+    for key in items:
+        _text(key, "returned item", 128)
+    if len({key for key in items}) != len(items):
+        raise ValidationError("Returned work items must not repeat")
+    return json.dumps(sorted(items), ensure_ascii=False)
+
+
 def _epoch(value: int, field: str) -> int:
     if type(value) is not int or value < 1:
         raise ValidationError(f"Invalid {field}")
@@ -91,6 +106,8 @@ def _record(cls, row):
     values = dict(row)
     if cls is AgentProjectBinding:
         values["allowed_tools"] = tuple(json.loads(values["allowed_tools"]))
+    elif cls in (RequirementAcceptance, RequirementIntegration):
+        values["returned_items"] = tuple(json.loads(values["returned_items"] or "[]"))
     elif cls is ExecutionInstance:
         for name in ("allowed_tools", "env_allowlist"):
             if values[name] is not None:
@@ -180,14 +197,14 @@ _OWNER_REVIEW_COLUMNS = (
 _ACCEPTANCE_REVIEW_COLUMNS = _OWNER_REVIEW_COLUMNS
 _REQUIREMENT_ACCEPTANCE_COLUMNS = (
     "acceptance_id,project_id,requirement_id,reviewer_user_id,decision,evidence_hash,reason,"
-    "created_at"
+    "created_at,returned_items"
 )
 _REQUIREMENT_PAUSE_COLUMNS = (
     "pause_id,project_id,requirement_id,actor_user_id,action,reason,created_at"
 )
 _REQUIREMENT_INTEGRATION_COLUMNS = (
     "integration_id,project_id,requirement_id,actor_user_id,decision,evidence_hash,reason,"
-    "created_at"
+    "created_at,returned_items"
 )
 _SECURITY_REVIEW_COLUMNS = (
     "security_review_id,attempt_id,project_id,rule_key,input_hash,requirement_id,revision_id,"
@@ -1668,19 +1685,22 @@ class CollaborationStore:
 
     def add_requirement_acceptance(self, project_id: str, requirement_id: str, *,
                                    reviewer_user_id: str, decision: str, evidence_hash: str,
-                                   reason: str, created_at: float) -> RequirementAcceptance:
+                                   reason: str, created_at: float,
+                                   returned_items: list[str] | tuple[str, ...] = (),
+                                   ) -> RequirementAcceptance:
         """One line of the requester's own verdict on the whole requirement."""
         _choice(decision, ("accepted", "changes_requested"), "decision")
         _digest(evidence_hash, "evidence_hash")
+        scope = _return_scope(returned_items)
         acceptance_id = uuid4().hex
         with self._write() as conn:
             requirement = self._requirement(conn, project_id, requirement_id)
             conn.execute(
                 "INSERT INTO requirement_acceptance(acceptance_id,project_id,requirement_id,"
-                "reviewer_user_id,decision,evidence_hash,reason,created_at) "
-                "VALUES(?,?,?,?,?,?,?,?)",
+                "reviewer_user_id,decision,evidence_hash,reason,created_at,returned_items) "
+                "VALUES(?,?,?,?,?,?,?,?,?)",
                 (acceptance_id, requirement.project_id, requirement_id, reviewer_user_id, decision,
-                 evidence_hash, reason, created_at))
+                 evidence_hash, reason, created_at, scope))
             return _one(conn, RequirementAcceptance,
                         f"SELECT {_REQUIREMENT_ACCEPTANCE_COLUMNS} FROM requirement_acceptance "
                         "WHERE acceptance_id=?", (acceptance_id,))
@@ -1721,18 +1741,22 @@ class CollaborationStore:
 
     def add_requirement_integration(self, project_id: str, requirement_id: str, *,
                                     actor_user_id: str, decision: str, evidence_hash: str,
-                                    reason: str, created_at: float) -> RequirementIntegration:
+                                    reason: str, created_at: float,
+                                    returned_items: list[str] | tuple[str, ...] = (),
+                                    ) -> RequirementIntegration:
         """One manager's verdict on one concrete bundle: it passed the check, or it goes back."""
         _choice(decision, ("passed", "returned"), "decision")
         _digest(evidence_hash, "evidence_hash")
+        scope = _return_scope(returned_items)
         integration_id = uuid4().hex
         with self._write() as conn:
             requirement = self._requirement(conn, project_id, requirement_id)
             conn.execute(
                 "INSERT INTO requirement_integrations(integration_id,project_id,requirement_id,"
-                "actor_user_id,decision,evidence_hash,reason,created_at) VALUES(?,?,?,?,?,?,?,?)",
+                "actor_user_id,decision,evidence_hash,reason,created_at,returned_items) "
+                "VALUES(?,?,?,?,?,?,?,?,?)",
                 (integration_id, requirement.project_id, requirement_id, actor_user_id, decision,
-                 evidence_hash, reason, created_at))
+                 evidence_hash, reason, created_at, scope))
             return _one(conn, RequirementIntegration,
                         f"SELECT {_REQUIREMENT_INTEGRATION_COLUMNS} FROM requirement_integrations "
                         "WHERE integration_id=?", (integration_id,))

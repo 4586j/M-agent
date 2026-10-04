@@ -1212,11 +1212,23 @@ def machine_claims(source):
     return {key: data[key] for key in ("input_hash", "control_epoch", "lease_epoch")}
 
 
-def machine_attempt(api, *, worker_url=None):
+def plan_candidate(binding, member_uid, key, acceptance_ids, *, estimate=2):
+    return {"key": key, "title": f"任务 {key}", "objective": "完成目标", "scope": "范围内",
+            "non_goals": "不做的事", "duty": BINDING_FIELDS["duty"],
+            "assignee_user_id": member_uid, "binding_id": binding["binding_id"],
+            "acceptance_ids": list(acceptance_ids), "estimated_units": estimate,
+            "depends_on": []}
+
+
+def machine_attempt(api, *, worker_url=None, acceptance=("第一条验收",), items=None):
     """Approved requirement, published plan, verified instance and one dispatched attempt."""
-    project, member, binding, requirement_id = approval_setup(api)
+    project, member, binding, requirement_id = approval_setup(api, acceptance)
     pid = project["project_id"]
-    wire_planner(api, binding, member["user_id"])
+    if items is None:
+        wire_planner(api, binding, member["user_id"])
+    else:
+        candidate = {"items": items(member, binding)}
+        api.client.app.state.planning.planner = lambda context: candidate
     plan = checked(api.send("manager", "POST", plans_path(project, requirement_id)), 201)
     node, node_token = api.client.app.state.instances.enroll_node("machine-node")
     path = f"/projects/{pid}/agent-bindings/{binding['binding_id']}/instances"
@@ -2111,6 +2123,91 @@ def test_the_requester_signs_for_the_requirement_delivery_over_http(api):
                      json={"action": "cancel", "expected_version": done["version"]}), 409)
 
 
+def test_a_return_over_http_sends_back_only_the_items_it_names(api):
+    project, requirement_id, plan, attempt, token = machine_attempt(
+        api, acceptance=("第一条验收", "第二条验收"),
+        items=lambda member, binding: [
+            plan_candidate(binding, member["user_id"], "A", ["AC-001"]),
+            plan_candidate(binding, member["user_id"], "B", ["AC-002"])])
+    pid = project["project_id"]
+    headers = {"X-Instance-Token": token}
+    base = f"/projects/{pid}/requirements/{requirement_id}"
+    keys = [entry["key"] for entry in plan["work_items"]]
+    assert keys == ["A", "B"]
+
+    def finish(attempt_id, claims, work_item_id):
+        """One item, driven from the machine's first call to a business acceptance."""
+        checked(api.send(None, "POST", f"/machine/attempts/{attempt_id}/start", json=claims,
+                         headers=headers))
+        reported = checked(api.send(None, "POST", f"/machine/attempts/{attempt_id}/result",
+                                    json={**claims, "status": "submitted", "summary": "按原文做完",
+                                          "usage_units": 2}, headers=headers))
+        checked(api.send("member", "POST", delivery_path(pid, attempt_id),
+                         json={"decision": "confirmed",
+                               "expected_version": reported["attempt"]["version"]}))
+        stored = next(entry for entry in checked(
+            api.send("member", "GET", plans_path(project, requirement_id)
+                     + f"/{plan['plan']['plan_id']}"))["work_items"]
+            if entry["work_item_id"] == work_item_id)
+        return checked(api.send("manager", "POST",
+                                f"/projects/{pid}/work-items/{work_item_id}/accept",
+                                json={"decision": "accepted",
+                                      "expected_version": stored["version"]}))
+
+    finish(attempt.attempt_id, machine_claims(attempt), plan["work_items"][0]["work_item_id"])
+    dispatched = checked(api.send("manager", "POST",
+                                  dispatch_path(pid, plan["work_items"][1]["work_item_id"])))
+    item_b = plan["work_items"][1]["work_item_id"]
+    finish(dispatched["attempt_id"], machine_claims(dispatched), item_b)
+    assert work_item_statuses(api, project, requirement_id, plan) == ["accepted", "accepted"]
+
+    requirement = checked(api.send("member", "GET", base))
+    stopping = checked(api.send("member", "POST", f"{base}/actions",
+                                json={"action": "advance",
+                                      "expected_version": requirement["version"]}))
+    assert stopping["status"] == "integrating"
+    waiting = checked(api.send("manager", "POST", f"{base}/integration",
+                               json={"decision": "passed",
+                                     "expected_version": stopping["version"]}))
+    assert waiting["status"] == "awaiting_acceptance"
+
+    checked(api.send("member", "POST", f"{base}/acceptance",
+                     json={"decision": "accepted", "expected_version": waiting["version"],
+                           "returned_items": ["B"]}), 422)
+    checked(api.send("member", "POST", f"{base}/acceptance",
+                     json={"decision": "changes_requested", "reason": "第二条没做",
+                           "expected_version": waiting["version"], "returned_items": ["Z"]}), 422)
+    refused = checked(api.send("member", "POST", f"{base}/acceptance",
+                               json={"decision": "changes_requested",
+                                     "reason": "对照原文，第二条验收没做",
+                                     "expected_version": waiting["version"],
+                                     "returned_items": ["B"]}))
+    assert refused["status"] == "rework"
+    # A 没有被点名，它那一版已验收的交付就还站在原地。
+    assert work_item_statuses(api, project, requirement_id, plan) == ["accepted",
+                                                                      "changes_requested"]
+    rows = checked(api.send("member", "GET", f"{base}/delivery"))["acceptances"]
+    assert [(entry["decision"], entry["returned_items"]) for entry in rows] == [
+        ("changes_requested", ["B"])]
+    assert [(entry["decision"], entry["returned_items"]) for entry in
+            checked(api.send("member", "GET", f"{base}/integration"))["verdicts"]] == [
+        ("passed", [])]
+    # 提出人手里那条待办已经清了，欠的下一步是管理者把 B 重新排队。
+    assert [(entry["item_type"], entry["work_item_id"]) for entry in
+            checked(api.send("member", "GET", "/inbox"))] == []
+    reopened = checked(api.send("manager", "GET", plans_path(project, requirement_id)
+                                + f"/{plan['plan']['plan_id']}"))["work_items"][1]
+    queued = checked(api.send("manager", "POST", f"/projects/{pid}/work-items/{item_b}/rework",
+                              json={"expected_version": reopened["version"]}))
+    assert queued["status"] == "ready"
+    second = checked(api.send("manager", "POST", dispatch_path(pid, item_b)))
+    payload = checked(api.send(None, "GET",
+                               f"/machine/attempts/{second['attempt_id']}/package",
+                               headers=headers))
+    assert [(entry["kind"], entry["reason"]) for entry in payload["rework"]] == [
+        ("requirement_acceptance", "对照原文，第二条验收没做")]
+
+
 def test_a_returned_requirement_reopens_its_items_and_informs_the_next_attempt(api):
     seen = delivered(api)
     pid = seen.project["project_id"]
@@ -2751,6 +2848,22 @@ def test_the_panel_leads_from_a_verdict_to_the_files_it_signed():
     assert "签的是另一份交付" in source
 
 
+def test_the_panel_lets_a_return_name_the_items_it_refuses():
+    # 后端接住了「只退其中几项」，界面没有出口就等于这条能力只活在 API 里。
+    source = (RUNTIME / "collaboration" / "web" / "app.js").read_text(encoding="utf-8")
+    assert source.count("returns: ") == 2  # 两种签字待办都能点名，别的裁定不行。
+    assert 'returns: "changes_requested"' in source and 'returns: "returned"' in source
+    assert "const view = await get(entry.links.delivery);" in source
+    assert "body.returned_items = picked;" in source
+    assert "只退其中几项" in source
+    # 不勾任何一项就是整篇退回：这一格不能被读成「什么都没退」。
+    assert "不勾任何一项，就是退回整篇交付" in source
+    # 一次定义、两处裁定行（核对裁定与提出人裁定）都说得出点名了谁。
+    assert source.count("returnScopeOf(verdict)") == 3
+    assert 'verdict.decision !== "changes_requested" && verdict.decision !== "returned"' in source
+    assert "只退了 ${verdict.returned_items.join" in source
+
+
 def test_the_panel_offers_every_action_the_requirement_endpoint_accepts():
     # 后端多一个需求动作而面板没有按钮，等待的人就只剩命令行能停手或恢复——这条守住那道接缝。
     from typing import get_args
@@ -2818,7 +2931,8 @@ def test_the_coverage_report_travels_with_the_two_signatures(api):
     stopping = checked(api.send("member", "POST", f"{base}/actions",
                                 json={"action": "advance",
                                       "expected_version": requirement["version"]}))
-    coverage = {"coverage": f"{base}/integration"}
+    # 两份签字待办都带着核对报告，也带着那一份交付：退回要点名工作项，客户端不该自己拼路径。
+    coverage = {"coverage": f"{base}/integration", "delivery": f"{base}/delivery"}
 
     def link_of(actor, item_type):
         rows = [entry for entry in checked(api.send(actor, "GET", "/inbox"))

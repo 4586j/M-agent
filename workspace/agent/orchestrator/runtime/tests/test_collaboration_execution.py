@@ -556,6 +556,72 @@ def test_v11_migration_failure_leaves_the_file_untouched(tmp_path, monkeypatch):
     assert CollaborationStore(Database(path)).get_user("old-user").version == 1
 
 
+def make_v11_database(path):
+    """A v11 file holding verdicts written before a return could name the items it refuses."""
+    make_v10_database(path)
+    with closing(sqlite3.connect(path, isolation_level=None)) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        for statement in database_module._INTEGRATION_SCHEMA:
+            conn.execute(statement)
+        conn.execute("INSERT INTO requirement_integrations(integration_id,project_id,"
+                     "requirement_id,actor_user_id,decision,evidence_hash,reason,created_at) "
+                     "VALUES('old-check','old-project','old-requirement','old-user','returned',?,"
+                     "'第二条验收没做',3700.0)", ("f" * 64,))
+        conn.execute("PRAGMA user_version=11")
+        conn.commit()
+
+
+def test_v11_database_upgrades_to_v12_and_old_returns_still_mean_the_whole_bundle(tmp_path):
+    path = tmp_path / "v12.sqlite3"
+    make_v11_database(path)
+    database = Database(path)
+    with pytest.raises(database_module.SchemaVersionError):
+        with database.read():
+            pytest.fail("Migration must be explicit")
+    database.initialize()
+    with database.read() as conn:
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+        assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+        # 旧行没有点过名，落下来就是空串：读出来仍然是「整篇」，不是凭空多出一份清单。
+        assert conn.execute("SELECT returned_items FROM requirement_integrations "
+                            "WHERE integration_id='old-check'").fetchone()[0] == ""
+        assert conn.execute("SELECT returned_items FROM requirement_acceptance "
+                            "WHERE acceptance_id='old-signature'").fetchone()[0] == ""
+    store = CollaborationStore(database)
+    assert store.list_requirement_integrations("old-project",
+                                               "old-requirement")[0].returned_items == ()
+    assert store.list_requirement_acceptances("old-project",
+                                              "old-requirement")[0].returned_items == ()
+    # 加了列不等于加了口子：裁定仍然是写进去就不能改的那一行。
+    with pytest.raises(sqlite3.IntegrityError):
+        with database.transaction() as conn:
+            conn.execute("UPDATE requirement_integrations SET returned_items='[\"B\"]' "
+                         "WHERE integration_id='old-check'")
+    # 旧的插入语句不写这一列也照样能用：默认值就是它一直以来的意思。
+    with database.transaction() as conn:
+        conn.execute("INSERT INTO requirement_integrations(integration_id,project_id,"
+                     "requirement_id,actor_user_id,decision,evidence_hash,reason,created_at) "
+                     "VALUES('plain-insert','old-project','old-requirement','old-user','passed',?,"
+                     "'',3800.0)", ("e" * 64,))
+    assert [row.returned_items for row in
+            store.list_requirement_integrations("old-project", "old-requirement")] == [(), ()]
+
+
+def test_v12_migration_failure_leaves_the_file_untouched(tmp_path, monkeypatch):
+    path = tmp_path / "v11.sqlite3"
+    make_v11_database(path)
+    before = path.read_bytes()
+    with monkeypatch.context() as patch:
+        patch.setattr(database_module, "_RETURN_SCOPE_SCHEMA",
+                      ("INVALID SQL",))
+        with pytest.raises(sqlite3.OperationalError):
+            Database(path).initialize()
+    assert path.read_bytes() == before
+    Database(path).initialize()
+    assert CollaborationStore(Database(path)).list_requirement_integrations(
+        "old-project", "old-requirement")[0].reason == "第二条验收没做"
+
+
 # --- instance registration ----------------------------------------------------
 
 def test_worker_url_is_registered_and_rejects_extra_callback_targets(team):
@@ -2539,6 +2605,122 @@ def test_a_returned_integration_reopens_the_delivery_and_tells_the_next_attempt(
              entry["reviewed_by"]) for entry in payload["rework"]] == [
         ("requirement_integration", None, "第二条验收没做，缺灰度开关", None, team.reviewer.user_id)]
     assert second.input_hash != first.input_hash
+
+
+def test_a_return_can_name_the_items_it_refuses(team):
+    """A return that points at one item must not sweep the accepted delivery of another one back."""
+    requirement, plan, _instance, token = reserved_plan(
+        team, plan_item(team, "A", estimate=5), plan_item(team, "B", estimate=4))
+    project_id, requirement_id = requirement.project_id, requirement.requirement_id
+    item_a, item_b = work_item(team, plan, "A"), work_item(team, plan, "B")
+    accept_item(team, project_id, item_a, token)
+    accept_item(team, project_id, item_b, token)
+    with session(team, team.requester) as access:
+        stopping = team.reviews.advance_requirement(access, project_id=project_id,
+                                                    requirement_id=requirement_id,
+                                                    expected_version=requirement.version)
+    assert stopping.status == "integrating"
+
+    def check(decision, **kwargs):
+        with session(team, team.reviewer) as access:
+            return team.reviews.record_integration(access, project_id=project_id,
+                                                   requirement_id=requirement_id,
+                                                   decision=decision,
+                                                   expected_version=kwargs.pop("version"),
+                                                   **kwargs)
+
+    with pytest.raises(ValidationError):
+        # 通过的那一方没有可退的东西：点名工作项只属于退回。
+        check("passed", version=stopping.version, returned_items=["B"])
+    with pytest.raises(ValidationError):
+        # 点一个不在这一版交付里的名字，不能被读成「那就全退」。
+        check("returned", version=stopping.version, reason="B 缺灰度开关", returned_items=["Z"])
+    with pytest.raises(ValidationError):
+        check("returned", version=stopping.version, reason="B 缺灰度开关",
+              returned_items=["B", "B"])
+    returned = check("returned", version=stopping.version, reason="B 缺灰度开关",
+                     returned_items=["B"])
+    assert returned.status == "rework"
+    kept = team.store.get_work_item(project_id, item_a.work_item_id)
+    reopened = team.store.get_work_item(project_id, item_b.work_item_id)
+    assert (kept.status, reopened.status) == ("accepted", "changes_requested")
+    rows = team.store.list_requirement_integrations(project_id, requirement_id)
+    assert [(row.decision, row.returned_items) for row in rows] == [("returned", ("B",))]
+    # 欠的下一条待办只有 B：A 没有被退，就没有要重排的活。
+    assert todos(team, team.reviewer) == [(
+        "rework_queue", "rework_work_item",
+        f"/projects/{project_id}/work-items/{item_b.work_item_id}/rework")]
+    with pytest.raises(InvalidState):
+        # 退回之后这一版交付已经变了：再点一次「退回」不是一句重复的话，它得重新对着当前版本说。
+        check("returned", version=returned.version, reason="B 缺灰度开关", returned_items=["B"])
+    with pytest.raises(InvalidState):
+        # 换一组名字同样是另一句话，不是重放。
+        check("returned", version=returned.version, reason="A 也没做", returned_items=["A"])
+    assert len(team.store.list_requirement_integrations(project_id, requirement_id)) == 1
+
+    with session(team, team.reviewer) as access:
+        team.reviews.rework(access, project_id=project_id, work_item_id=item_b.work_item_id,
+                            expected_version=reopened.version)
+    second_b = team.make_dispatch(requires_real_data=False).dispatch(project_id,
+                                                                     item_b.work_item_id)
+    payload = json.loads(team.make_execution().package(token, second_b.attempt_id)[0])
+    assert [(entry["kind"], entry["reason"]) for entry in payload["rework"]] == [
+        ("requirement_integration", "B 缺灰度开关")]
+    accept_item(team, project_id, item_b, token, attempt=second_b)
+    with session(team, team.requester) as access:
+        again = team.reviews.advance_requirement(access, project_id=project_id,
+                                                 requirement_id=requirement_id,
+                                                 expected_version=returned.version)
+    assert again.status == "integrating"
+    waiting = integrated(team, project_id, requirement_id)
+    assert waiting.status == "awaiting_acceptance"
+
+    with session(team, team.requester) as access:
+        refused = team.reviews.accept_requirement(access, project_id=project_id,
+                                                  requirement_id=requirement_id,
+                                                  decision="changes_requested",
+                                                  reason="A 的原文那条没满足",
+                                                  expected_version=waiting.version,
+                                                  returned_items=["A"])
+    assert refused.status == "rework"
+    back_a = team.store.get_work_item(project_id, item_a.work_item_id)
+    assert (back_a.status, back_a.version) == ("changes_requested", kept.version + 1)
+    # B 刚交回来的那一版没有被点名，所以它还站在 accepted，也不用再排一次队。
+    assert team.store.get_work_item(project_id, item_b.work_item_id).status == "accepted"
+    assert [(row.decision, row.returned_items) for row in
+            team.store.list_requirement_acceptances(project_id, requirement_id)] == [
+        ("changes_requested", ("A",))]
+    with session(team, team.requester) as access:
+        # 同一次退回再点一次是回放：不加行、不推版本，B 也不会被顺带拖回去。
+        replayed = team.reviews.accept_requirement(access, project_id=project_id,
+                                                   requirement_id=requirement_id,
+                                                   decision="changes_requested",
+                                                   reason="A 的原文那条没满足",
+                                                   expected_version=refused.version,
+                                                   returned_items=["A"])
+        assert (replayed.status, replayed.version) == ("rework", refused.version)
+        with pytest.raises(InvalidState):
+            # 换一组名字是另一句话：这一轮已经不在签字那一步了。
+            team.reviews.accept_requirement(access, project_id=project_id,
+                                            requirement_id=requirement_id,
+                                            decision="changes_requested", reason="B 也不对",
+                                            expected_version=refused.version,
+                                            returned_items=["B"])
+    assert len(team.store.list_requirement_acceptances(project_id, requirement_id)) == 1
+    assert team.store.get_work_item(project_id, item_b.work_item_id).status == "accepted"
+    assert todos(team, team.reviewer) == [(
+        "rework_queue", "rework_work_item",
+        f"/projects/{project_id}/work-items/{item_a.work_item_id}/rework")]
+
+    with session(team, team.reviewer) as access:
+        team.reviews.rework(access, project_id=project_id, work_item_id=item_a.work_item_id,
+                            expected_version=back_a.version)
+    second_a = team.make_dispatch(requires_real_data=False).dispatch(project_id,
+                                                                     item_a.work_item_id)
+    payload = json.loads(team.make_execution().package(token, second_a.attempt_id)[0])
+    # 那一句关于 B 的退回没有跟着来到 A 的任务包里：它说的是别人的活。
+    assert [(entry["kind"], entry["reason"]) for entry in payload["rework"]] == [
+        ("requirement_acceptance", "A 的原文那条没满足")]
 
 
 def test_an_integration_verdict_carries_only_the_bundle_it_was_made_against(team):

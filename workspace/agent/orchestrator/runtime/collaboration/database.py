@@ -8,7 +8,7 @@ from typing import Iterator
 from .models import SchemaVersionError
 
 
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 
 _SCHEMA_STATEMENTS = (
     """
@@ -987,6 +987,15 @@ _INTEGRATION_SCHEMA = (
     """,
 )
 
+# A return can name the items it refuses instead of sending the whole bundle back. Which ones it
+# named belongs on the verdict row itself: the next attempt reads these rows as its instructions,
+# and a note about item B handed to item C would tell the worker to fix something nobody complained
+# about. An empty list keeps the older meaning — every accepted item of that bundle.
+_RETURN_SCOPE_SCHEMA = (
+    "ALTER TABLE requirement_acceptance ADD COLUMN returned_items TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE requirement_integrations ADD COLUMN returned_items TEXT NOT NULL DEFAULT ''",
+)
+
 
 def _check_schema_version(connection: sqlite3.Connection) -> None:
     version = connection.execute("PRAGMA user_version").fetchone()[0]
@@ -1093,6 +1102,11 @@ class Database:
                     for statement in _INTEGRATION_SCHEMA:
                         connection.execute(statement)
                     version = 11
+                    migrated = True
+                if version == 11:
+                    for statement in _RETURN_SCOPE_SCHEMA:
+                        connection.execute(statement)
+                    version = 12
                     migrated = True
                 if migrated:
                     connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")

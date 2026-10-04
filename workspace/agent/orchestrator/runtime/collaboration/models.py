@@ -198,6 +198,7 @@ class RequirementAcceptance:
     evidence_hash: str
     reason: str = ""
     created_at: float = 0.0
+    returned_items: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -221,6 +222,7 @@ class RequirementIntegration:
     evidence_hash: str
     reason: str = ""
     created_at: float = 0.0
+    returned_items: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)

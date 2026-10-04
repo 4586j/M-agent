@@ -647,56 +647,100 @@ class ReviewService:
         return updated
 
     def record_integration(self, access: Access, *, project_id: str, requirement_id: str,
-                           decision: str, expected_version: int, reason: str = "") -> Requirement:
+                           decision: str, expected_version: int, reason: str = "",
+                           returned_items: list[str] | tuple[str, ...] = ()) -> Requirement:
         """A manager says whether this bundle is fit to be put in front of the requester.
 
         The verdict is bound to the bundle digest it was made against, so an earlier sign-off
         cannot carry a later round: new accepted work moves the digest and the requirement comes
-        back here. A return re-opens every accepted item, the same way the requester's own return
-        does, because the published plan already carries the next round and the original text is
-        not rewritten. Which acceptance item the bundle covers is a fact the plan already
-        guarantees here — a published plan covers every one of them and this step is only reached
-        once all of them are accepted — so the check is shown by ``integration_report`` rather
-        than enforced by this write.
+        back here. A return re-opens the accepted items it names — all of them when it names
+        none — the same way the requester's own return does, because the published plan already
+        carries the next round and the original text is not rewritten. Which acceptance item the
+        bundle covers is a fact the plan already guarantees here — a published plan covers every
+        one of them and this step is only reached once all of them are accepted — so the check is
+        shown by ``integration_report`` rather than enforced by this write.
         """
         verdict = _choice(decision, INTEGRATION_DECISIONS, "decision")
         explanation = self._reason(reason)
         if verdict == "returned" and not explanation.strip():
             raise ValidationError("A returned integration must say what the delivery missed")
+        if verdict != "returned" and returned_items:
+            raise ValidationError("Only a return can name the work items it refuses")
         member = self._member(access, project_id)
         if member.access_role not in MANAGER_ROLES:
             raise Forbidden("Only a project manager can record the integration check")
         requirement = access.store.get_requirement(project_id, requirement_id)
         bundle = self.delivery_bundle(access.store, project_id, requirement_id)
-        if self._integrated_already(access, requirement, verdict, bundle["evidence_hash"]):
+        refused = self._refused(bundle, returned_items) if verdict == "returned" else []
+        if self._integrated_already(access, requirement, verdict, bundle["evidence_hash"], refused):
             return requirement
         if requirement.status != "integrating":
             raise InvalidState("Requirement is not awaiting an integration check")
         _version(requirement.version, expected_version)
         now = self.clock()
         if verdict == "returned":
-            for entry in bundle["items"]:
-                stored = access.store.get_work_item(project_id, entry["work_item_id"])
-                reopened = access.store.advance_work_item(entry["work_item_id"],
-                                                          status="changes_requested",
-                                                          expected_version=stored.version,
-                                                          updated_at=now)
-                record_audit(access.conn, now, access.user.user_id, "work_item.changes_requested",
-                             entry["work_item_id"], project_id=project_id,
-                             target_version=reopened.version)
+            self._reopen(access, project_id=project_id, refused=refused, bundle=bundle, now=now)
         target = "awaiting_acceptance" if verdict == "passed" else "rework"
         updated = access.store.set_requirement_status(project_id, requirement_id, status=target,
                                                       expected_version=requirement.version,
                                                       updated_at=now)
         access.store.add_requirement_integration(
             project_id, requirement_id, actor_user_id=access.user.user_id, decision=verdict,
-            evidence_hash=bundle["evidence_hash"], reason=explanation, created_at=now)
+            evidence_hash=bundle["evidence_hash"], reason=explanation, created_at=now,
+            returned_items=refused)
         record_audit(access.conn, now, access.user.user_id, f"integration.{verdict}",
                      requirement_id, project_id=project_id, target_version=updated.version)
         return updated
 
+    def _refused(self, bundle: dict, returned_items) -> list[str]:
+        """The work items a return names, checked against the delivery it is refusing.
+
+        Naming something that is not part of this bundle is refused instead of being read as
+        "everything": the next attempt takes these rows as its instructions, so a key that matches
+        no work item would sign a statement about work nobody is pointing at.
+        """
+        keys = self._keys(returned_items)
+        missing = [key for key in keys if key not in {entry["key"] for entry in bundle["items"]}]
+        if missing:
+            raise ValidationError("Only a work item of this delivery can be returned: "
+                                  + ", ".join(sorted(missing)))
+        return keys
+
+    @staticmethod
+    def _keys(returned_items) -> list[str]:
+        keys = list(returned_items)
+        if len(keys) > 64:
+            raise ValidationError("Too many returned work items")
+        for key in keys:
+            if not isinstance(key, str) or not key.strip() or len(key) > 128:
+                raise ValidationError("Invalid returned work item")
+        if len({key for key in keys}) != len(keys):
+            raise ValidationError("Returned work items must not repeat")
+        return sorted(keys)
+
+    def _reopen(self, access: Access, *, project_id: str, refused: list[str], bundle: dict,
+                now: float) -> None:
+        """Send back exactly the deliveries this return names, and only those still accepted.
+
+        An empty ``refused`` list is the older, wider meaning: the whole bundle went back.
+        """
+        wanted = set(refused)
+        for entry in bundle["items"]:
+            if wanted and entry["key"] not in wanted:
+                continue
+            if entry["status"] != "accepted":
+                continue
+            stored = access.store.get_work_item(project_id, entry["work_item_id"])
+            reopened = access.store.advance_work_item(entry["work_item_id"],
+                                                      status="changes_requested",
+                                                      expected_version=stored.version,
+                                                      updated_at=now)
+            record_audit(access.conn, now, access.user.user_id, "work_item.changes_requested",
+                         entry["work_item_id"], project_id=project_id,
+                         target_version=reopened.version)
+
     def _integrated_already(self, access: Access, requirement: Requirement, verdict: str,
-                            evidence_hash: str) -> bool:
+                            evidence_hash: str, refused: list[str]) -> bool:
         """Is this the verdict this bundle already got? Then the retry writes nothing: a second
         click must not reopen work that is already back in the queue."""
         if requirement.status != ("awaiting_acceptance" if verdict == "passed" else "rework"):
@@ -704,24 +748,29 @@ class ReviewService:
         latest = access.store.latest_requirement_integration(requirement.project_id,
                                                              requirement.requirement_id)
         return (latest is not None and latest.decision == verdict
-                and latest.evidence_hash == evidence_hash)
+                and latest.evidence_hash == evidence_hash
+                and latest.returned_items == tuple(refused))
 
     def accept_requirement(self, access: Access, *, project_id: str, requirement_id: str,
-                           decision: str, expected_version: int, reason: str = "") -> Requirement:
+                           decision: str, expected_version: int, reason: str = "",
+                           returned_items: list[str] | tuple[str, ...] = ()) -> Requirement:
         """The requester signs for the whole requirement; nobody else can speak for them.
 
-        A return re-opens every accepted work item instead of refusing, because the published
-        plan already carries the second round: no new plan is made and the original text is not
-        rewritten, only the items go back. Their ``changes_requested`` status is what puts a
-        re-queue to-do in front of a manager, and the verdict row keeps which bundle was refused.
-        A per-attempt acceptance row is deliberately not written here: one attempt holds one
-        business verdict, and a requirement-level verdict spans every attempt of the round, so
-        ``requirement_acceptance`` is the record the next attempt reads.
+        A return re-opens work items instead of refusing, because the published plan already
+        carries the second round: no new plan is made and the original text is not rewritten. It
+        names the items it refuses, and names none when the whole delivery goes back. Their
+        ``changes_requested`` status is what puts a re-queue to-do in front of a manager, and the
+        verdict row keeps which bundle was refused and which items of it. A per-attempt acceptance
+        row is deliberately not written here: one attempt holds one business verdict, and a
+        requirement-level verdict spans the attempts it names, so ``requirement_acceptance`` is the
+        record the next attempt reads.
         """
         verdict = _choice(decision, ACCEPT_DECISIONS, "decision")
         explanation = self._reason(reason)
         if verdict == "changes_requested" and not explanation.strip():
             raise ValidationError("A returned requirement must say what the delivery missed")
+        if verdict != "changes_requested" and returned_items:
+            raise ValidationError("Only a return can name the work items it refuses")
         self._member(access, project_id)
         requirement = access.store.get_requirement(project_id, requirement_id)
         if requirement.requester_id != access.user.user_id:
@@ -731,7 +780,7 @@ class ReviewService:
                 return requirement
             raise InvalidState("A completed requirement cannot be returned")
         if requirement.status != "awaiting_acceptance":
-            if self._returned_already(access, requirement, verdict):
+            if self._returned_already(access, requirement, verdict, returned_items):
                 return requirement
             raise InvalidState("Requirement is not awaiting acceptance")
         _version(requirement.version, expected_version)
@@ -740,33 +789,32 @@ class ReviewService:
             raise InvalidState("Every work item must be accepted before the requirement is")
         now = self.clock()
         target = "rework" if verdict == "changes_requested" else "completed"
+        refused = (self._refused(bundle, returned_items)
+                   if verdict == "changes_requested" else [])
         if verdict == "changes_requested":
-            for entry in bundle["items"]:
-                stored = access.store.get_work_item(project_id, entry["work_item_id"])
-                reopened = access.store.advance_work_item(entry["work_item_id"],
-                                                          status="changes_requested",
-                                                          expected_version=stored.version,
-                                                          updated_at=now)
-                record_audit(access.conn, now, access.user.user_id, "work_item.changes_requested",
-                             entry["work_item_id"], project_id=project_id,
-                             target_version=reopened.version)
+            self._reopen(access, project_id=project_id, refused=refused, bundle=bundle, now=now)
         updated = access.store.set_requirement_status(project_id, requirement_id, status=target,
                                                       expected_version=requirement.version,
                                                       updated_at=now)
         access.store.add_requirement_acceptance(
             project_id, requirement_id, reviewer_user_id=access.user.user_id, decision=verdict,
-            evidence_hash=bundle["evidence_hash"], reason=explanation, created_at=now)
+            evidence_hash=bundle["evidence_hash"], reason=explanation, created_at=now,
+            returned_items=refused)
         record_audit(access.conn, now, access.user.user_id,
                      "requirement.returned" if verdict == "changes_requested"
                      else "requirement.completed", requirement_id,
                      project_id=project_id, target_version=updated.version)
         return updated
 
-    def _returned_already(self, access: Access, requirement: Requirement, verdict: str) -> bool:
+    def _returned_already(self, access: Access, requirement: Requirement, verdict: str,
+                          returned_items) -> bool:
         """Is this the very return the requester already signed? Then the second click changes
-        nothing, so a retried request cannot reopen work that is already back in the queue."""
+        nothing, so a retried request cannot reopen work that is already back in the queue.
+        Naming other items this time is a different statement, and is not a replay."""
         if verdict != "changes_requested" or requirement.status != "rework":
             return False
+        keys = self._keys(returned_items)
         rows = access.store.list_requirement_acceptances(requirement.project_id,
                                                          requirement.requirement_id)
-        return bool(rows) and rows[-1].decision == "changes_requested"
+        return bool(rows) and rows[-1].decision == "changes_requested" \
+            and rows[-1].returned_items == tuple(keys)

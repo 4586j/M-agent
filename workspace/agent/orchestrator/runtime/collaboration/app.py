@@ -273,12 +273,14 @@ class RequirementAcceptanceCreate(Input):
     decision: Literal["accepted", "changes_requested"]
     expected_version: Version
     reason: Annotated[str, Field(max_length=2048)] = ""
+    returned_items: Annotated[list[str], Field(max_length=64)] = []
 
 
 class IntegrationDecision(Input):
     decision: Literal["passed", "returned"]
     expected_version: Version
     reason: Annotated[str, Field(max_length=2048)] = ""
+    returned_items: Annotated[list[str], Field(max_length=64)] = []
 
 
 class AttemptReconcile(Input):
@@ -1042,7 +1044,8 @@ def create_app(config: AppConfig) -> FastAPI:
         with _access(request, project_id=pid, write=True) as access:
             requirement = app.state.reviews.record_integration(
                 access, project_id=pid, requirement_id=rid, decision=body.decision,
-                reason=body.reason, expected_version=body.expected_version)
+                reason=body.reason, expected_version=body.expected_version,
+                returned_items=body.returned_items)
             return asdict(requirement)
 
     @router.get("/projects/{pid}/requirements/{rid}/delivery")
@@ -1061,7 +1064,8 @@ def create_app(config: AppConfig) -> FastAPI:
         with _access(request, project_id=pid, write=True) as access:
             requirement = app.state.reviews.accept_requirement(
                 access, project_id=pid, requirement_id=rid, decision=body.decision,
-                reason=body.reason, expected_version=body.expected_version)
+                reason=body.reason, expected_version=body.expected_version,
+                returned_items=body.returned_items)
             return asdict(requirement)
 
     @router.post("/projects/{pid}/requirements/{rid}/plans", status_code=201)

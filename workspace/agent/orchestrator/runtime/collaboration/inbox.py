@@ -56,13 +56,17 @@ ACTIONS = {
     "final_acceptance": ("accept_requirement",
                          "/projects/{project_id}/requirements/{requirement_id}/acceptance",
                          {"coverage": "/projects/{project_id}/requirements/{requirement_id}"
-                                       "/integration"}),
+                                       "/integration",
+                          "delivery": "/projects/{project_id}/requirements/{requirement_id}"
+                                      "/delivery"}),
     # A delivery that has stopped being somebody's work has to become somebody's check: it is
     # owed to the project's managers, who are the only ones allowed to record the verdict.
     "integration_check": ("record_integration",
                           "/projects/{project_id}/requirements/{requirement_id}/integration",
                           {"coverage": "/projects/{project_id}/requirements/{requirement_id}"
-                                       "/integration"}),
+                                        "/integration",
+                           "delivery": "/projects/{project_id}/requirements/{requirement_id}"
+                                       "/delivery"}),
 }
 
 # The drafting to-dos come from a different projection, so they arrive as bare requirement rows

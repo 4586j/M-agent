@@ -77,14 +77,16 @@ class DispatchService:
         return sorted(dependencies, key=lambda entry: entry["key"])
 
     def _rework_notes(self, store, project_id: str, work_item_id: str,
-                      requirement_id: str) -> list[dict]:
-        """Every human return for this item, in the order the rounds actually happened.
+                      requirement_id: str, item_key: str) -> list[dict]:
+        """Every human return that speaks about this item, in the order the rounds actually happened.
 
         Both the owner's confirmation and the business acceptance can send one delivery back, and
-        the requester's verdict on the whole requirement sends every accepted delivery of the plan
-        back at once. So can a manager's integration check, which is the one return that says the
-        bundle as a whole does not cover the original text. All four are notes the next attempt has
-        to read, so they share one list.
+        the requester's verdict on the whole requirement can send every accepted delivery of the
+        plan back at once — or only the items it names, now that a return can point. So can a
+        manager's integration check, which is the one return that says the bundle as a whole does
+        not cover the original text. All four are notes the next attempt has to read, so they share
+        one list; a requirement-level note that named other items than this one is not this
+        attempt's instruction.
         The attempt number orders the per-delivery notes because a clock can hand two reviewers the
         same second; a requirement verdict has no attempt of its own, so within one second it
         comes after the deliveries it covered.
@@ -101,13 +103,17 @@ class DispatchService:
                               "reason": entry.reason, "reviewed_by": entry.reviewer_user_id,
                               "reviewed_at": entry.created_at})
         for entry in store.list_requirement_acceptances(project_id, requirement_id):
-            if entry.decision == "changes_requested":
-                notes.append({"kind": "requirement_acceptance", "attempt_id": None,
-                              "attempt_number": None, "reason": entry.reason,
-                              "reviewed_by": entry.reviewer_user_id,
-                              "reviewed_at": entry.created_at})
+            if entry.decision != "changes_requested":
+                continue
+            if entry.returned_items and item_key not in entry.returned_items:
+                continue
+            notes.append({"kind": "requirement_acceptance", "attempt_id": None,
+                          "attempt_number": None, "reason": entry.reason,
+                          "reviewed_by": entry.reviewer_user_id,
+                          "reviewed_at": entry.created_at})
         for entry in store.list_requirement_integrations(project_id, requirement_id):
-            if entry.decision == "returned":
+            if entry.decision == "returned" and (not entry.returned_items
+                                                 or item_key in entry.returned_items):
                 notes.append({"kind": "requirement_integration", "attempt_id": None,
                               "attempt_number": None, "reason": entry.reason,
                               "reviewed_by": entry.actor_user_id,
@@ -144,7 +150,7 @@ class DispatchService:
             # What a human already sent back for this item or for the whole delivery: the next
             # attempt is told which acceptance item missed instead of being asked to guess.
             "rework": self._rework_notes(store, project_id, item.work_item_id,
-                                         requirement.requirement_id),
+                                         requirement.requirement_id, item.key),
             "policy": {
                 "binding_id": binding.binding_id, "binding_version": binding.version,
                 "duty": binding.duty, "persona_version": binding.persona_version,

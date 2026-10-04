@@ -14,11 +14,13 @@ const DECISIONS = {
   final_acceptance: {title: "最终验收", field: "decision", reason: true,
                      hint: "退回时必填：写下整篇交付缺了什么",
                      choices: [["accepted", "签字验收"], ["changes_requested", "退回整篇交付"]],
-                     look: "coverage", lookLabel: "查看覆盖核对", shown: showCoverage},
+                     look: "coverage", lookLabel: "查看覆盖核对", shown: showCoverage,
+                     returns: "changes_requested"},
   integration_check: {title: "集成核对", field: "decision",
                       reason: true, hint: "退回时必填：写下缺了哪一条验收",
                       choices: [["passed", "核对通过，交给提出人"], ["returned", "退回返工"]],
-                      look: "coverage", lookLabel: "查看覆盖核对", shown: showCoverage},
+                      look: "coverage", lookLabel: "查看覆盖核对", shown: showCoverage,
+                      returns: "returned"},
   rework_queue: {title: "重新排队", field: null, reason: false, choices: []},
   worker_attention: {title: "执行机失联（租约已过期）", field: null, reason: true, choices: [],
                      hint: "写下你看到的实情（可留空）",
@@ -433,11 +435,12 @@ function showCoverage(parent, view) {
     add(parent, "dd", null, "还没有人核对过这一版交付。");
   }
   for (const verdict of view.verdicts) {
-    add(parent, "dd", null, `${personName(verdict.actor_user_id)} `
-        + `${verdict.decision === "passed" ? "核对通过" : "退回返工"} · `
-        + `摘要 ${verdict.evidence_hash} · ${signedSameBundle(verdict.evidence_hash,
-                                                              view.report.evidence_hash)} · `
-        + `${when(verdict.created_at)} · ${verdict.reason || "没有留下理由"}`);
+    add(parent, "dd", null, [`${personName(verdict.actor_user_id)} `
+        + `${verdict.decision === "passed" ? "核对通过" : "退回返工"}`,
+        `摘要 ${verdict.evidence_hash}`,
+        signedSameBundle(verdict.evidence_hash, view.report.evidence_hash),
+        returnScopeOf(verdict), when(verdict.created_at),
+        verdict.reason || "没有留下理由"].filter(Boolean).join(" · "));
   }
 }
 
@@ -445,6 +448,54 @@ function showCoverage(parent, view) {
 function signedSameBundle(signed, current) {
   return signed === current ? "签的就是屏幕上这一份"
                             : "签的是另一份交付，屏幕上列出的不是它";
+}
+
+// 退回点名了哪几项，决定下一轮谁回来重做：不写出来就等于说「整篇都不行」。
+// 通过的那一方没有可退的东西，所以它没有这一句——给一次核对通过写上「退回整篇交付」是假话。
+function returnScopeOf(verdict) {
+  if (verdict.decision !== "changes_requested" && verdict.decision !== "returned") {
+    return "";
+  }
+  return verdict.returned_items.length ? `只退了 ${verdict.returned_items.join("、")}`
+                                       : "退回整篇交付";
+}
+
+function returnScope(form, entry) {
+  // 退回整篇之外还得能只退其中几项：清单要点开才取，取到了也只列这一版里已经验收的那几项。
+  const box = add(form, "div", "scope");
+  const trigger = add(box, "button", "soft", "只退其中几项");
+  trigger.type = "button";
+  const list = add(box, "div", "locator");
+  list.hidden = true;
+  add(box, "span", "locator", " 不勾任何一项，就是退回整篇交付。");
+  let loaded = false;
+  trigger.addEventListener("click", async () => {
+    try {
+      if (!loaded) {
+        const view = await get(entry.links.delivery);
+        list.replaceChildren();
+        const accepted = view.delivery.items.filter(item => item.status === "accepted");
+        for (const item of accepted) {
+          const line = add(list, "label", null);
+          const tick = add(line, "input");
+          tick.type = "checkbox";
+          tick.value = item.key;
+          add(line, "span", null, ` ${item.key} · 第 ${item.attempt_number} 次尝试 · `
+                                 + `${item.acceptance.map(one => one.text).join("、") || "无验收项"}`);
+        }
+        if (!accepted.length) {
+          add(list, "span", null, "这一版交付里没有已验收的工作项。");
+        }
+        loaded = true;
+      }
+      list.hidden = false;
+    } catch (error) {
+      if (error.name !== "AbortError") {
+        say(`工作项清单取不回：${error.message}`, "error");
+      }
+    }
+  });
+  return () => [...list.querySelectorAll("input:checked")].map(tick => tick.value);
 }
 
 function renderChoice(form, entry, spec) {
@@ -464,6 +515,8 @@ function renderChoice(form, entry, spec) {
     reason.placeholder = spec.hint || "写下理由（退回时必填）";
     reason.size = 34;
   }
+  const scope = spec.returns && entry.links && entry.links.delivery ? returnScope(form, entry)
+                                                                   : null;
   const button = add(form, "button", null, spec.submitLabel || "提交");
   button.type = "button";
   button.addEventListener("click", async () => {
@@ -474,6 +527,12 @@ function renderChoice(form, entry, spec) {
     }
     if (reason) {
       body.reason = reason.value;
+    }
+    if (scope && choice && choice.value === spec.returns) {
+      const picked = scope();
+      if (picked.length) {
+        body.returned_items = picked;
+      }
     }
     for (const [name, field] of Object.entries(spec.extra || {})) {
       body[name] = entry[field];
@@ -825,9 +884,12 @@ async function renderRequirement(projectId, requirementId) {
       }
       add(block, "dd", "locator", `本次交付摘要 ${delivery.delivery.evidence_hash}`);
       for (const verdict of delivery.acceptances) {
-        add(block, "dd", null, `提出人裁定：${verdict.decision} · `
-            + `${verdict.reason || "无理由文本"} · `
-            + signedSameBundle(verdict.evidence_hash, delivery.delivery.evidence_hash));
+        add(block, "dd", null, [`提出人裁定：${verdict.decision}`,
+                                verdict.reason || "无理由文本",
+                                returnScopeOf(verdict),
+                                signedSameBundle(verdict.evidence_hash,
+                                                 delivery.delivery.evidence_hash)]
+            .filter(Boolean).join(" · "));
       }
     } catch (error) {
       if (error.name !== "AbortError") {
