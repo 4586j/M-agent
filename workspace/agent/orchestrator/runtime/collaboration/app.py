@@ -1216,9 +1216,21 @@ def create_app(config: AppConfig) -> FastAPI:
                                                  entry.get("requirement_id") or ""))
 
     @router.get("/inbox")
-    def inbox(request: Request):
+    def inbox(request: Request, response: Response,
+              limit: Annotated[int, Query(ge=1, le=200)] = 50,
+              offset: Annotated[int, Query(ge=0)] = 0):
+        """One page of the to-dos this person owes, newest first.
+
+        Paging is a read view only. ``POST /inbox/ack`` still checks against the undivided list, so
+        somebody reading page two can acknowledge what they see there, and the round that reclaims
+        stale acknowledgements keeps exactly what this person could still be shown. How many rows
+        the whole list has travels in ``X-Total-Count``, because the body is an array and an
+        envelope around it would change what every existing reader expects.
+        """
         with _access(request) as access:
-            return _inbox(access)
+            entries = _inbox(access)
+            response.headers["X-Total-Count"] = str(len(entries))
+            return entries[offset:offset + limit]
 
     def _stamped_feed(access, limit: int) -> list[dict]:
         """The news list with this reader's unread flag on it; read state, so it may lag."""

@@ -87,6 +87,7 @@ const NEWS = {
 };
 const ACTIVITY_LIMIT = 20;
 const FEED_LIMIT = 20;
+const TODO_LIMIT = 20;
 
 let csrf = null;
 let me = null;
@@ -95,6 +96,10 @@ let roster = [];
 let projectNames = {};
 let pendingRequirement = null;
 let controller = new AbortController();
+// 待办一次只摊一屏，这三个数说的是屏幕上这一叠，不是服务端一共欠谁多少条。
+let todoShown = 0;
+let todoTotal = 0;
+let todoUnread = 0;
 
 const fields = {};
 for (const id of ["login", "workspace", "who", "logout", "project", "requirement", "todos",
@@ -129,10 +134,11 @@ function when(seconds) {
 }
 
 async function call(path, options) {
+  const {raw, ...init} = options || {};
   const response = await fetch(API + path, {
     credentials: "same-origin",
-    ...options,
-    headers: {Accept: "application/json", ...(options.headers || {})},
+    ...init,
+    headers: {Accept: "application/json", ...(init.headers || {})},
     signal: controller.signal,
   });
   if (!response.ok) {
@@ -144,11 +150,19 @@ async function call(path, options) {
     }
     throw new Error(label);
   }
+  if (raw) {
+    return response;
+  }
   return response.status === 204 ? null : response.json();
 }
 
 function get(path) {
   return call(path, {method: "GET"});
+}
+
+// 待办的总数只能从响应头拿：正文是一个数组，给它套信封会把所有既有读法都改掉。
+function getRaw(path) {
+  return call(path, {method: "GET", raw: true});
 }
 
 function post(path, body) {
@@ -164,17 +178,66 @@ function stop() {
   controller = new AbortController();
 }
 
+function resetTodos() {
+  todoShown = 0;
+  todoTotal = 0;
+  todoUnread = 0;
+  fields.todos.replaceChildren();
+  text(fields.todoCount, "");
+}
+
+async function loadTodos(path) {
+  const response = await getRaw(path);
+  const rows = await response.json();
+  todoTotal = Number(response.headers.get("X-Total-Count") ?? rows.length);
+  for (const entry of rows.filter(item => DECISIONS[item.item_type])) {
+    renderTodo(entry);
+  }
+  todoShown += rows.length;
+  todoUnread += rows.filter(entry => entry.unread).length;
+  renderTodoTail();
+}
+
+function renderTodoTail() {
+  const old = fields.todos.querySelector(".more");
+  if (old) {
+    old.remove();
+  }
+  text(fields.todoCount, todoUnread ? `（未读 ${todoUnread}）` : "");
+  if (!todoShown) {
+    add(fields.todos, "li", null, "当前没有属于你的待办裁定。");
+    return;
+  }
+  if (todoShown < todoTotal) {
+    // 一屏只摊这么多：剩下的条数说清楚，取回下一批的按钮也留在这儿，别让人以为待办就这几条。
+    const row = add(fields.todos, "li", "more locator",
+                    `已摊开 ${todoShown} 条，还有 ${todoTotal - todoShown} 条没取回来。`);
+    const button = add(row, "button", "soft", "再看一批");
+    button.type = "button";
+    button.addEventListener("click", async () => {
+      button.disabled = true;
+      try {
+        await loadTodos(`/inbox?limit=${TODO_LIMIT}&offset=${todoShown}`);
+      } catch (error) {
+        button.disabled = false;
+        if (error.name !== "AbortError") {
+          say(`待办翻页失败：${error.message}`, "error");
+        }
+      }
+    });
+  }
+}
+
 async function refresh() {
   stop();
   const projectId = fields.project.value;
   const requirementId = fields.requirement.value;
   role = null;
   roster = [];
-  fields.todos.replaceChildren();
+  resetTodos();
   fields.feedList.replaceChildren();
   fields.createBox.replaceChildren();
   fields.detail.replaceChildren();
-  text(fields.todoCount, "");
   text(fields.feedCount, "");
   say("");
   try {
@@ -185,16 +248,7 @@ async function refresh() {
     }
     role = (await get(`/projects/${projectId}`)).access_role;
     roster = await get(`/projects/${projectId}/members`);
-    const inbox = await get("/inbox");
-    const todos = inbox.filter(item => DECISIONS[item.item_type]);
-    for (const entry of todos) {
-      renderTodo(entry);
-    }
-    const unread = todos.filter(entry => entry.unread).length;
-    text(fields.todoCount, unread ? `（未读 ${unread}）` : "");
-    if (!fields.todos.children.length) {
-      add(fields.todos, "li", null, "当前没有属于你的待办裁定。");
-    }
+    await loadTodos(`/inbox?limit=${TODO_LIMIT}`);
     renderCreate(projectId);
     if (requirementId) {
       await renderRequirement(projectId, requirementId);
@@ -928,8 +982,7 @@ fields.logout.addEventListener("click", async () => {
   fields.logout.hidden = true;
   fields.project.replaceChildren();
   fields.requirement.replaceChildren();
-  fields.todos.replaceChildren();
-  text(fields.todoCount, "");
+  resetTodos();
   fields.feedList.replaceChildren();
   text(fields.feedCount, "");
   fields.detail.replaceChildren();

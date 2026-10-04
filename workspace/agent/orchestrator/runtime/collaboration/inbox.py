@@ -126,8 +126,14 @@ class InboxService:
             stamped.append(enriched)
         return stamped
 
-    def ack(self, access: Access, *, item_key: str, known: set[str]) -> None:
-        """Mark one of the to-dos this person is actually owed as seen; the decision stays open."""
+    def ack(self, access: Access, *, item_key: str, known: set[str]) -> int:
+        """Mark one of the to-dos this person is actually owed as seen; the decision stays open.
+
+        ``known`` is the whole set the read view could currently hand back, and it doubles as the
+        boundary for reclamation: an acknowledgement for anything outside it names a decision that
+        is no longer owed or news too old to be shown again, so this same round drops it.
+        """
         if item_key not in known:
             raise ValidationError("That is not a to-do you currently owe")
         access.store.ack_inbox(access.user.user_id, item_key=item_key, acked_at=self.clock())
+        return access.store.prune_inbox_acks(access.user.user_id, keep=known)

@@ -1166,6 +1166,26 @@ class CollaborationStore:
             conn.execute("INSERT INTO inbox_acks(user_id,item_key,acked_at) VALUES(?,?,?) "
                          "ON CONFLICT(user_id,item_key) DO NOTHING", (user_id, item_key, acked_at))
 
+    def prune_inbox_acks(self, user_id: str, *, keep: set[str]) -> int:
+        """Drop this person's acknowledgements for anything that is no longer on their radar.
+
+        Read state has no other way to shrink. A key names one decision owed, and once somebody
+        rules on it (or the news slides out of the window that can show it) nothing will ever
+        render that key again, so the row only remembers that a person once saw a thing.
+        """
+        with self._write() as conn:
+            dead = [row["item_key"] for row in conn.execute(
+                "SELECT item_key FROM inbox_acks WHERE user_id=?", (user_id,))
+                if row["item_key"] not in keep]
+            for start in range(0, len(dead), 200):
+                # Chunked because the key list rides as bound parameters, and SQLite caps how many
+                # one statement may carry.
+                chunk = dead[start:start + 200]
+                conn.execute(
+                    f"DELETE FROM inbox_acks WHERE user_id=? AND item_key IN "
+                    f"({','.join('?' * len(chunk))})", (user_id, *chunk))
+            return len(dead)
+
     def advance_work_item(self, work_item_id: str, *, status: str, expected_version: int,
                           updated_at: float) -> WorkItem:
         _choice(status, WORK_ITEM_STATUSES, "status")

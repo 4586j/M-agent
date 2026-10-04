@@ -2365,6 +2365,53 @@ def test_a_to_do_stays_owed_after_the_person_marks_it_read(api):
     assert rows("member") == []
 
 
+def test_the_inbox_hands_back_one_page_and_reclaims_acks_that_can_never_show_again(api):
+    # 两个项目各欠一份产出确认：收件箱就此有了可翻的第二页。
+    delivered(api), delivered(api)
+    manager = api.identities["manager"]["user"]["user_id"]
+
+    def page(query=""):
+        response = api.send("manager", "GET", f"/inbox{query}")
+        return checked(response), int(response.headers["X-Total-Count"])
+
+    whole, total = page()
+    keys = [entry["key"] for entry in whole]
+    assert total == len(keys) == 2 and len(set(keys)) == 2
+    # 不传参数走的就是那一档默认边界，且它报的总数是「一共欠多少」，不是「这一页有几条」。
+    assert page("?limit=50") == (whole, total)
+    assert [page(f"?limit=1&offset={index}")[0] for index in (0, 1)] == [[whole[0]], [whole[1]]]
+    assert page("?limit=1&offset=2") == ([], 2)
+    for junk in ("?limit=0", "?limit=201", "?offset=-1"):
+        checked(api.send("manager", "GET", f"/inbox{junk}"), 422)
+
+    def stored():
+        with api.database.read() as conn:
+            return {row["item_key"] for row in conn.execute(
+                "SELECT item_key FROM inbox_acks WHERE user_id=?", (manager,))}
+
+    assert stored() == set()
+    checked(api.send("manager", "POST", "/inbox/ack", json={"item_key": keys[0]}), 204)
+    assert stored() == {keys[0]}
+    # 分页只收窄了「一次给几条」，没有收窄「这条是不是你欠的」：第二页上的照样能标已读。
+    checked(api.send("manager", "POST", "/inbox/ack", json={"item_key": keys[1]}), 204)
+    assert stored() == set(keys)
+
+    # 第一份交付签掉了，那条待办不再是任何人的：它的已读标记也一起走——没有别的东西会再把它画出来。
+    checked(api.send("manager", "POST", whole[0]["href"],
+                     json={"decision": "confirmed",
+                           "expected_version": whole[0]["expected_version"]}))
+    checked(api.send("manager", "POST", "/inbox/ack", json={"item_key": keys[1]}), 204)
+    assert stored() == {keys[1]}
+    remaining = page("")[0]
+    assert keys[0] not in [entry["key"] for entry in remaining]
+    # 签完产出立刻长出下一格要裁的（业务验收）：它是新长出来的，不该被上一轮的已读沾上。
+    assert [(entry["item_type"], entry["unread"]) for entry in remaining] == [
+        ("business_acceptance", True), ("delivery_confirmation", False)]
+    # 另一份还挂着：标过已读只是少了一个红点，要写的动作与版本一个字都没变。
+    still = next(entry for entry in remaining if entry["item_type"] == "delivery_confirmation")
+    assert (still["action"], still["href"]) == ("confirm_delivery", whole[1]["href"])
+
+
 def test_a_new_requirement_revision_is_unread_again(api):
     project = api.project()
     pid = project["project_id"]
@@ -2602,6 +2649,18 @@ def test_the_panel_renders_every_kind_of_to_do_the_inbox_can_advertise():
     source = (RUNTIME / "collaboration" / "web" / "app.js").read_text(encoding="utf-8")
     block = source.split("const DECISIONS = {", 1)[1].split("\n};", 1)[0]
     assert set(re.findall(r"^  (\w+): \{", block, re.MULTILINE)) == set(ACTIONS) | set(DRAFT_ACTIONS)
+
+
+def test_the_panel_asks_for_a_page_of_todos_and_says_what_it_left_out():
+    # 后端把 /inbox 收成一次一屏之后，面板若仍按「一次拿全部」来画，屏外那些待办就悄悄不见了。
+    source = (RUNTIME / "collaboration" / "web" / "app.js").read_text(encoding="utf-8")
+    assert re.search(r"const TODO_LIMIT = \d+;", source)
+    assert "/inbox?limit=${TODO_LIMIT}" in source
+    assert "/inbox?limit=${TODO_LIMIT}&offset=${todoShown}" in source
+    assert "X-Total-Count" in source
+    # 没取回来多少要说得出数，还要有下一步：只写「还有更多」等于把人留在原地猜。
+    assert re.search(r"还有 \$\{todoTotal - todoShown\} 条", source)
+    assert re.search(r"add\(row, \"button\", \"soft\", \"再看一批\"\)", source)
 
 
 def test_the_panel_offers_every_action_the_requirement_endpoint_accepts():

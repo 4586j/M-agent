@@ -3293,6 +3293,38 @@ def test_a_seen_to_do_is_still_owed_until_someone_rules(team):
         inbox.ack(access, item_key=f"final_acceptance:{project_id}{'f' * 32}", known=keys)
 
 
+def test_acknowledging_a_to_do_also_reclaims_acks_that_can_never_show_again(team):
+    """已读标记只会往里加，此前没人往外删：这一条给它一个收缩的时刻，而且要收缩得动一批。"""
+    requirement, plan, _instance, token = reserved_plan(team, plan_item(team, "A", estimate=5))
+    project_id = requirement.project_id
+    item = work_item(team, plan, "A")
+    attempt = team.make_dispatch(requires_real_data=False).dispatch(project_id, item.work_item_id)
+    deliver(team, token, attempt, "A 自认完成")
+    inbox = InboxService(clock=team.clock)
+    key = f"delivery_confirmation:{project_id}:{attempt.attempt_id}"
+    with session(team, team.reviewer) as access:
+        live = {entry["key"] for entry in inbox.stamp(access, inbox.pending(access))}
+    assert live == {key}
+
+    # 250 条比一条语句肯带的占位符还多：回收得分批，而不是第一次撞上上限就报错。
+    with team.database.transaction() as conn:
+        conn.executemany("INSERT INTO inbox_acks(user_id,item_key,acked_at) VALUES(?,?,?)",
+                         [(team.reviewer.user_id, f"delivery_confirmation:{project_id}:gone{i}",
+                           team.clock()) for i in range(250)])
+    with session(team, team.reviewer) as access:
+        assert inbox.ack(access, item_key=key, known=live) == 250
+    with team.database.read() as conn:
+        rows = conn.execute("SELECT item_key FROM inbox_acks WHERE user_id=?",
+                            (team.reviewer.user_id,)).fetchall()
+    assert [row["item_key"] for row in rows] == [key]
+    # 同一格再标一次：没有新行要插，也没有旧行可收。
+    with session(team, team.reviewer) as access:
+        assert inbox.ack(access, item_key=key, known=live) == 0
+    # 已读不裁定：这条待办仍挂在原处，要写的动作一个字都没变。
+    assert [(entry["item_type"], entry["action"]) for entry in listed(team, team.reviewer)] == [
+        ("delivery_confirmation", "confirm_delivery")]
+
+
 # --- resident scheduler host ---------------------------------------------------------
 
 def host_for(team, *, dispatch=None):
