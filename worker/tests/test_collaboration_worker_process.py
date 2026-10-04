@@ -156,13 +156,14 @@ def approved_requirement(rig) -> str:
     return requirement
 
 
-def published_plan(rig, requirement_id: str, revision_id: str, revision_hash: str) -> dict:
+def published_plan(rig, requirement_id: str, revision_id: str, revision_hash: str, *,
+                   keys=ITEM_KEYS) -> dict:
     fields = [{"key": key, "title": f"{key} 任务", "objective": f"完成 {key} 的目标",
                "scope": "范围内", "non_goals": "不做的事", "duty": "实现",
                "assignee_user_id": rig.executor.user_id, "binding_id": rig.binding.binding_id,
                "acceptance_ids": [f"AC-{index:03d}" for index in range(1, 4)],
                "estimated_units": 2, "depends_on": []}
-              for index, key in enumerate(ITEM_KEYS, start=1)]
+              for index, key in enumerate(keys, start=1)]
     plan = rig.store.create_plan(rig.project.project_id, requirement_id,
                                  revision_id=revision_id, revision_hash=revision_hash,
                                  status="published",
@@ -368,16 +369,30 @@ def wait_status(rig, attempt_id: str, wanted: str, *, timeout=60.0):
                 f"never {wanted}")
 
 
-def wait_local(bundle: Bundle, attempt_id: str, wanted: str, *, timeout=45.0) -> dict:
+def wait_local(bundle: Bundle, attempt_id: str, wanted: str, *, timeout=45.0,
+               reason_contains: str | None = None) -> dict:
     deadline = time.time() + timeout
     while time.time() < deadline:
         response = bundle.local(attempt_id)
-        if response.status_code == 200 and response.json().get("state") == wanted:
-            return response.json()
+        view = response.json() if response.status_code == 200 else {}
+        if view.get("state") == wanted and (
+                reason_contains is None or reason_contains in view.get("reason", "")):
+            return view
         time.sleep(0.2)
     latest = bundle.local(attempt_id)
     pytest.fail(f"the worker never reported {wanted}: {latest.status_code} {latest.text} | "
                 f"{bundle.process.output[-2000:]}")
+
+
+def wait_rejected(rig, attempt_id: str, stage: str, *, timeout=45.0):
+    """Wait for the refused callback to land as its own row; the local journal moves first."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        refused = [row for row in report_rows(rig, attempt_id, stage) if not row.accepted]
+        if refused:
+            return refused
+        time.sleep(0.2)
+    pytest.fail(f"no refused {stage} callback was recorded for {attempt_id}")
 
 
 # --- 闭环 -------------------------------------------------------------------------------
@@ -607,3 +622,140 @@ def test_another_projects_instance_cannot_reach_these_inputs(rig, machine):
                         headers={"X-Instance-Token": bundle.instance_token[:-1]})
     assert damaged.status_code == 401
     foreign.close()
+
+
+# --- 恢复演练（跨进程） -------------------------------------------------------------------
+
+def test_a_lost_run_is_reconciled_and_the_delivery_still_reaches_the_requester(rig, machine):
+    """一次丢失的运行怎么被结算，以及这一版交付怎么一路走到提出人手里。
+
+    撤销在跑的尝试 → 人核对那台机器上留下的痕迹并按失败结算 → 管理员重排队 → 同一个真 Worker
+    再交一次 → 负责人确认、管理员验收 → 需求停在 integrating 等覆盖核对 → 管理员签摘要 →
+    提出人签字。用的是另一条需求和一个只含一项的计划：走到 integrating 要求这一版计划的每一项
+    都被验收，而夹具那条 A–G 的需求在别的用例里早已是混合状态。
+    """
+    bundle = machine(name="recover")
+    requirement = approved_requirement(rig)
+    with human(rig, rig.owner) as access:
+        requirement = access.store.set_requirement_status(
+            rig.project.project_id, requirement.requirement_id, status="executing",
+            expected_version=requirement.version, updated_at=time.time())
+    item = published_plan(rig, requirement.requirement_id, requirement.approved_revision_id,
+                          requirement.approved_revision_hash, keys=("R",))["R"]
+
+    # 唤醒由服务进程经真实 socket 送出；Worker 把任务包与完整原文取回并冻结在自己的磁盘上，
+    # 然后停在待批的安全规则前面——所以它确实动过外部状态，却没有任何一条回传被接受。
+    first = rig.dispatch.dispatch(rig.project.project_id, item.work_item_id)
+    with human(rig, rig.reviewer) as access:
+        rig.reviews.record_rule(access, project_id=rig.project.project_id,
+                                attempt_id=first.attempt_id, rule_key="dangerous_command")
+    bundle.notify(first)
+    wait_local(bundle, first.attempt_id, PAUSED_GATE)
+    assert accepted_stages(rig, first.attempt_id) == []
+    stalled = bundle.state_dir / "work" / first.attempt_id
+    original_hash = digest_of(ORIGINAL.encode("utf-8"))
+    assert (stalled / f"package-{first.input_hash[:16]}.json").read_text(
+        encoding="utf-8") == first.package_json
+    assert (stalled / f"requirement-{original_hash[:16]}.md").read_text(
+        encoding="utf-8") == ORIGINAL
+
+    # 撤回执行权，这一轮既没被确认也收不到被接受的结果。
+    with human(rig, rig.owner) as access:
+        running = access.store.get_work_item(rig.project.project_id, item.work_item_id)
+        withdrawn = rig.reviews.cancel(access, project_id=rig.project.project_id,
+                                       work_item_id=running.work_item_id,
+                                       expected_version=running.version, reason="这一轮先停下来")
+    parked = stored(rig, first.attempt_id)
+    assert (withdrawn.status, parked.status) == ("cancelled", "reconciliation_required")
+
+    # 撤销的提示仍由服务进程经真实 socket 送出：那台机器知道自己停下来了，却确认不了停止——
+    # 执行权已被撤回，所以它只能本地转入对账，服务端一行都不接受。
+    delivery = tick(rig)
+    assert delivery.status_code == 200, delivery.text
+    # 那台机器本地先转入对账，随后停止确认被服务端拒绝，它写下的是「没被接受」而不是「已停好」。
+    wait_local(bundle, first.attempt_id, "reconciling",
+               reason_contains="stop confirmation was not accepted")
+    refused = wait_rejected(rig, first.attempt_id, "cancel")
+    rows = report_rows(rig, first.attempt_id, "cancel")
+    assert (bool(rows[0].accepted), rows[0].reason) == (True, "execution right revoked by human")
+    assert all(not row.accepted for row in rows[1:])
+    assert {row.reason for row in refused} == {"execution right revoked"}
+
+    # 只有看着那台机器的人才结算得了：痕迹在，就不是"什么都没发生"的放弃，预留按已花掉算。
+    with human(rig, rig.owner) as access:
+        settled = rig.reviews.reconcile_attempt(
+            access, project_id=rig.project.project_id, attempt_id=first.attempt_id,
+            outcome="failed", reason="核对过那台机器：任务包与完整原文都已取回并冻结，停止确认也没被接受",
+            expected_version=parked.version)
+    reopened = rig.store.get_work_item(rig.project.project_id, item.work_item_id)
+    assert (settled.status, reopened.status) == ("failed", "failed")
+    with human(rig, rig.owner) as access:
+        requeued = rig.reviews.rework(access, project_id=rig.project.project_id,
+                                      work_item_id=reopened.work_item_id,
+                                      expected_version=reopened.version)
+    assert requeued.status == "ready"
+
+    # 失败的一轮按原输入重试：人没有点名哪条验收漏了，所以输入摘要与上一轮一致。
+    second = rig.dispatch.dispatch(rig.project.project_id, item.work_item_id)
+    assert (second.number, second.input_hash) == (2, first.input_hash)
+    bundle.notify(second)
+    delivered = wait_status(rig, second.attempt_id, "submitted")
+    assert accepted_stages(rig, second.attempt_id) == ["ack", "start", "artifact", "result"]
+
+    with human(rig, rig.executor) as access:
+        rig.reviews.confirm(access, project_id=rig.project.project_id,
+                            attempt_id=second.attempt_id, decision="confirmed",
+                            reason="三条验收都对照完整原文复看过了",
+                            expected_version=delivered.version)
+    reviewable = rig.store.get_work_item(rig.project.project_id, item.work_item_id)
+    with human(rig, rig.reviewer) as access:
+        rig.reviews.accept(access, project_id=rig.project.project_id,
+                           work_item_id=reviewable.work_item_id, decision="accepted",
+                           expected_version=reviewable.version)
+
+    with human(rig, rig.requester) as access:
+        checked = rig.reviews.advance_requirement(
+            access, project_id=rig.project.project_id, requirement_id=requirement.requirement_id,
+            expected_version=access.store.get_requirement(rig.project.project_id,
+                                                          requirement.requirement_id).version)
+    assert checked.status == "integrating"
+    report = rig.reviews.integration_report(rig.store, rig.project.project_id,
+                                            requirement.requirement_id)
+    assert report["uncovered"] == []
+    assert [entry["covered_by"] for entry in report["acceptance"]] == [["R"], ["R"], ["R"]]
+
+    # 管理员签的是这一版交付的摘要，不是"做完了"这三个字。
+    with human(rig, rig.reviewer) as access:
+        signed_bundle = rig.reviews.delivery_bundle(access.store, rig.project.project_id,
+                                                    requirement.requirement_id)
+        passed = rig.reviews.record_integration(
+            access, project_id=rig.project.project_id, requirement_id=requirement.requirement_id,
+            decision="passed", reason="覆盖已逐条核对，交给提出人",
+            expected_version=access.store.get_requirement(rig.project.project_id,
+                                                          requirement.requirement_id).version)
+    assert passed.status == "awaiting_acceptance"
+    verdict = rig.store.latest_requirement_integration(rig.project.project_id,
+                                                       requirement.requirement_id)
+    assert (verdict.decision, verdict.evidence_hash, verdict.reason) == (
+        "passed", signed_bundle["evidence_hash"], "覆盖已逐条核对，交给提出人")
+
+    with human(rig, rig.requester) as access:
+        done = rig.reviews.accept_requirement(
+            access, project_id=rig.project.project_id, requirement_id=requirement.requirement_id,
+            decision="accepted",
+            expected_version=access.store.get_requirement(rig.project.project_id,
+                                                          requirement.requirement_id).version)
+    assert done.status == "completed"
+
+    with rig.database.read() as conn:
+        trail = [row["action"] for row in conn.execute(
+            "SELECT action FROM collaboration_audit WHERE project_id=? AND target_id IN (?,?,?,?) "
+            "ORDER BY rowid", (rig.project.project_id, requirement.requirement_id,
+                               item.work_item_id, first.attempt_id, second.attempt_id))]
+    for step in ("work_item.cancelled", "attempt.reconciled.failed", "work_item.failed",
+                 "work_item.requeued", "attempt.confirmed", "work_item.accepted",
+                 "requirement.integrating", "integration.passed", "requirement.completed"):
+        assert step in trail, step
+    assert trail.count("attempt.assigned") == 2
+    assert trail.index("work_item.cancelled") < trail.index("work_item.requeued")
+    assert trail[-2:] == ["integration.passed", "requirement.completed"]
