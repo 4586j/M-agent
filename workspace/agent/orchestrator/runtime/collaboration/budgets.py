@@ -51,6 +51,20 @@ class BudgetService:
                       ref_type="plan", ref_key=plan_id, kind="reserve",
                       delta_units=amount, created_at=created_at)
 
+    def reserve_item(self, store, *, project_id: str, requirement_id: str, work_item_id: str,
+                     amount: int, created_at: float) -> None:
+        """Reserve the share of one work item that joined after the plan was approved.
+
+        The plan-level reservation carries one row per plan, because the plan is the thing a human
+        approved as a whole. An item added beside it gets its own key, so the approved total is not
+        rewritten and a retried request reserves exactly once.
+        """
+        if type(amount) is not int or amount < 0:
+            raise ValidationError("Invalid budget reservation")
+        self._entries(store, project_id=project_id, requirement_id=requirement_id,
+                      ref_type="work_item", ref_key=work_item_id, kind="reserve",
+                      delta_units=amount, created_at=created_at)
+
     def settle(self, store, *, project_id: str, requirement_id: str, attempt_id: str,
                reserved_units: int, actual_units: int, created_at: float) -> None:
         """Charge one attempt's real usage against the share already reserved for it.

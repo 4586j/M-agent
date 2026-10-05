@@ -625,7 +625,74 @@ class ReviewService:
             return "integrating"
         if statuses & set(REWORKABLE_STATUSES):
             return "rework"
+        if self._pending_integration(store, project_id, bundle["plan_id"]) is not None:
+            return "integrating"
         return "executing"
+
+    def _pending_integration(self, store: CollaborationStore, project_id: str,
+                             plan_id: str) -> WorkItem | None:
+        """The merge-and-test round, while it still has work to deliver.
+
+        A requirement that has one open integration item is not awaiting a signature: somebody is
+        still putting this version together. It is also not back in ordinary execution — the
+        business deliveries are all accepted, and calling that state "executing" would hide which
+        round is actually running.
+        """
+        return next((entry for entry in store.list_work_items(project_id, plan_id)
+                     if entry.kind == "integration" and entry.status != "accepted"), None)
+
+    def integration_item(self, access: Access, *, project_id: str, requirement_id: str,
+                         binding_id: str, estimated_units: int,
+                         expected_version: int) -> WorkItem:
+        """A manager points the merge-and-test round at one binding this project authorized.
+
+        The plan a human approved stays as it was: this item is added beside it, depends on every
+        accepted delivery it has to put together, and reserves its own share of the budget. The
+        assignee is not chosen freely either — it is the member that binding belongs to, because
+        the binding is what carries the duty, the persona and the tool policy. Repeating the request
+        returns the item that already exists instead of opening a second merge round.
+        """
+        member = self._member(access, project_id)
+        if member.access_role not in MANAGER_ROLES:
+            raise Forbidden("Only a project manager can open the integration round")
+        if type(estimated_units) is not int or not 1 <= estimated_units <= 10 ** 9:
+            raise ValidationError("Invalid estimated_units")
+        requirement = access.store.get_requirement(project_id, requirement_id)
+        plan = access.store.published_plan(project_id, requirement_id)
+        if plan is None:
+            raise InvalidState("Requirement has no published plan")
+        items = access.store.list_work_items(project_id, plan.plan_id)
+        existing = next((entry for entry in items if entry.kind == "integration"), None)
+        if existing is not None:
+            return existing
+        if requirement.status != "integrating":
+            raise InvalidState("The integration round opens once every work item is accepted")
+        _version(requirement.version, expected_version)
+        business = [entry for entry in items if entry.kind == "business"]
+        if any(entry.status != "accepted" for entry in business):
+            raise InvalidState("Every work item must be accepted before the merge round opens")
+        binding = access.store.get_binding(project_id, binding_id)
+        if binding.status != "active":
+            raise InvalidState("That execution identity is not active")
+        if self.budgets.limit_problems(access.store, project_id=project_id,
+                                       requirement_id=requirement_id, amount=estimated_units):
+            raise Conflict("This requirement's budget has no room for the integration round")
+        now = self.clock()
+        item = access.store.add_work_item(
+            project_id, plan.plan_id, kind="integration",
+            raw={"key": "integration", "title": "集成这一版交付并跑测试",
+                 "objective": "把已验收的交付合到一起，在独立目录跑一遍项目测试并回报结果",
+                 "scope": "合并这些已验收工作项的产物、解决冲突、运行项目测试",
+                 "non_goals": "不新增功能，不改需求原文，不替提出人签字",
+                 "duty": binding.duty, "assignee_user_id": binding.member_user_id,
+                 "binding_id": binding.binding_id, "estimated_units": estimated_units},
+            depends_on_ids=[entry.work_item_id for entry in business], created_at=now)
+        self.budgets.reserve_item(access.store, project_id=project_id,
+                                  requirement_id=requirement_id, work_item_id=item.work_item_id,
+                                  amount=estimated_units, created_at=now)
+        record_audit(access.conn, now, access.user.user_id, "work_item.integration_created",
+                     item.work_item_id, project_id=project_id, target_version=item.version)
+        return item
 
     def advance_requirement(self, access: Access, *, project_id: str, requirement_id: str,
                             expected_version: int) -> Requirement:
@@ -672,6 +739,11 @@ class ReviewService:
         requirement = access.store.get_requirement(project_id, requirement_id)
         bundle = self.delivery_bundle(access.store, project_id, requirement_id)
         refused = self._refused(bundle, returned_items) if verdict == "returned" else []
+        if verdict == "passed":
+            # 说「可以签字」之前，那一版交付得先真的被合起来测过：核对不能替一次没跑的合并放行。
+            pending = self._pending_integration(access.store, project_id, bundle["plan_id"])
+            if pending is not None:
+                raise InvalidState("The integration round has not delivered this version yet")
         if self._integrated_already(access, requirement, verdict, bundle["evidence_hash"], refused):
             return requirement
         if requirement.status != "integrating":

@@ -283,6 +283,12 @@ class IntegrationDecision(Input):
     returned_items: Annotated[list[str], Field(max_length=64)] = []
 
 
+class IntegrationItemCreate(Input):
+    binding_id: Annotated[str, Field(min_length=1, max_length=64)]
+    estimated_units: Annotated[int, Field(ge=1, le=10 ** 9)]
+    expected_version: Version
+
+
 class AttemptReconcile(Input):
     outcome: Literal["cancelled", "failed"]
     reason: Annotated[str, Field(min_length=1, max_length=2048)]
@@ -1047,6 +1053,21 @@ def create_app(config: AppConfig) -> FastAPI:
                 reason=body.reason, expected_version=body.expected_version,
                 returned_items=body.returned_items)
             return asdict(requirement)
+
+    @router.post("/projects/{pid}/requirements/{rid}/integration-item", status_code=201)
+    def create_integration_item(pid: str, rid: str, body: IntegrationItemCreate,
+                                request: Request):
+        """Open the merge-and-test round on one binding this project authorized.
+
+        A manager names it, because the binding carries the duty, the persona and the tool policy
+        that will actually run — and the plan a human approved is left as it was: this round is a
+        separate decision with its own budget reservation.
+        """
+        with _access(request, project_id=pid, write=True) as access:
+            item = app.state.reviews.integration_item(
+                access, project_id=pid, requirement_id=rid, binding_id=body.binding_id,
+                estimated_units=body.estimated_units, expected_version=body.expected_version)
+            return asdict(item)
 
     @router.get("/projects/{pid}/requirements/{rid}/delivery")
     def requirement_delivery(pid: str, rid: str, request: Request):

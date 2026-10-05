@@ -266,6 +266,7 @@ class WorkItem:
     status: str = "pending_dependency"
     estimated_units: int = 0
     version: int = 1
+    kind: str = "business"
     created_at: float = 0.0
     updated_at: float = 0.0
 

@@ -622,6 +622,70 @@ def test_v12_migration_failure_leaves_the_file_untouched(tmp_path, monkeypatch):
         "old-project", "old-requirement")[0].reason == "第二条验收没做"
 
 
+def make_v12_database(path):
+    """A v12 file whose scoped return is already written, so v12 -> v13 is what gets tested."""
+    make_v11_database(path)
+    with closing(sqlite3.connect(path, isolation_level=None)) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        for statement in database_module._RETURN_SCOPE_SCHEMA:
+            conn.execute(statement)
+        conn.execute("INSERT INTO requirement_integrations(integration_id,project_id,requirement_id,"
+                     "actor_user_id,decision,evidence_hash,reason,created_at,returned_items) "
+                     "VALUES('scoped-check','old-project','old-requirement','old-user','returned',?,"
+                     "'只退 B',3750.0,'[\"B\"]')", ("d" * 64,))
+        conn.execute("PRAGMA user_version=12")
+        conn.commit()
+
+
+def test_v12_database_upgrades_to_v13_and_old_items_stay_business(tmp_path):
+    path = tmp_path / "v13.sqlite3"
+    make_v12_database(path)
+    database = Database(path)
+    with pytest.raises(database_module.SchemaVersionError):
+        with database.read():
+            pytest.fail("Migration must be explicit")
+    database.initialize()
+    with database.read() as conn:
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+        assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+        # 早就交付完的工作项不会因为多了这一列就被说成集成项：默认值就是它一直以来的意思。
+        assert conn.execute("SELECT kind FROM work_items WHERE work_item_id='old-item'"
+                           ).fetchone()[0] == "business"
+    store = CollaborationStore(database)
+    # 上一轮写下的点名范围，穿过这一次迁移仍然是那一个范围。
+    assert store.list_requirement_integrations("old-project",
+                                               "old-requirement")[-1].returned_items == ("B",)
+
+    def insert(work_item_id, kind):
+        with database.transaction() as conn:
+            conn.execute(
+                "INSERT INTO work_items(work_item_id,plan_id,project_id,key,title,objective,scope,"
+                "non_goals,duty,assignee_user_id,binding_id,status,estimated_units,created_at,"
+                "updated_at,kind) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,1.0,1.0,?)",
+                (work_item_id, "old-plan", "old-project", work_item_id, "标题", "目标", "范围",
+                 "非目标", "实现", "old-user", "old-binding", "ready", 3, kind))
+
+    insert("merge-item", "integration")
+    assert store.get_work_item("old-project", "merge-item").kind == "integration"
+    # 这一列只认那两种活：第三种不是「还没想好」，是写坏了。
+    with pytest.raises(sqlite3.IntegrityError):
+        insert("broken-item", "sprint")
+
+
+def test_v13_migration_failure_leaves_the_file_untouched(tmp_path, monkeypatch):
+    path = tmp_path / "v12.sqlite3"
+    make_v12_database(path)
+    before = path.read_bytes()
+    with monkeypatch.context() as patch:
+        patch.setattr(database_module, "_INTEGRATION_ITEM_SCHEMA", ("INVALID SQL",))
+        with pytest.raises(sqlite3.OperationalError):
+            Database(path).initialize()
+    assert path.read_bytes() == before
+    Database(path).initialize()
+    assert CollaborationStore(Database(path)).get_work_item("old-project",
+                                                            "old-item").estimated_units == 4
+
+
 # --- instance registration ----------------------------------------------------
 
 def test_worker_url_is_registered_and_rejects_extra_callback_targets(team):
@@ -2721,6 +2785,81 @@ def test_a_return_can_name_the_items_it_refuses(team):
     # 那一句关于 B 的退回没有跟着来到 A 的任务包里：它说的是别人的活。
     assert [(entry["kind"], entry["reason"]) for entry in payload["rework"]] == [
         ("requirement_acceptance", "A 的原文那条没满足")]
+
+
+def test_an_integration_round_merges_the_accepted_work_before_anybody_signs(team):
+    requirement, plan, _instance, token = reserved_plan(
+        team, plan_item(team, "A", estimate=5), plan_item(team, "B", estimate=4))
+    project_id, requirement_id = requirement.project_id, requirement.requirement_id
+    item_a, item_b = work_item(team, plan, "A"), work_item(team, plan, "B")
+    attempt_a = accept_item(team, project_id, item_a, token)
+    attempt_b = accept_item(team, project_id, item_b, token)
+    with session(team, team.requester) as access:
+        stopping = team.reviews.advance_requirement(access, project_id=project_id,
+                                                    requirement_id=requirement_id,
+                                                    expected_version=requirement.version)
+    assert stopping.status == "integrating"
+
+    def open_item(who, **kwargs):
+        version = kwargs.pop("version")
+        with session(team, who) as access:
+            return team.reviews.integration_item(access, project_id=project_id,
+                                                 requirement_id=requirement_id,
+                                                 expected_version=version, **kwargs)
+
+    with pytest.raises(Forbidden):
+        # 提出人说了不算：点名哪一个执行身份来合这一版，是项目管理者的决定。
+        open_item(team.requester, binding_id=team.binding.binding_id, estimated_units=3,
+                  version=stopping.version)
+    with pytest.raises(ValidationError):
+        open_item(team.reviewer, binding_id=team.binding.binding_id, estimated_units=0,
+                  version=stopping.version)
+    with pytest.raises(NotFound):
+        open_item(team.reviewer, binding_id="0" * 32, estimated_units=3,
+                  version=stopping.version)
+    with pytest.raises(Conflict):
+        # 陈旧视图不开新的一轮：那一版交付可能已经不是他看到的那一份了。
+        open_item(team.reviewer, binding_id=team.binding.binding_id, estimated_units=3,
+                  version=stopping.version + 2)
+
+    item = open_item(team.reviewer, binding_id=team.binding.binding_id, estimated_units=3,
+                     version=stopping.version)
+    assert (item.kind, item.key, item.status, item.estimated_units) == (
+        "integration", "integration", "ready", 3)
+    # 负责人不由人另点：谁的工作身份被点名，活就落在谁身上。
+    assert (item.assignee_user_id, item.binding_id) == (team.worker.user_id,
+                                                       team.binding.binding_id)
+    assert [(entry.work_item_id, entry.depends_on_id) for entry in
+            team.store.list_work_item_dependencies(project_id, plan.plan_id)] == [
+        (item.work_item_id, item_a.work_item_id), (item.work_item_id, item_b.work_item_id)]
+    assert audited(team, item.work_item_id) == ["work_item.integration_created"]
+    # 集成轮自己不算验收项：它合的是别人交付的东西，不新占一条原文验收。
+    assert team.store.list_work_item_acceptance(item.work_item_id) == []
+    assert open_item(team.reviewer, binding_id=team.binding.binding_id, estimated_units=99,
+                     version=stopping.version).work_item_id == item.work_item_id
+    # 再点一次是同一行，也不按新数字再预留一次：预算仍然只多了这一轮的 3。
+    assert sum(entry.delta_units for entry in
+               team.store.list_budget_entries("requirement", requirement_id)
+               if entry.ref_type == "work_item" and entry.kind == "reserve") == 3
+
+    with pytest.raises(InvalidState):
+        # 合并还没交付，核对不能说「可以签字」：那一版交付此刻还没被合起来测过。
+        integrated(team, project_id, requirement_id)
+
+    merge = team.make_dispatch(requires_real_data=False).dispatch(project_id, item.work_item_id)
+    payload = json.loads(team.make_execution().package(token, merge.attempt_id)[0])
+    assert sorted(entry["work_item_id"] for entry in payload["dependencies"]) == sorted(
+        [item_a.work_item_id, item_b.work_item_id])
+    assert payload["subtask"]["key"] == "integration"
+    accept_item(team, project_id, item, token, attempt=merge)
+    # 合并交付之后，核对签的才是包含这一份合并结果的交付：摘要跟着变了。
+    with session(team, team.reviewer) as access:
+        before = team.reviews.delivery_bundle(access.store, project_id, requirement_id)
+    assert [entry["key"] for entry in before["items"]] == ["A", "B", "integration"]
+    waiting = integrated(team, project_id, requirement_id)
+    assert waiting.status == "awaiting_acceptance"
+    assert team.store.latest_requirement_integration(
+        project_id, requirement_id).evidence_hash == before["evidence_hash"]
 
 
 def test_an_integration_verdict_carries_only_the_bundle_it_was_made_against(team):

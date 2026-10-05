@@ -2864,6 +2864,93 @@ def test_the_panel_lets_a_return_name_the_items_it_refuses():
     assert "只退了 ${verdict.returned_items.join" in source
 
 
+def test_a_manager_opens_the_integration_round_over_http(api):
+    project, requirement_id, plan, attempt, token = machine_attempt(
+        api, acceptance=("第一条验收", "第二条验收"),
+        items=lambda member, binding: [
+            plan_candidate(binding, member["user_id"], "A", ["AC-001"]),
+            plan_candidate(binding, member["user_id"], "B", ["AC-002"])])
+    pid = project["project_id"]
+    headers = {"X-Instance-Token": token}
+    base = f"/projects/{pid}/requirements/{requirement_id}"
+    plans = plans_path(project, requirement_id) + f"/{plan['plan']['plan_id']}"
+
+    def finish(attempt_id, claims, work_item_id):
+        checked(api.send(None, "POST", f"/machine/attempts/{attempt_id}/start", json=claims,
+                         headers=headers))
+        reported = checked(api.send(None, "POST", f"/machine/attempts/{attempt_id}/result",
+                                    json={**claims, "status": "submitted", "summary": "按原文做完",
+                                          "usage_units": 2}, headers=headers))
+        checked(api.send("member", "POST", delivery_path(pid, attempt_id),
+                         json={"decision": "confirmed",
+                               "expected_version": reported["attempt"]["version"]}))
+        stored = next(entry for entry in checked(api.send("member", "GET", plans))["work_items"]
+                      if entry["work_item_id"] == work_item_id)
+        checked(api.send("manager", "POST", f"/projects/{pid}/work-items/{work_item_id}/accept",
+                         json={"decision": "accepted", "expected_version": stored["version"]}))
+
+    finish(attempt.attempt_id, machine_claims(attempt), plan["work_items"][0]["work_item_id"])
+    second = checked(api.send("manager", "POST",
+                              dispatch_path(pid, plan["work_items"][1]["work_item_id"])))
+    finish(second["attempt_id"], machine_claims(second),
+           plan["work_items"][1]["work_item_id"])
+    requirement = checked(api.send("member", "GET", base))
+    stopping = checked(api.send("member", "POST", f"{base}/actions",
+                                json={"action": "advance",
+                                      "expected_version": requirement["version"]}))
+    assert stopping["status"] == "integrating"
+    item_path = f"{base}/integration-item"
+    binding_id = plan["work_items"][0]["binding_id"]
+
+    checked(api.send("outsider", "POST", item_path,
+                     json={"binding_id": binding_id, "estimated_units": 3,
+                           "expected_version": stopping["version"]}), 404)
+    checked(api.send("member", "POST", item_path,
+                     json={"binding_id": binding_id, "estimated_units": 3,
+                           "expected_version": stopping["version"]}), 403)
+    checked(api.send("manager", "POST", item_path,
+                     json={"binding_id": binding_id, "estimated_units": 0,
+                           "expected_version": stopping["version"]}), 422)
+    checked(api.send("manager", "POST", item_path,
+                     json={"binding_id": binding_id, "estimated_units": 3,
+                           "expected_version": stopping["version"] + 4}), 409)
+    checked(api.send("manager", "POST", item_path,
+                     json={"binding_id": "0" * 32, "estimated_units": 3,
+                           "expected_version": stopping["version"]}), 404)
+
+    item = checked(api.send("manager", "POST", item_path,
+                            json={"binding_id": binding_id, "estimated_units": 3,
+                                  "expected_version": stopping["version"]}), 201)
+    # 合并那一轮已经开着了：它没交付之前，核对不能说「可以签字」。
+    checked(api.send("manager", "POST", f"{base}/integration",
+                     json={"decision": "passed", "expected_version": stopping["version"]}), 409)
+    assert (item["kind"], item["key"], item["status"], item["estimated_units"]) == (
+        "integration", "integration", "ready", 3)
+    assert item["assignee_user_id"] == api.identities["member"]["user"]["user_id"]
+    assert checked(api.send("manager", "POST", item_path,
+                            json={"binding_id": binding_id, "estimated_units": 9,
+                                  "expected_version": stopping["version"]}),
+                   201)["work_item_id"] == item["work_item_id"]
+    listed = checked(api.send("member", "GET", plans))["work_items"]
+    assert [entry["key"] for entry in listed] == ["A", "B", "integration"]
+    assert checked(api.send("member", "GET", f"{base}/delivery"))["delivery"]["items"][2]["key"] \
+        == "integration"
+
+    merge = checked(api.send("manager", "POST", dispatch_path(pid, item["work_item_id"])))
+    finish(merge["attempt_id"], machine_claims(merge), item["work_item_id"])
+    waiting = checked(api.send("manager", "POST", f"{base}/integration",
+                               json={"decision": "passed",
+                                     "expected_version": stopping["version"]}))
+    assert waiting["status"] == "awaiting_acceptance"
+    # 签字绑的是包含这次合并结果的交付：清单里第三行就是它，摘要跟着走。
+    bundle = checked(api.send("member", "GET", f"{base}/delivery"))["delivery"]
+    assert [(entry["key"], entry["status"], entry["attempt_number"])
+            for entry in bundle["items"]] == [("A", "accepted", 1), ("B", "accepted", 1),
+                                              ("integration", "accepted", 1)]
+    assert bundle["evidence_hash"] == checked(
+        api.send("member", "GET", f"{base}/integration"))["report"]["evidence_hash"]
+
+
 def test_the_panel_offers_every_action_the_requirement_endpoint_accepts():
     # 后端多一个需求动作而面板没有按钮，等待的人就只剩命令行能停手或恢复——这条守住那道接缝。
     from typing import get_args

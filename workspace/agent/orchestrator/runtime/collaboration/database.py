@@ -8,7 +8,7 @@ from typing import Iterator
 from .models import SchemaVersionError
 
 
-SCHEMA_VERSION = 12
+SCHEMA_VERSION = 13
 
 _SCHEMA_STATEMENTS = (
     """
@@ -996,6 +996,15 @@ _RETURN_SCOPE_SCHEMA = (
     "ALTER TABLE requirement_integrations ADD COLUMN returned_items TEXT NOT NULL DEFAULT ''",
 )
 
+# The merge-and-test step is work, so it lives where work lives: one row in `work_items`, run by
+# the same machine protocol, confirmed and accepted like any other delivery. What makes it a
+# different kind of row is who put it there — a named manager chose the binding after the plan was
+# approved, not the planner before it — and `kind` is what says so.
+_INTEGRATION_ITEM_SCHEMA = (
+    "ALTER TABLE work_items ADD COLUMN kind TEXT NOT NULL DEFAULT 'business' "
+    "CHECK(kind IN ('business','integration'))",
+)
+
 
 def _check_schema_version(connection: sqlite3.Connection) -> None:
     version = connection.execute("PRAGMA user_version").fetchone()[0]
@@ -1107,6 +1116,11 @@ class Database:
                     for statement in _RETURN_SCOPE_SCHEMA:
                         connection.execute(statement)
                     version = 12
+                    migrated = True
+                if version == 12:
+                    for statement in _INTEGRATION_ITEM_SCHEMA:
+                        connection.execute(statement)
+                    version = 13
                     migrated = True
                 if migrated:
                     connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")

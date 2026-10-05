@@ -168,7 +168,7 @@ _PLAN_COLUMNS = (
 )
 _WORK_ITEM_COLUMNS = (
     "work_item_id,plan_id,project_id,key,title,objective,scope,non_goals,duty,"
-    "assignee_user_id,binding_id,status,estimated_units,version,created_at,updated_at"
+    "assignee_user_id,binding_id,status,estimated_units,version,created_at,updated_at,kind"
 )
 _OUTBOX_COLUMNS = (
     "event_id,project_id,topic,payload,created_at,next_attempt_at,attempts,"
@@ -1015,6 +1015,53 @@ class CollaborationStore:
                             "project_id) VALUES(?,?,?,?)",
                             (ids_by_key[raw["key"]], dependency_id, plan_id, project_id))
             return self._plan(conn, project_id, plan_id)
+
+    def add_work_item(self, project_id: str, plan_id: str, *, kind: str, raw: dict,
+                      depends_on_ids=(), created_at: float) -> WorkItem:
+        """One more item on a plan that is already published, as its own kind of decision.
+
+        The published plan is the decomposition a human approved, and its report and total units
+        stay what that reviewer saw. An item added afterwards — today the merge-and-test step,
+        which a named manager points at one authorized binding — therefore carries its own budget
+        reservation instead of quietly rewriting the approved plan.
+        """
+        _choice(kind, ("business", "integration"), "kind")
+        fields = self._work_item_fields(raw)
+        dependencies = list(dict.fromkeys(depends_on_ids))
+        if any(not isinstance(value, str) or not value for value in dependencies):
+            raise ValidationError("Invalid depends_on")
+        with self._write() as conn:
+            plan = self._plan(conn, project_id, plan_id)
+            if plan.status != "published":
+                raise InvalidState("Only a published plan takes work items")
+            binding = self._active(self._binding(conn, project_id, fields["binding_id"]))
+            if binding.member_user_id != fields["assignee_user_id"]:
+                raise ValidationError("The assignee must be the member this binding belongs to")
+            upstream = [self._work_item(conn, value) for value in dependencies]
+            for entry in upstream:
+                if entry.plan_id != plan_id:
+                    raise ValidationError("A work item may only depend on this plan's items")
+            work_item_id = uuid4().hex
+            conn.execute(
+                "INSERT INTO work_items(work_item_id,plan_id,project_id,key,title,objective,scope,"
+                "non_goals,duty,assignee_user_id,binding_id,status,estimated_units,created_at,"
+                "updated_at,kind) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (work_item_id, plan_id, project_id, fields["key"], fields["title"],
+                 fields["objective"], fields["scope"], fields["non_goals"], fields["duty"],
+                 fields["assignee_user_id"], fields["binding_id"],
+                 "ready" if all(entry.status == "accepted" for entry in upstream)
+                 else "pending_dependency",
+                 fields["estimated_units"], created_at, created_at, kind))
+            for position, item_id in enumerate(fields["acceptance_ids"]):
+                conn.execute(
+                    "INSERT INTO work_item_acceptance_items(work_item_id,item_id,position) "
+                    "VALUES(?,?,?)", (work_item_id, item_id, position))
+            for dependency_id in dependencies:
+                conn.execute(
+                    "INSERT INTO work_item_dependencies(work_item_id,depends_on_id,plan_id,"
+                    "project_id) VALUES(?,?,?,?)", (work_item_id, dependency_id, plan_id,
+                                                    project_id))
+            return self._work_item(conn, work_item_id)
 
     @staticmethod
     def _plan(conn, project_id, plan_id):
