@@ -2006,6 +2006,23 @@ def test_the_people_judging_a_delivery_can_read_the_files_behind_it(api, monkeyp
     assert name not in disposition
     assert unquote(disposition.split("filename*=UTF-8''")[1]) == name
 
+    # 第 14.3 节 C24 的字面是「含脚本或可执行 HTML」，所以真的交一份带脚本的：防护不跟着类型走。
+    scripted = b"<html><body><script>alert('read me as html')</script></body></html>"
+    page = checked(api.send(None, "POST", base + "/artifacts", headers=headers, json={
+        **machine_claims(started["attempt"]), "name": "结果说明.html",
+        "media_type": "text/html", "sha256": hashlib.sha256(scripted).hexdigest(),
+        "content": base64.b64encode(scripted).decode("ascii")}), 201)
+    delivered = api.send("member", "GET",
+                         f"{human}/{page['artifact']['artifact_id']}")
+    assert (delivered.status_code, delivered.content) == (200, scripted)
+    # 自报的类型照原样回传，但只是资料：要执行它得先在新标签里以本源渲染，头三行不给这条路。
+    assert delivered.headers["content-type"].startswith("text/html")
+    assert delivered.headers["content-disposition"].startswith("attachment;")
+    for header in ("x-content-type-options", "content-security-policy", "referrer-policy"):
+        assert delivered.headers[header] == response.headers[header]
+    # 服务端不「消毒」字节：证据必须和交回来的那份逐字相等，不执行靠头，不靠改写。
+    assert b"<script>" in delivered.content
+
     # 证据改不动：append-only 触发器先拦下任何 SQL 改写，所以「字节与摘要不符」只能来自文件损坏。
     with api.database.transaction() as conn, pytest.raises(sqlite3.IntegrityError):
         conn.execute("UPDATE attempt_artifacts SET content=? WHERE artifact_id=?",
@@ -2016,8 +2033,9 @@ def test_the_people_judging_a_delivery_can_read_the_files_behind_it(api, monkeyp
 
     monkeypatch.setattr(CollaborationStore, "get_artifact_content", rotted)
     checked(api.send("member", "GET", f"{human}/{artifact_id}"), 409)
-    # 清单照旧可读：它不碰字节，报的是「机器交回了什么」。
-    assert [entry["sha256"] for entry in checked(api.send("member", "GET", human))] == [digest]
+    # 清单照旧可读：它不碰字节，报的是「机器交回了什么」——两份都在，摘要各自对得上。
+    assert {entry["name"]: entry["sha256"] for entry in checked(api.send("member", "GET", human))} \
+        == {name: digest, "结果说明.html": hashlib.sha256(scripted).hexdigest()}
 
 
 def test_the_requester_signs_for_the_requirement_delivery_over_http(api):
@@ -2884,6 +2902,23 @@ def test_the_panel_names_the_binding_that_runs_the_merge_round():
     # 这一行不在批准的计划里，列出来就得说清来源。
     assert 'item.kind === "integration" ? " · 集成这一轮（不在批准的计划里）"' in source
     assert '"work_item.integration_created"' in source
+
+
+def test_the_panel_hands_server_text_to_the_dom_only_as_text():
+    # 需求原文、产物名、成员名、暂停理由都是别人写下的字：它们只有一个去处——文本节点。
+    # 这条不是风格检查：一旦有人为了「让说明带格式」改用标记入口，注入就进了这个源。
+    sources = {name: (RUNTIME / "collaboration" / "web" / name).read_text(encoding="utf-8")
+               for name in ("app.js", "index.html", "styles.css")}
+    for name, source in sources.items():
+        for sink in ("innerHTML", "outerHTML", "insertAdjacentHTML", "createContextualFragment",
+                     "document.write"):
+            assert sink not in source, f"{name} 出现了 {sink}"
+    app = sources["app.js"]
+    # 唯一的渲染出口是 add()：它写 textContent，所以这一句在，上面那些就真的没有替代路径。
+    assert "node.textContent = value" in app
+    # 产物只给下载链接，不给预览：href 由服务端算好的路径拼出，且不带到新窗口的返回引用。
+    assert 'link.rel = "noopener"' in app
+    assert "srcdoc" not in app and "target = \"_blank\"" not in app
 
 
 def test_a_manager_opens_the_integration_round_over_http(api):
