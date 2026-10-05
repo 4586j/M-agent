@@ -27,6 +27,8 @@ button.soft { border-color: #b9c3d0; background: #f2f5f9; color: #33404f; }
 .original { background: #f6f8fa; border: 1px solid #d8dee7; border-radius: 6px;
   padding: 10px 12px; white-space: pre-wrap; word-break: break-word; }
 .draft { width: 100%; box-sizing: border-box; margin-top: 6px; }
+/* 估算单位是一个个位数：跟着默认宽度摊开会盖掉同一行里别的裁定入口。 */
+.units { width: 4.5rem; }
 dl { margin: 6px 0; }
 dt { font-weight: 600; margin-top: 8px; }
 dd { margin: 0 0 4px 16px; color: #33404f; overflow-wrap: anywhere; }

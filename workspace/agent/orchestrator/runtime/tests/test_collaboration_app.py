@@ -2864,6 +2864,26 @@ def test_the_panel_lets_a_return_name_the_items_it_refuses():
     assert "只退了 ${verdict.returned_items.join" in source
 
 
+def test_the_panel_names_the_binding_that_runs_the_merge_round():
+    # 后端能点名开一轮，界面却没有说「谁来合」的那一格：管理者就只能在命令行里做这个决定。
+    source = (RUNTIME / "collaboration" / "web" / "app.js").read_text(encoding="utf-8")
+    assert source.count("opens: true") == 1  # 只有核对待办能开这一轮，签字那位没有这个权限。
+    assert ('(await get(entry.links.bindings)).filter(item => item.status === "active")'
+            in source)
+    assert "await post(entry.links.integration_item," in source
+    assert "开一轮集成" in source and "选择执行身份" in source
+    # 没有活跃执行身份时不能只留一个空下拉：那读起来像「这里没人能干」，其实是还没登记一台。
+    assert "这个项目没有活跃的执行身份" in source
+    assert "!Number.isInteger(amount) || amount < 1" in source
+    assert "集成工作项 ${item.key} 已开出来" in source
+    # 挡住「核对通过」的那一行要在点之前就看得见，而不是只回一句服务器的英文。
+    assert "view.pending_integration" in source
+    assert "集成那一轮还开着" in source
+    # 这一行不在批准的计划里，列出来就得说清来源。
+    assert 'item.kind === "integration" ? " · 集成这一轮（不在批准的计划里）"' in source
+    assert '"work_item.integration_created"' in source
+
+
 def test_a_manager_opens_the_integration_round_over_http(api):
     project, requirement_id, plan, attempt, token = machine_attempt(
         api, acceptance=("第一条验收", "第二条验收"),
@@ -2924,6 +2944,9 @@ def test_a_manager_opens_the_integration_round_over_http(api):
     # 合并那一轮已经开着了：它没交付之前，核对不能说「可以签字」。
     checked(api.send("manager", "POST", f"{base}/integration",
                      json={"decision": "passed", "expected_version": stopping["version"]}), 409)
+    # 挡住核对的是哪一行要说得出名字：核对视图带上还没交付的那一轮，界面不用让人点下去才知道。
+    assert checked(api.send("member", "GET", f"{base}/integration"))["pending_integration"][
+        "work_item_id"] == item["work_item_id"]
     assert (item["kind"], item["key"], item["status"], item["estimated_units"]) == (
         "integration", "integration", "ready", 3)
     assert item["assignee_user_id"] == api.identities["member"]["user"]["user_id"]
@@ -2938,6 +2961,9 @@ def test_a_manager_opens_the_integration_round_over_http(api):
 
     merge = checked(api.send("manager", "POST", dispatch_path(pid, item["work_item_id"])))
     finish(merge["attempt_id"], machine_claims(merge), item["work_item_id"])
+    # 那一轮交付完了就从视图里消失：核对不再被挡，挡路的那句也不该继续挂着。
+    assert checked(api.send("member", "GET",
+                            f"{base}/integration"))["pending_integration"] is None
     waiting = checked(api.send("manager", "POST", f"{base}/integration",
                                json={"decision": "passed",
                                      "expected_version": stopping["version"]}))
@@ -3020,6 +3046,9 @@ def test_the_coverage_report_travels_with_the_two_signatures(api):
                                       "expected_version": requirement["version"]}))
     # 两份签字待办都带着核对报告，也带着那一份交付：退回要点名工作项，客户端不该自己拼路径。
     coverage = {"coverage": f"{base}/integration", "delivery": f"{base}/delivery"}
+    # 只有管理者那条核对待办多带两句：谁可以被点名，以及点名写到哪里去。
+    opening = {**coverage, "bindings": f"/projects/{pid}/agent-bindings",
+               "integration_item": f"{base}/integration-item"}
 
     def link_of(actor, item_type):
         rows = [entry for entry in checked(api.send(actor, "GET", "/inbox"))
@@ -3029,7 +3058,7 @@ def test_the_coverage_report_travels_with_the_two_signatures(api):
 
     assert stopping["status"] == "integrating"
     # 核对待办把报告一起递到手边：管理者签之前读的就是这份映射，不用自己去拼路径。
-    assert link_of("manager", "integration_check") == coverage
+    assert link_of("manager", "integration_check") == opening
     checked(api.send("manager", "POST", f"{base}/integration",
                      json={"decision": "passed", "expected_version": stopping["version"]}))
     # 提出人的签字待办带同一份报告：他签的是「有人核过的这一版交付」，不是「系统说完成了」。

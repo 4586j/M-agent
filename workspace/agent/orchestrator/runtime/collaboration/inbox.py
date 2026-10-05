@@ -61,12 +61,17 @@ ACTIONS = {
                                       "/delivery"}),
     # A delivery that has stopped being somebody's work has to become somebody's check: it is
     # owed to the project's managers, who are the only ones allowed to record the verdict.
+    # The two extra links are the merge round this manager owes before that verdict can pass:
+    # which execution identities exist to be pointed at, and where opening one is written.
     "integration_check": ("record_integration",
                           "/projects/{project_id}/requirements/{requirement_id}/integration",
                           {"coverage": "/projects/{project_id}/requirements/{requirement_id}"
                                         "/integration",
                            "delivery": "/projects/{project_id}/requirements/{requirement_id}"
-                                       "/delivery"}),
+                                       "/delivery",
+                           "bindings": "/projects/{project_id}/agent-bindings",
+                           "integration_item": "/projects/{project_id}/requirements/"
+                                               "{requirement_id}/integration-item"}),
 }
 
 # The drafting to-dos come from a different projection, so they arrive as bare requirement rows

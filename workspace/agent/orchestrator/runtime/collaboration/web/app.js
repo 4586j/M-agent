@@ -20,7 +20,7 @@ const DECISIONS = {
                       reason: true, hint: "退回时必填：写下缺了哪一条验收",
                       choices: [["passed", "核对通过，交给提出人"], ["returned", "退回返工"]],
                       look: "coverage", lookLabel: "查看覆盖核对", shown: showCoverage,
-                      returns: "returned"},
+                      returns: "returned", opens: true},
   rework_queue: {title: "重新排队", field: null, reason: false, choices: []},
   worker_attention: {title: "执行机失联（租约已过期）", field: null, reason: true, choices: [],
                      hint: "写下你看到的实情（可留空）",
@@ -64,6 +64,7 @@ const NEWS = {
   "requirement.resumed": "已恢复",
   "plan.published": "已发布",
   "plan.blocked": "被挡住",
+  "work_item.integration_created": "被管理者点名开的一轮合并与测试",
   "work_item.pending_dependency": "还在等依赖",
   "work_item.ready": "就绪",
   "work_item.waiting_agent": "等可用的执行机",
@@ -380,6 +381,9 @@ function renderTodo(entry) {
                       revision_href: entry.links.revision, submit: "重新送审"});
   } else {
     renderChoice(form, entry, spec);
+    if (spec.opens) {
+      integrationOpener(form, entry);
+    }
   }
   if (entry.unread) {
     ackButton(form, entry, "已记下你看过了这条待办；裁定仍然挂着。");
@@ -431,6 +435,11 @@ function showCoverage(parent, view) {
         + (item.covered_by.length ? `由 ${item.covered_by.join("、")} 交付` : "没有已验收的工作项覆盖"));
   }
   add(parent, "dd", "locator", `本次交付摘要 ${view.report.evidence_hash}`);
+  if (view.pending_integration) {
+    // 挡住「核对通过」的是这一行还没交付，不是服务端不肯签：把挡路的那行先摊开。
+    add(parent, "dd", null, `集成那一轮还开着：${view.pending_integration.key} · `
+        + `状态 ${view.pending_integration.status} · 它交付之前，核对通过会被挡住。`);
+  }
   if (!view.verdicts.length) {
     add(parent, "dd", null, "还没有人核对过这一版交付。");
   }
@@ -496,6 +505,77 @@ function returnScope(form, entry) {
     }
   });
   return () => [...list.querySelectorAll("input:checked")].map(tick => tick.value);
+}
+
+function integrationOpener(form, entry) {
+  // 核对通过在这轮合并交付之前会被服务端挡住，而「谁来合」是管理者说的话，界面不替他点名。
+  // 清单点开才取：待办一屏可能挂着好几条核对，每次刷新都替每条需求拉一遍绑定没有道理。
+  const box = add(form, "div", "scope");
+  const trigger = add(box, "button", "soft", "开一轮集成");
+  trigger.type = "button";
+  const row = add(box, "div", "form-row");
+  row.hidden = true;
+  add(box, "span", "locator", " 已有没交付的那一轮时，这一句不再开出第二轮。");
+  let loaded = false;
+  trigger.addEventListener("click", async () => {
+    try {
+      if (!loaded) {
+        const bindings = (await get(entry.links.bindings)).filter(item => item.status === "active");
+        row.replaceChildren();
+        if (bindings.length) {
+          const select = add(row, "select");
+          const blank = add(select, "option", null, "选择执行身份");
+          blank.value = "";
+          for (const binding of bindings) {
+            const option = document.createElement("option");
+            option.value = binding.binding_id;
+            option.textContent = `${binding.duty}（${personName(binding.member_user_id)}）`;
+            select.appendChild(option);
+          }
+          const units = add(row, "input", "units");
+          units.type = "number";
+          units.min = "1";
+          units.value = "1";
+          units.size = 6;
+          add(row, "span", "locator", "估算单位");
+          const submit = add(row, "button", null, "点名这一轮");
+          submit.type = "button";
+          submit.addEventListener("click", async () => {
+            const amount = Number(units.value);
+            if (!select.value) {
+              say("先点名一个执行身份：这一轮由它来合。", "error");
+              return;
+            }
+            if (!Number.isInteger(amount) || amount < 1) {
+              say("估算单位要是大于 0 的整数，预算要按它预留。", "error");
+              return;
+            }
+            submit.disabled = true;
+            try {
+              const item = await post(entry.links.integration_item,
+                                      {binding_id: select.value, estimated_units: amount,
+                                       expected_version: entry.expected_version});
+              await report(`集成工作项 ${item.key} 已开出来（${item.status}）：`
+                           + "在下方那一行点「派发一次尝试」才真的跑。");
+            } catch (error) {
+              submit.disabled = false;
+              if (error.name !== "AbortError") {
+                say(`开这一轮失败：${error.message}`, "error");
+              }
+            }
+          });
+        } else {
+          add(row, "span", null, "这个项目没有活跃的执行身份：先登记一台，才有人能合这一版。");
+        }
+        loaded = true;
+      }
+      row.hidden = false;
+    } catch (error) {
+      if (error.name !== "AbortError") {
+        say(`执行身份清单取不回：${error.message}`, "error");
+      }
+    }
+  });
 }
 
 function renderChoice(form, entry, spec) {
@@ -953,7 +1033,9 @@ async function renderWorkItems(block, projectId, requirementId, paused) {
   for (const item of detail.work_items) {
     const row = add(block, "dl", null);
     add(row, "dd", null, `${item.key} · ${item.title} · ${item.status} · 版本 ${item.version}`
-                          + ` · 估算 ${item.estimated_units}`);
+                          + ` · 估算 ${item.estimated_units}`
+                          // 被人批准的那份计划里没有这一行：它是管理者后来点名的那一轮，得说清来源。
+                          + (item.kind === "integration" ? " · 集成这一轮（不在批准的计划里）" : ""));
     add(row, "dd", null, `职责 ${item.duty} · 负责人 ${people[item.assignee_user_id] ?? item.assignee_user_id}`
                           + (needs[item.work_item_id] ? ` · 依赖 ${needs[item.work_item_id].join("、")}`
                                                        : ""));

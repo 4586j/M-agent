@@ -1040,9 +1040,11 @@ def create_app(config: AppConfig) -> FastAPI:
         """
         with _access(request, project_id=pid) as access:
             access.store.get_requirement(pid, rid)
+            pending = app.state.reviews.pending_integration(access.store, pid, rid)
             return {"report": app.state.reviews.integration_report(access.store, pid, rid),
                     "verdicts": [asdict(entry) for entry in
-                                 access.store.list_requirement_integrations(pid, rid)]}
+                                 access.store.list_requirement_integrations(pid, rid)],
+                    "pending_integration": None if pending is None else asdict(pending)}
 
     @router.post("/projects/{pid}/requirements/{rid}/integration")
     def record_integration(pid: str, rid: str, body: IntegrationDecision, request: Request):

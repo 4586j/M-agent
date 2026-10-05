@@ -629,6 +629,18 @@ class ReviewService:
             return "integrating"
         return "executing"
 
+    def pending_integration(self, store: CollaborationStore, project_id: str,
+                            requirement_id: str) -> WorkItem | None:
+        """The merge round this version still owes, read without needing a published plan.
+
+        A manager is refused a ``passed`` while this row is open, so the check view has to be able
+        to name the round standing in the way instead of leaving a person to click into a Conflict.
+        """
+        plan = store.published_plan(project_id, requirement_id)
+        if plan is None:
+            return None
+        return self._pending_integration(store, project_id, plan.plan_id)
+
     def _pending_integration(self, store: CollaborationStore, project_id: str,
                              plan_id: str) -> WorkItem | None:
         """The merge-and-test round, while it still has work to deliver.
