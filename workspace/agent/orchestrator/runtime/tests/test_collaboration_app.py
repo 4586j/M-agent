@@ -23,9 +23,11 @@ RUNTIME = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(RUNTIME))
 
 from collaboration import __main__ as cli
-from collaboration.app import AppConfig, COOKIE, PREFIX, _wake, create_app
+from collaboration.app import (_ACTIVITY_DENIED, AppConfig, COOKIE, PREFIX, _wake, create_app)
 from collaboration.database import Database
-from collaboration.store import CollaborationStore
+from collaboration.reviews import INTEGRATION_DECISIONS
+from collaboration.store import (REQUIREMENT_TRANSITIONS, WORK_ITEM_STATUSES,
+                                 CollaborationStore)
 
 ORIGIN = "https://testserver"
 PASSWORD = "test-only-password-2026"
@@ -3010,6 +3012,46 @@ def test_the_pause_reason_the_panel_banner_shows_is_readable_by_every_member(api
     # 面板用 filter(paused).pop() 取当前这一次的原因：排序一反就把它停手前的旧理由当成现在的。
     assert (history[-1]["reason"], history[-1]["actor_user_id"]) == (
         "先别派，我要改一条验收项", api.identities["member"]["user"]["user_id"])
+
+
+# 需求动态与「我的动态」都是审计流水的投影：主语由服务端算好，界面只补谓语那半句。
+# 值集从写它的那行代码里读，不在测试里抄一份——抄的那份会跟着代码烂掉。
+_SUBJECTS = ("attempt.", "integration.", "plan.", "requirement.", "work_item.")
+
+
+def _story_actions() -> set[str]:
+    """Every action name the two read views can hand out, read off the writers themselves."""
+    package = RUNTIME / "collaboration"
+    found = set()
+    for path in package.glob("*.py"):
+        lines = path.read_text(encoding="utf-8").splitlines()
+        for index, line in enumerate(lines):
+            if "record_audit(" in line:
+                found |= set(re.findall(r'f?"([a-z_]+(?:\.[a-z_]+)+)"',
+                                         "\n".join(lines[index:index + 3])))
+    reviews = (package / "reviews.py").read_text(encoding="utf-8")
+    outcomes = re.findall(r'"(\w+)"',
+                          re.search(r"_choice\(outcome, \(([^)]*)\)", reviews).group(1))
+    stages = re.findall(r'stage="(\w+)"', (package / "execution.py").read_text(encoding="utf-8"))
+    assert outcomes and stages  # 形状一变就明说，而不是悄悄少扫到一批动作。
+    found |= {f"attempt.{stage}" for stage in stages}
+    found |= {f"attempt.reconciled.{outcome}" for outcome in outcomes}
+    found |= {f"requirement.{status}" for status in REQUIREMENT_TRANSITIONS}
+    found |= {f"work_item.{status}" for status in WORK_ITEM_STATUSES}
+    found |= {f"integration.{verdict}" for verdict in INTEGRATION_DECISIONS}
+    return {action for action in found if action.startswith(_SUBJECTS)} - set(_ACTIVITY_DENIED)
+
+
+def test_the_panel_has_a_verb_for_every_action_the_story_can_emit():
+    # 「漏一个词只是难看」这句话由人肉守着，就会一直靠人在浏览器里撞见：这里把它钉成集合相等。
+    source = (RUNTIME / "collaboration" / "web" / "app.js").read_text(encoding="utf-8")
+    block = source.split("const NEWS = {", 1)[1].split("\n};", 1)[0]
+    named = set(re.findall(r'^  "([\w.]+)":', block, re.MULTILINE))
+    emitted = _story_actions()
+    # 冒出来却没有中文谓语的那一格，时间线上就写成 attempt.artifact 这种机器名。
+    assert emitted - named == set()
+    # 反过来也空：留着一句再也不会发生的话，读的人就被多骗一次。
+    assert named - emitted == set()
 
 
 def test_the_panel_names_every_action_either_read_view_can_show(api):
