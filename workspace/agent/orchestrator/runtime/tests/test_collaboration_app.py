@@ -3206,3 +3206,91 @@ def test_a_second_backup_never_replaces_the_first(api, tmp_path, capsys):
     assert error.value.code == 2
     assert archive.read_bytes() == before
 
+
+# --- T09ab: restore fence ------------------------------------------------------
+
+def test_a_restored_archive_comes_back_behind_a_fence(api, tmp_path, capsys):
+    # 第 15.3 节说的不是重启进程，而是把信任退回去：档案里的机器令牌与登录态都属于过去那一刻。
+    project, requirement_id, plan, attempt, token = machine_attempt(
+        api, acceptance=("第一条验收", "第二条验收"),
+        items=lambda member, binding: [
+            plan_candidate(binding, member["user_id"], "A", ["AC-001"]),
+            plan_candidate(binding, member["user_id"], "B", ["AC-002"])])
+    pid = project["project_id"]
+    headers = {"X-Instance-Token": token}
+    base = f"/machine/attempts/{attempt.attempt_id}"
+    acked = checked(api.send(None, "POST", base + "/ack", json=machine_claims(attempt),
+                             headers=headers))
+    item_b = plan["work_items"][1]["work_item_id"]
+
+    archive = tmp_path / "archive" / "collab.sqlite3"
+    archive.parent.mkdir()
+    assert cli.main(["backup", "--data-dir", str(tmp_path), "--out", str(archive)]) == 0
+    capsys.readouterr()
+
+    # 档案之后实时那一格继续往前走：B 被派了出去。恢复的意思是这一派不曾发生。
+    checked(api.send("manager", "POST", dispatch_path(pid, item_b)))
+
+    with Database(archive).read() as conn:
+        signed_in = conn.execute("SELECT COUNT(*) FROM auth_sessions WHERE revoked=0").fetchone()[0]
+    assert signed_in == len(api.identities)  # 五个人的登录态都被复制进了档案
+
+    restored = tmp_path / "restored"
+    restored.mkdir()
+    (restored / "metadata.sqlite3").write_bytes(archive.read_bytes())
+    assert cli.main(["restore-fence", "--data-dir", str(restored)]) == 0
+    assert json.loads(capsys.readouterr().out) == {"nodes_disabled": 1, "instances_disabled": 1,
+                                                   "sessions_revoked": signed_in}
+    with Database(restored / "metadata.sqlite3").read() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM auth_sessions WHERE revoked=0").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM attempts").fetchone()[0] == 1
+        assert conn.execute("SELECT COUNT(*) FROM nodes WHERE status='active'").fetchone()[0] == 0
+    # 围栏是可以重跑的：第二遍找不到任何要收回的东西。
+    assert cli.main(["restore-fence", "--data-dir", str(restored)]) == 0
+    assert json.loads(capsys.readouterr().out) == {"nodes_disabled": 0, "instances_disabled": 0,
+                                                   "sessions_revoked": 0}
+
+    # 档案当作服务起来：旧令牌与旧登录态一律不认，重新登录的人才读得到原来那些字。
+    with TestClient(create_app(AppConfig(restored, public_origin=ORIGIN)), base_url=ORIGIN,
+                    client=("127.0.0.1", 42001)) as client:
+        old = {"Origin": ORIGIN, "Cookie": f"{COOKIE}={api.identities['member']['token']}"}
+        checked(client.get(PREFIX + "/me", headers=old), 401)
+        machine = {"Origin": ORIGIN, "X-Instance-Token": token}
+        checked(client.get(PREFIX + "/machine/instances/me/attempts", headers=machine), 401)
+        checked(client.post(PREFIX + base + "/start", json=machine_claims(acked["attempt"]),
+                            headers=machine), 401)
+        again = checked(client.post(PREFIX + "/auth/login",
+                                    json={"username": "manager", "password": PASSWORD},
+                                    headers={"Origin": ORIGIN}))
+        fresh = {"Origin": ORIGIN, "Cookie": f"{COOKIE}={client.cookies.get(COOKIE)}",
+                 "X-CSRF-Token": again["csrf_token"]}
+        assert again["user"]["user_id"] == api.identities["manager"]["user"]["user_id"]
+        seen = checked(client.get(PREFIX + f"/projects/{pid}/requirements/{requirement_id}",
+                                  headers=fresh))
+        assert (seen["title"], seen["status"]) == ("需求文档", "executing")
+        # 围栏不判定任何一轮：档案里那一轮仍停在 acked，等的是去看那台机器的人。
+        read = checked(client.get(PREFIX + delivery_path(pid, attempt.attempt_id), headers=fresh))
+        assert (read["attempt"]["status"], read["attempt"]["control_epoch"]) == ("acked", 1)
+        # 派发冻在「没有机器」这一事实上，而不是停在某人忘记撤掉的旗子上。
+        checked(client.post(PREFIX + dispatch_path(pid, item_b), headers=fresh), 409)
+        tick = checked(client.post(PREFIX + f"/projects/{pid}/scheduler/tick", headers=fresh))
+        assert tick["work_items_changed"] == 1
+        # 档案里那些没投完的事件仍然会被重新认领：两条按当下的事实成了无害的空转，第三条是
+        # 「去唤醒那台已被围栏关掉的机器」，它只会被一再推迟。15.3 要的「过期派发事件作废」
+        # 还没实现——围栏收走的是执行权，不是那条事件。
+        assert (tick["claimed"], tick["delivered"], tick["deferred"]) == (3, 2, 1)
+        detail = checked(client.get(PREFIX + plans_path(project, requirement_id)
+                                    + f"/{plan['plan']['plan_id']}", headers=fresh))
+        assert [entry["status"] for entry in detail["work_items"]] == ["running", "waiting_agent"]
+    with Database(restored / "metadata.sqlite3").read() as conn:
+        stuck = [(row[0], row[1]) for row in conn.execute(
+            "SELECT topic,last_error FROM outbox_events WHERE delivered_at IS NULL")]
+        assert stuck == [("attempt.assigned", "AdmissionDenied")]
+        # 重放不重复造计划：需求早已走过 approved，那一条被认成「不再适用」而不是再生成一版。
+        assert conn.execute("SELECT COUNT(*) FROM plans").fetchone()[0] == 1
+
+    # 围栏只写它被指到的那一个目录：实时那一格的那台机器与那两个工作项都没被波及。
+    held = checked(api.send(None, "GET", "/machine/instances/me/attempts", headers=headers))
+    assert len(held) == 2
+    assert work_item_statuses(api, project, requirement_id, plan) == ["running", "running"]
+

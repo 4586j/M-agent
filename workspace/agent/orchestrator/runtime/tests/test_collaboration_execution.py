@@ -19,7 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from collaboration import database as database_module
 from collaboration.__main__ import main as host_main
-from collaboration.auth import Access, Forbidden, Unauthorized
+from collaboration.auth import Access, AuthService, Forbidden, Unauthorized
 from collaboration.budgets import BudgetService
 from collaboration.database import Database, SCHEMA_VERSION
 from collaboration.dispatch import DispatchService, TOPIC_ATTEMPT_ASSIGNED, TOPIC_ATTEMPT_REVOKED
@@ -31,6 +31,7 @@ from collaboration.scheduler import OutboxDispatcher, QueueService, Scheduler
 from collaboration.models import (
     Conflict, InvalidState, NotFound, SchemaVersionError, ValidationError,
 )
+from collaboration.recovery import fence_after_restore
 from collaboration.requirements import RequirementService
 from collaboration.reviews import ReviewService, tool_policy_digest
 from collaboration.store import CollaborationStore
@@ -3733,4 +3734,106 @@ def test_the_scheduler_command_runs_one_real_round_over_the_seeded_database(team
     assert moved.get_requirement(project_id, requirement_id).status == "integrating"
     # 命令行那一轮只写了副本：宿主不碰原库，就不可能把测试里那份需求的状态顺手改掉。
     assert team.store.get_requirement(project_id, requirement_id).status == "executing"
+
+
+# --- T09ab: restore fence ------------------------------------------------------
+
+def fence(team):
+    """The same call the ``restore-fence`` command makes, against this fixture's database."""
+    return fence_after_restore(team.database, instances=team.instances,
+                               auth=AuthService(team.database, clock=team.clock),
+                               clock=team.clock)
+
+
+def test_the_fence_takes_back_every_execution_right_a_restored_archive_carries(team):
+    # 第 15.3 节要的是一道围栏：档案里那些机器令牌与登录态都属于被复制的那一刻。
+    requirement, plan, item_a, instance, token, attempt = live_attempt(
+        team, items=(plan_item(team, "A"), plan_item(team, "B", acceptance=("AC-002",))))
+    project_id = requirement.project_id
+    execution = team.make_execution()
+    acked = execution.ack(token, attempt.attempt_id, **claims(attempt))
+    started = execution.start(token, attempt.attempt_id, trace_id="trace-1",
+                              **claims(acked.attempt))
+    assert started.attempt.status == "running"
+    item_b = work_item(team, plan, "B")
+    assert team.store.get_work_item(project_id, item_b.work_item_id).status == "ready"
+
+    assert fence(team) == {"nodes_disabled": 1, "instances_disabled": 1, "sessions_revoked": 0}
+    # 这一格里没有人登录过：围栏只报它真的收回了的东西，不替「没人登录」编一个数字。
+    assert team.store.get_node(instance.node_id).status == "disabled"
+    seen = team.store.get_instance(project_id, instance.instance_id)
+    assert (seen.status, seen.control_epoch) == ("disabled", instance.control_epoch + 1)
+    assert audited(team, instance.node_id) == ["node.disabled"]
+    assert audited(team, instance.instance_id) == ["instance.disabled"]
+    # 围栏不判定任何一轮：那一轮仍停在原来的状态上，等的是去看那台机器的人。
+    assert team.store.get_attempt(project_id, attempt.attempt_id) == started.attempt
+    assert team.store.get_work_item(project_id, item_a.work_item_id).status == "running"
+
+    # 那台机器的令牌现在连门都进不来：它不再是一个被拒收的回报，而是一个不被认识的身份。
+    late = {"status": "submitted", "summary": "迟到的结果", "usage_units": 1}
+    with pytest.raises(Unauthorized):
+        execution.renew_lease(token, attempt.attempt_id, **claims(started.attempt))
+    with pytest.raises(Unauthorized):
+        execution.report_result(token, attempt.attempt_id, **late, **claims(started.attempt))
+    # 拒收没有替那一轮写下任何一行：账上仍是围栏之前的两条被接受的回报。
+    assert stored_reports(team, project_id, attempt.attempt_id) == [
+        ("ack", True, None), ("start", True, None)]
+
+    # 派发冻在「没有机器」这一事实上：没有新的旗子要记得撤下来。
+    with pytest.raises(AdmissionDenied):
+        team.make_dispatch(requires_real_data=False).dispatch(project_id, item_b.work_item_id)
+    queue = QueueService(team.database, heartbeat_timeout=120, clock=team.clock)
+    assert queue.advance(project_id)["work_items_changed"] == 1
+    assert team.store.get_work_item(project_id, item_b.work_item_id).status == "waiting_agent"
+    assert team.store.get_work_item(project_id, item_a.work_item_id).status == "running"
+
+    team.clock.advance(121.0)
+    # 那一轮欠的仍是一条要人处理的待办：围栏收走写权，不收走判断。
+    assert [(entry[0], entry[1]) for entry in todos(team, team.worker)] == \
+        [("worker_attention", "cancel_work_item")]
+    with team.database.read() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM attempts WHERE project_id=?",
+                            (project_id,)).fetchone()[0] == 1
+        assert conn.execute("SELECT COUNT(*) FROM collaboration_audit WHERE action="
+                            "'restore.fenced'").fetchone()[0] == 1
+
+
+def test_a_second_fence_pass_finds_nothing_left_to_take_back(team):
+    """围栏是可以重跑的：一半做完再跑一次，不会重复作废谁，也不会重复抬一次控制 epoch。"""
+    requirement, _plan, _item, instance, token, attempt = live_attempt(team)
+    execution = team.make_execution()
+    acked = execution.ack(token, attempt.attempt_id, **claims(attempt))
+    assert fence(team) == {"nodes_disabled": 1, "instances_disabled": 1, "sessions_revoked": 0}
+    with pytest.raises(Unauthorized):
+        execution.start(token, attempt.attempt_id, **claims(acked.attempt))
+    assert fence(team) == {"nodes_disabled": 0, "instances_disabled": 0, "sessions_revoked": 0}
+    seen = team.store.get_instance(requirement.project_id, instance.instance_id)
+    assert (seen.status, seen.control_epoch) == ("disabled", instance.control_epoch + 1)
+    assert team.store.get_attempt(requirement.project_id,
+                                  attempt.attempt_id).status == "acked"
+    with team.database.read() as conn:
+        rows = conn.execute("SELECT COUNT(*) FROM collaboration_audit WHERE "
+                            "action IN ('node.disabled','instance.disabled')").fetchone()[0]
+        fences = conn.execute("SELECT COUNT(*) FROM collaboration_audit "
+                              "WHERE action='restore.fenced'").fetchone()[0]
+    assert (rows, fences) == (2, 2)
+
+
+def test_the_fence_command_runs_over_a_seeded_copy(team, capsys):
+    """命令行那一遍读的是它被给到的那一个目录，不是测试手里正在用的那个库。"""
+    requirement, _plan, _item, instance, _token, _attempt = live_attempt(team)
+    copy = team.database.path.parent / "restored"
+    copy.mkdir()
+    shutil.copy2(team.database.path, copy / "metadata.sqlite3")
+    assert host_main(["restore-fence", "--data-dir", str(copy)]) == 0
+    assert json.loads(capsys.readouterr().out) == {"nodes_disabled": 1, "instances_disabled": 1,
+                                                   "sessions_revoked": 0}
+    moved = CollaborationStore(Database(copy / "metadata.sqlite3"))
+    assert moved.get_instance(requirement.project_id, instance.instance_id).status == "disabled"
+    # 围栏只写它被指到的目录：测试里那份库还在原来的位置上。
+    assert team.store.get_instance(requirement.project_id,
+                                   instance.instance_id).status == "active"
+    with team.database.read() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM collaboration_audit WHERE action="
+                            "'restore.fenced'").fetchone()[0] == 0
 

@@ -19,6 +19,7 @@ from .host import SchedulerHost
 from .instances import InstanceService
 from .models import CollaborationError
 from .planning import PlanService
+from .recovery import fence_after_restore
 from .reviews import ReviewService
 from .scheduler import QueueService, Scheduler
 
@@ -51,6 +52,9 @@ def main(argv=None) -> int:
                                  help="Write a verified snapshot of the collaboration database")
     backup.add_argument("--data-dir", type=Path, required=True)
     backup.add_argument("--out", type=Path, required=True)
+    fence = commands.add_parser("restore-fence",
+                                help="Revoke every credential a restored archive may still carry")
+    fence.add_argument("--data-dir", type=Path, required=True)
     scheduler = commands.add_parser("scheduler",
                                     help="Keep running scheduling rounds until stopped (Ctrl-C)")
     scheduler.add_argument("--data-dir", type=Path, required=True)
@@ -104,6 +108,19 @@ def main(argv=None) -> int:
             report = snapshot(args.data_dir / "metadata.sqlite3", args.out)
         except (CollaborationError, Unauthorized, Forbidden, RateLimited, sqlite3.Error, OSError):
             parser.error("Backup failed")
+        print(json.dumps(report, sort_keys=True))
+        return 0
+
+    if args.command == "restore-fence":
+        # Run this after copying an archive over the live data directory. The counts are the
+        # evidence an operator keeps: a second pass must report zeros.
+        try:
+            database = Database(args.data_dir / "metadata.sqlite3")
+            database.initialize()
+            report = fence_after_restore(database, instances=InstanceService(database),
+                                         auth=AuthService(database))
+        except (CollaborationError, Unauthorized, Forbidden, RateLimited, sqlite3.Error, OSError):
+            parser.error("Restore fence failed")
         print(json.dumps(report, sort_keys=True))
         return 0
 

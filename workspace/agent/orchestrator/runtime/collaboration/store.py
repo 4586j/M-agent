@@ -534,6 +534,11 @@ class CollaborationStore:
             return _one(conn, ExecutionNode,
                         f"SELECT {_NODE_COLUMNS} FROM nodes WHERE credential_hash=?", (credential_hash,))
 
+    def list_nodes(self) -> list[ExecutionNode]:
+        with self._read() as conn:
+            return [_record(ExecutionNode, row) for row in conn.execute(
+                f"SELECT {_NODE_COLUMNS} FROM nodes ORDER BY name,node_id")]
+
     def disable_node(self, node_id: str) -> ExecutionNode:
         with self._write() as conn:
             self._active(self._node(conn, node_id))

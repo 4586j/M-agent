@@ -243,6 +243,18 @@ class AuthService:
                                 (token_digest(token),))
             self.audit(access.conn, access.user.user_id, "session.revoked", access.user.user_id)
 
+    def revoke_all_sessions(self) -> int:
+        """Take back every live sign-in at once, and report how many were standing.
+
+        A restored archive carries the people who happened to be signed in at the moment it was
+        copied. Section 15.3 asks them to authenticate again rather than keep a session the
+        operator cannot account for, so this leaves no row revoked=0 behind — including for a
+        member whose removal the archive never saw.
+        """
+        with self.database.transaction() as conn:
+            return conn.execute("UPDATE auth_sessions SET revoked=1,version=version+1 "
+                                "WHERE revoked=0").rowcount
+
     def create_invitation(self, token: str, csrf: str, username: str, display_name: str) -> InvitationResult:
         username = normalize_username(username)
         _text(display_name, "display_name")
