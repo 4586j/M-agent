@@ -5,11 +5,13 @@ import argparse
 from getpass import getpass
 import httpx
 from ipaddress import ip_address
+import json
 from pathlib import Path
 import sqlite3
 
 from .app import AppConfig, _wake, create_app
 from .auth import AuthService, Unauthorized, Forbidden, RateLimited
+from .backup import snapshot
 from .budgets import BudgetService
 from .database import Database
 from .dispatch import DispatchService
@@ -45,6 +47,10 @@ def main(argv=None) -> int:
     disable = commands.add_parser("node-disable", help="Disable an execution node and its live instances")
     disable.add_argument("--data-dir", type=Path, required=True)
     disable.add_argument("--node-id", required=True)
+    backup = commands.add_parser("backup",
+                                 help="Write a verified snapshot of the collaboration database")
+    backup.add_argument("--data-dir", type=Path, required=True)
+    backup.add_argument("--out", type=Path, required=True)
     scheduler = commands.add_parser("scheduler",
                                     help="Keep running scheduling rounds until stopped (Ctrl-C)")
     scheduler.add_argument("--data-dir", type=Path, required=True)
@@ -89,6 +95,16 @@ def main(argv=None) -> int:
         except (CollaborationError, Unauthorized, Forbidden, RateLimited, sqlite3.Error):
             parser.error("Node operation failed")
         print(node.node_id)
+        return 0
+
+    if args.command == "backup":
+        # The manifest is the part an operator reads years later, so it is printed in full and
+        # carries no content: counts and digests only, never a requirement text or a name.
+        try:
+            report = snapshot(args.data_dir / "metadata.sqlite3", args.out)
+        except (CollaborationError, Unauthorized, Forbidden, RateLimited, sqlite3.Error, OSError):
+            parser.error("Backup failed")
+        print(json.dumps(report, sort_keys=True))
         return 0
 
     if args.command == "scheduler":

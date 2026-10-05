@@ -24,7 +24,7 @@ sys.path.insert(0, str(RUNTIME))
 
 from collaboration import __main__ as cli
 from collaboration.app import (_ACTIVITY_DENIED, AppConfig, COOKIE, PREFIX, _wake, create_app)
-from collaboration.database import Database
+from collaboration.database import Database, SCHEMA_VERSION
 from collaboration.reviews import INTEGRATION_DECISIONS
 from collaboration.store import (REQUIREMENT_TRANSITIONS, WORK_ITEM_STATUSES,
                                  CollaborationStore)
@@ -3122,4 +3122,87 @@ def test_the_panel_opens_the_coverage_report_where_a_signature_is_asked():
     # 需求详情区也摊开同一份报告：不签字的相关人（例如另一位管理者）也读得到核对痕迹。
     assert 'add(block, "dt", null, "覆盖核对' in source
     assert "showCoverage(block, await get(`${path}/integration`))" in source
+
+
+# --- T09aa: verified backups --------------------------------------------------
+
+def test_the_backup_command_writes_a_verified_snapshot_that_boots_as_a_service(api, tmp_path,
+                                                                               capsys):
+    # 第 15.2 节要的是一份记着 schema 版本与原文/产物校验结果的备份：没验过的副本等于把数据丢两次。
+    project, requirement_id, plan, attempt, token = machine_attempt(api)
+    pid = project["project_id"]
+    headers = {"X-Instance-Token": token}
+    base = f"/machine/attempts/{attempt.attempt_id}"
+    started = checked(api.send(None, "POST", base + "/start", json=machine_claims(attempt),
+                               headers=headers))
+    content = "交付说明".encode("utf-8")
+    digest = hashlib.sha256(content).hexdigest()
+    checked(api.send(None, "POST", base + "/artifacts", headers=headers, json={
+        **machine_claims(started["attempt"]), "name": "result.md", "media_type": "text/markdown",
+        "sha256": digest, "content": base64.b64encode(content).decode("ascii")}), 201)
+
+    archive = tmp_path / "archive" / "collab.sqlite3"
+    archive.parent.mkdir()
+    assert cli.main(["backup", "--data-dir", str(tmp_path), "--out", str(archive)]) == 0
+    printed = json.loads(capsys.readouterr().out)
+    manifest = json.loads((tmp_path / "archive" / "collab.sqlite3.manifest.json").read_text(
+        encoding="utf-8"))
+    assert printed == manifest
+    assert manifest["schema_version"] == SCHEMA_VERSION
+    assert manifest["backup"]["sha256"] == hashlib.sha256(archive.read_bytes()).hexdigest()
+    assert manifest["backup"]["size_bytes"] == archive.stat().st_size
+    assert manifest["verified"] == {"requirement_texts": 1, "artifacts": 1,
+                                    "audit_append_only": True}
+    with Database(archive).read() as conn:
+        for table, count in manifest["counts"].items():
+            assert conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == count, table
+    assert manifest["counts"]["attempt_artifacts"] == 1 and manifest["counts"]["plans"] == 1
+
+    # 档案要能被服务起来读，才算备份：登录态、需求与那份交付文件都还在原来的位置上。
+    restored = tmp_path / "restored"
+    restored.mkdir()
+    (restored / "metadata.sqlite3").write_bytes(archive.read_bytes())
+    session = {"Origin": ORIGIN, "Cookie": f"{COOKIE}={api.identities['member']['token']}"}
+    with TestClient(create_app(AppConfig(restored, public_origin=ORIGIN)),
+                    base_url=ORIGIN) as client:
+        seen = checked(client.get(PREFIX + f"/projects/{pid}/requirements/{requirement_id}",
+                                  headers=session))
+        assert (seen["title"], seen["status"]) == ("需求文档", "executing")
+        files = f"/projects/{pid}/attempts/{attempt.attempt_id}/artifacts"
+        listed = checked(client.get(PREFIX + files, headers=session))
+        blob = client.get(PREFIX + f"{files}/{listed[0]['artifact_id']}", headers=session)
+        assert (blob.content, blob.headers["x-content-hash"]) == (content, digest)
+        assert blob.headers["content-disposition"].startswith("attachment;")
+
+
+def test_a_backup_whose_copy_does_not_match_its_digests_is_never_promoted(api, tmp_path, capsys):
+    project, requirement_id, plan, attempt, token = machine_attempt(api)
+    with sqlite3.connect(api.database.path) as conn:
+        # 服务自己写不出摘要对不上的产物行，但一份坏档案正是从这样一行开始的：它不该变成备份。
+        conn.execute("INSERT INTO attempt_artifacts(artifact_id,attempt_id,project_id,"
+                     "work_item_id,name,media_type,size_bytes,sha256,content,created_at) "
+                     "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                     ("bad" * 8, attempt.attempt_id, project["project_id"],
+                      plan["work_items"][0]["work_item_id"], "bad.md", "text/markdown", 1,
+                      "0" * 64, b"z", 1.0))
+    archive = tmp_path / "archive.sqlite3"
+    with pytest.raises(SystemExit) as error:
+        cli.main(["backup", "--data-dir", str(tmp_path), "--out", str(archive)])
+    assert error.value.code == 2
+    output = capsys.readouterr()
+    assert not output.out and "digest" not in output.err
+    assert not archive.exists() and not (tmp_path / "archive.sqlite3.part").exists()
+    assert not (tmp_path / "archive.sqlite3.manifest.json").exists()
+
+
+def test_a_second_backup_never_replaces_the_first(api, tmp_path, capsys):
+    machine_attempt(api)
+    archive = tmp_path / "archive.sqlite3"
+    assert cli.main(["backup", "--data-dir", str(tmp_path), "--out", str(archive)]) == 0
+    capsys.readouterr()
+    before = archive.read_bytes()
+    with pytest.raises(SystemExit) as error:
+        cli.main(["backup", "--data-dir", str(tmp_path), "--out", str(archive)])
+    assert error.value.code == 2
+    assert archive.read_bytes() == before
 
