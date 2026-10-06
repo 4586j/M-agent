@@ -702,8 +702,8 @@ def test_queue_and_dispatch_are_project_scoped(team):
     requirement = approved_requirement(team)
     plan = manual_plan(team, requirement, {"items": [item(team, "A")]})
     result = team.scheduler.tick(project_id=team.project_b.project_id)
-    assert result == {"claimed": 0, "delivered": 0, "deferred": 0, "work_items_changed": 0,
-                      "attempts_reclaimed": 0}
+    assert result == {"claimed": 0, "delivered": 0, "deferred": 0, "voided": 0,
+                      "work_items_changed": 0, "attempts_reclaimed": 0}
     assert team.store.list_work_items(requirement.project_id, plan.plan_id)[0].status == "ready"
     assert team.store.list_events(team.project_b.project_id) == []
 
@@ -714,11 +714,13 @@ def test_dispatch_defers_unknown_topics_with_backoff_and_a_cap(team):
     dispatcher = OutboxDispatcher(team.database, clock=team.clock)
     event = team.store.enqueue_event(team.project_a.project_id, "mystery.topic", {"n": 1},
                                      created_at=team.clock())
-    assert dispatcher.dispatch_once() == {"claimed": 1, "delivered": 0, "deferred": 1}
+    assert dispatcher.dispatch_once() == {"claimed": 1, "delivered": 0, "deferred": 1,
+                                         "voided": 0}
     stored = team.store.get_event(event.event_id)
     assert (stored.attempts, stored.last_error) == (1, "_NoHandler")
     assert stored.next_attempt_at == team.clock() + 5.0
-    assert dispatcher.dispatch_once() == {"claimed": 0, "delivered": 0, "deferred": 0}
+    assert dispatcher.dispatch_once() == {"claimed": 0, "delivered": 0, "deferred": 0,
+                                         "voided": 0}
     team.clock.advance(5)
     assert dispatcher.dispatch_once()["claimed"] == 1
     stored = team.store.get_event(event.event_id)
@@ -730,6 +732,26 @@ def test_dispatch_defers_unknown_topics_with_backoff_and_a_cap(team):
     stored = team.store.get_event(event.event_id)
     assert stored.next_attempt_at == team.clock() + 3600.0
     assert stored.delivered_at is None
+
+
+def test_a_voided_event_is_closed_but_never_called_delivered(team):
+    store = team.store
+    event = store.enqueue_event(team.project_a.project_id, "closed.topic", {}, team.clock())
+    claimed = store.claim_due_events(now=team.clock(), lease_ttl=300, batch_size=10)
+    assert [entry.event_id for entry in claimed] == [event.event_id]
+    # 只有手里那次认领可以盖章：过期的认领属于别人，作废它等于替别人撒谎。
+    assert store.void_event(event.event_id, claim_expires_at=team.clock() - 1,
+                            voided_at=team.clock(), last_error="DeliveryVoided") is False
+    assert store.void_event(event.event_id, claim_expires_at=team.clock() + 300,
+                            voided_at=team.clock(), last_error="DeliveryVoided") is True
+    closed = store.get_event(event.event_id)
+    assert (closed.delivered_at, closed.voided_at, closed.attempts, closed.last_error) == \
+        (None, team.clock(), 0, "DeliveryVoided")
+    # 作废是终态：第二遍只报告没有变化，时间戳不动，认领也再也看不见它。
+    assert store.void_event(event.event_id, claim_expires_at=team.clock() + 300,
+                            voided_at=team.clock() + 5, last_error="DeliveryVoided") is False
+    assert store.get_event(event.event_id).voided_at == team.clock()
+    assert store.claim_due_events(now=team.clock() + 100, lease_ttl=300, batch_size=10) == []
 
 
 def test_dispatch_records_the_failure_type_and_marks_success(team):
@@ -748,7 +770,8 @@ def test_dispatch_records_the_failure_type_and_marks_success(team):
     handled = []
     dispatcher.register("work.topic", lambda event: handled.append(event.event_id))
     team.clock.advance(5)
-    assert dispatcher.dispatch_once() == {"claimed": 1, "delivered": 1, "deferred": 0}
+    assert dispatcher.dispatch_once() == {"claimed": 1, "delivered": 1, "deferred": 0,
+                                          "voided": 0}
     assert handled == [event.event_id]
     stored = team.store.get_event(event.event_id)
     assert (stored.delivered_at, stored.claim_expires_at) == (team.clock(), None)
@@ -767,7 +790,8 @@ def test_expired_claim_leases_allow_exactly_one_redelivery(team):
                                            delivered_at=team.clock()) is False
     assert dispatcher.dispatch_once()["claimed"] == 0
     team.clock.advance(301)
-    assert dispatcher.dispatch_once() == {"claimed": 1, "delivered": 1, "deferred": 0}
+    assert dispatcher.dispatch_once() == {"claimed": 1, "delivered": 1, "deferred": 0,
+                                          "voided": 0}
     assert delivered == [event.event_id]
     stored = team.store.get_event(event.event_id)
     assert (stored.attempts, stored.delivered_at) == (0, team.clock())
@@ -795,8 +819,8 @@ def test_scheduler_tick_plans_after_approval_and_queues_work_items(team):
     requirement = approved_requirement(team)
     team.planning.planner = lambda context: {"items": [item(team, "A", estimate=2)]}
     first = team.scheduler.tick(project_id=requirement.project_id)
-    assert first == {"claimed": 1, "delivered": 1, "deferred": 0, "work_items_changed": 1,
-                     "attempts_reclaimed": 0}
+    assert first == {"claimed": 1, "delivered": 1, "deferred": 0, "voided": 0,
+                     "work_items_changed": 1, "attempts_reclaimed": 0}
     assert current(team, requirement).status == "executing"
     plan = team.store.published_plan(requirement.project_id, requirement.requirement_id)
     assert plan is not None and plan.total_units == 2

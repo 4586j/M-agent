@@ -687,6 +687,59 @@ def test_v13_migration_failure_leaves_the_file_untouched(tmp_path, monkeypatch):
                                                             "old-item").estimated_units == 4
 
 
+def make_v13_database(path):
+    """A v13 file with one wake still owed, so v13 -> v14 is what gets tested."""
+    make_v12_database(path)
+    with closing(sqlite3.connect(path, isolation_level=None)) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        for statement in database_module._INTEGRATION_ITEM_SCHEMA:
+            conn.execute(statement)
+        conn.execute("INSERT INTO outbox_events(event_id,project_id,topic,payload,created_at,"
+                     "next_attempt_at,attempts,last_error) "
+                     "VALUES('owed','old-project','attempt.assigned','{}',3900.0,3900.0,1,"
+                     "'AdmissionDenied')")
+        conn.execute("PRAGMA user_version=13")
+        conn.commit()
+
+
+def test_v13_database_upgrades_to_v14_and_an_owed_wake_stays_owed(tmp_path):
+    path = tmp_path / "v14.sqlite3"
+    make_v13_database(path)
+    database = Database(path)
+    with pytest.raises(database_module.SchemaVersionError):
+        with database.read():
+            pytest.fail("Migration must be explicit")
+    database.initialize()
+    with database.read() as conn:
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+        assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+        # 多了「作废」这一格不等于旧事件都成了作废：默认值就是它一直以来的意思——还欠着。
+        assert tuple(conn.execute("SELECT voided_at,delivered_at FROM outbox_events "
+                                  "WHERE event_id='owed'").fetchone()) == (None, None)
+    store = CollaborationStore(database)
+    assert [event.event_id for event in
+            store.claim_due_events(now=4000.0, lease_ttl=300, batch_size=10)] == ["owed"]
+    assert store.void_event("owed", claim_expires_at=4300.0, voided_at=4300.0,
+                            last_error="DeliveryVoided") is True
+    assert store.claim_due_events(now=4400.0, lease_ttl=300, batch_size=10) == []
+
+
+def test_v14_migration_failure_leaves_the_file_untouched(tmp_path, monkeypatch):
+    path = tmp_path / "v13.sqlite3"
+    make_v13_database(path)
+    before = path.read_bytes()
+    with monkeypatch.context() as patch:
+        patch.setattr(database_module, "_OUTBOX_VOID_SCHEMA", ("INVALID SQL",))
+        with pytest.raises(sqlite3.OperationalError):
+            Database(path).initialize()
+    assert path.read_bytes() == before
+    Database(path).initialize()
+    # 迁移失败那一次什么也没留下：重来一遍，那条还欠着的唤醒仍然是原样。
+    owed = CollaborationStore(Database(path)).get_event("owed")
+    assert (owed.topic, owed.attempts, owed.voided_at, owed.delivered_at) == \
+        ("attempt.assigned", 1, None, None)
+
+
 # --- instance registration ----------------------------------------------------
 
 def test_worker_url_is_registered_and_rejects_extra_callback_targets(team):
@@ -1295,7 +1348,15 @@ def test_wake_defers_until_the_owner_registers_a_worker_url(team):
     pending = events(team, requirement.project_id, TOPIC_ATTEMPT_ASSIGNED)[0]
     assert (pending.attempts, pending.last_error) == (1, "AdmissionDenied")
     team.store.set_disabled(attempt.instance_id)
-    assert dispatcher.dispatch_once(requirement.project_id)["deferred"] == 0
+    team.clock.advance(10)
+    # 槽位一被关掉，再也没有人可以替它登记地址：这条唤醒不是迟到，而是不再成立，
+    # 所以它被记成作废，而不是被一推再推。
+    result = dispatcher.dispatch_once(requirement.project_id)
+    assert (result["claimed"], result["voided"], result["deferred"]) == (2, 1, 1)
+    closed = events(team, requirement.project_id, TOPIC_ATTEMPT_ASSIGNED)[0]
+    assert (closed.delivered_at, closed.voided_at, closed.last_error) == \
+        (None, team.clock(), "DeliveryVoided")
+    assert dispatcher.dispatch_once(requirement.project_id)["claimed"] == 0
 
 
 def test_scheduler_tick_auto_dispatches_only_when_admission_allows(team):

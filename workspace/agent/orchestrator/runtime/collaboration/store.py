@@ -172,7 +172,7 @@ _WORK_ITEM_COLUMNS = (
 )
 _OUTBOX_COLUMNS = (
     "event_id,project_id,topic,payload,created_at,next_attempt_at,attempts,"
-    "claim_expires_at,delivered_at,last_error"
+    "claim_expires_at,delivered_at,last_error,voided_at"
 )
 _BUDGET_ACCOUNT_COLUMNS = "scope,ref_id,limit_units,version,updated_at"
 _BUDGET_ENTRY_COLUMNS = "entry_id,scope,ref_id,ref_type,ref_key,kind,delta_units,created_at"
@@ -1305,13 +1305,14 @@ class CollaborationStore:
             if project_id is None:
                 rows = conn.execute(
                     f"SELECT {_OUTBOX_COLUMNS} FROM outbox_events WHERE delivered_at IS NULL "
-                    "AND next_attempt_at<=? AND (claim_expires_at IS NULL OR claim_expires_at<=?) "
+                    "AND voided_at IS NULL AND next_attempt_at<=? "
+                    "AND (claim_expires_at IS NULL OR claim_expires_at<=?) "
                     "ORDER BY next_attempt_at,created_at,event_id LIMIT ?",
                     (now, now, batch_size)).fetchall()
             else:
                 rows = conn.execute(
                     f"SELECT {_OUTBOX_COLUMNS} FROM outbox_events WHERE project_id=? "
-                    "AND delivered_at IS NULL AND next_attempt_at<=? "
+                    "AND delivered_at IS NULL AND voided_at IS NULL AND next_attempt_at<=? "
                     "AND (claim_expires_at IS NULL OR claim_expires_at<=?) "
                     "ORDER BY next_attempt_at,created_at,event_id LIMIT ?",
                     (project_id, now, now, batch_size)).fetchall()
@@ -1341,6 +1342,21 @@ class CollaborationStore:
                 "UPDATE outbox_events SET attempts=attempts+1,next_attempt_at=?,claim_expires_at=NULL,"
                 "last_error=? WHERE event_id=? AND claim_expires_at=?",
                 (next_attempt_at, last_error, event_id, claim_expires_at))
+            return cursor.rowcount == 1
+
+    def void_event(self, event_id: str, *, claim_expires_at: float, voided_at: float,
+                   last_error: str | None) -> bool:
+        """Close an event that can never be delivered, without claiming that it was.
+
+        Only a live claim may void, and only once: a second pass finds `voided_at` already set
+        and reports no change rather than moving the stamp.
+        """
+        with self._write() as conn:
+            cursor = conn.execute(
+                "UPDATE outbox_events SET voided_at=?,claim_expires_at=NULL,last_error=?"
+                " WHERE event_id=? AND claim_expires_at=? AND delivered_at IS NULL "
+                "AND voided_at IS NULL",
+                (voided_at, last_error, event_id, claim_expires_at))
             return cursor.rowcount == 1
 
     def get_budget_account(self, scope: str, ref_id: str) -> BudgetAccount | None:

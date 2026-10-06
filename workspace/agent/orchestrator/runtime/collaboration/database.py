@@ -8,7 +8,7 @@ from typing import Iterator
 from .models import SchemaVersionError
 
 
-SCHEMA_VERSION = 13
+SCHEMA_VERSION = 14
 
 _SCHEMA_STATEMENTS = (
     """
@@ -1005,6 +1005,12 @@ _INTEGRATION_ITEM_SCHEMA = (
     "CHECK(kind IN ('business','integration'))",
 )
 
+# A wake addressed to an instance that has since been disabled can never be delivered, and
+# retrying it forever buries the one fact an operator needs: nobody was told about that round.
+# `voided_at` says so on its own terms — `delivered_at` keeps meaning "the push actually went
+# out", which is the difference between a closed event and a lie about one.
+_OUTBOX_VOID_SCHEMA = ("ALTER TABLE outbox_events ADD COLUMN voided_at REAL",)
+
 
 def _check_schema_version(connection: sqlite3.Connection) -> None:
     version = connection.execute("PRAGMA user_version").fetchone()[0]
@@ -1121,6 +1127,11 @@ class Database:
                     for statement in _INTEGRATION_ITEM_SCHEMA:
                         connection.execute(statement)
                     version = 13
+                    migrated = True
+                if version == 13:
+                    for statement in _OUTBOX_VOID_SCHEMA:
+                        connection.execute(statement)
+                    version = 14
                     migrated = True
                 if migrated:
                     connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")

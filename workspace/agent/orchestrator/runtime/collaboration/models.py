@@ -291,6 +291,7 @@ class OutboxEvent:
     claim_expires_at: float | None = None
     delivered_at: float | None = None
     last_error: str | None = None
+    voided_at: float | None = None
 
 
 @dataclass(frozen=True)

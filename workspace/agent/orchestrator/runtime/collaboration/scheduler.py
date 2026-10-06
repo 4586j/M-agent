@@ -5,7 +5,8 @@ import json
 import time
 
 from .auth import record_audit
-from .dispatch import DISPATCHABLE_STATUSES, TOPIC_ATTEMPT_ASSIGNED, TOPIC_ATTEMPT_REVOKED
+from .dispatch import (DISPATCHABLE_STATUSES, DeliveryVoided, TOPIC_ATTEMPT_ASSIGNED,
+                       TOPIC_ATTEMPT_REVOKED)
 from .instances import AdmissionDenied
 from .models import Conflict, InvalidState, NotFound
 from .store import CollaborationStore, WORK_ITEM_QUEUE_STATUSES
@@ -46,13 +47,20 @@ class OutboxDispatcher:
         store = CollaborationStore(self.database)
         events = store.claim_due_events(now=now, lease_ttl=self.lease_ttl,
                                         batch_size=self.batch_size, project_id=project_id)
-        delivered = deferred = 0
+        delivered = deferred = voided = 0
         for event in events:
             handler = self.handlers.get(event.topic)
             try:
                 if handler is None:
                     raise _NoHandler(event.topic)
                 handler(event)
+            except DeliveryVoided as exc:
+                # The handler says this can never be delivered, so deferring it forever would
+                # spend the one thing the ledger is for: telling someone that nobody was told.
+                changed = store.void_event(
+                    event.event_id, claim_expires_at=event.claim_expires_at, voided_at=now,
+                    last_error=type(exc).__name__[:128])
+                voided += 1 if changed else 0
             except Exception as exc:
                 changed = store.defer_event(
                     event.event_id, claim_expires_at=event.claim_expires_at,
@@ -64,7 +72,8 @@ class OutboxDispatcher:
                     event.event_id, claim_expires_at=event.claim_expires_at,
                     delivered_at=self.clock())
                 delivered += 1 if changed else 0
-        return {"claimed": len(events), "delivered": delivered, "deferred": deferred}
+        return {"claimed": len(events), "delivered": delivered, "deferred": deferred,
+                "voided": voided}
 
 
 class QueueService:

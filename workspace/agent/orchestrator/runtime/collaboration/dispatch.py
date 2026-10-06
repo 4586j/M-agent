@@ -23,6 +23,10 @@ DISPATCHABLE_STATUSES = ("ready", "waiting_agent")
 REPORT_STAGES_ALLOWED = ("ack", "start", "lease", "artifact", "result", "cancel")
 
 
+class DeliveryVoided(Exception):
+    """The thing this event asks for can never happen; retrying it would hide that fact."""
+
+
 def _canonical(payload: dict) -> str:
     return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
@@ -288,7 +292,13 @@ class DispatchService:
         with self.database.read() as conn:
             instance = CollaborationStore(self.database, connection=conn).get_instance(
                 event.project_id, payload["instance_id"])
-        if instance.status != "active" or not instance.worker_url:
+        if instance.status != "active":
+            # A disabled slot never wakes again: nothing reactivates it and its row is never
+            # deleted. So this push is not late, it is moot — and the round it was telling
+            # about stays with the person who already owes the reconciliation.
+            raise DeliveryVoided("the instance this wake was addressed to was disabled")
+        if not instance.worker_url:
+            # Not moot yet: the owner can still register where this machine listens.
             raise AdmissionDenied("worker_unreachable")
         self.push(instance.worker_url, {
             "attempt_id": payload["attempt_id"], "work_item_id": payload["work_item_id"],

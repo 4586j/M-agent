@@ -1137,8 +1137,8 @@ def test_scheduler_tick_and_outbox_over_http(api):
     checked(api.send("member", "POST", tick_path), 403)
     checked(api.send("outsider", "POST", tick_path), 404)
     tick = checked(api.send("manager", "POST", tick_path))
-    assert tick == {"claimed": 1, "delivered": 1, "deferred": 0, "work_items_changed": 1,
-                    "attempts_reclaimed": 0}
+    assert tick == {"claimed": 1, "delivered": 1, "deferred": 0, "voided": 0,
+                    "work_items_changed": 1, "attempts_reclaimed": 0}
     assert checked(api.send("member", "GET",
                             f"/projects/{pid}/requirements/{requirement_id}"))["status"] == \
         "executing"
@@ -3318,16 +3318,20 @@ def test_a_restored_archive_comes_back_behind_a_fence(api, tmp_path, capsys):
         tick = checked(client.post(PREFIX + f"/projects/{pid}/scheduler/tick", headers=fresh))
         assert tick["work_items_changed"] == 1
         # 档案里那些没投完的事件仍然会被重新认领：两条按当下的事实成了无害的空转，第三条是
-        # 「去唤醒那台已被围栏关掉的机器」，它只会被一再推迟。15.3 要的「过期派发事件作废」
-        # 还没实现——围栏收走的是执行权，不是那条事件。
-        assert (tick["claimed"], tick["delivered"], tick["deferred"]) == (3, 2, 1)
+        # 「去唤醒那台已被围栏关掉的机器」。它不再被推迟到无穷远，而是被记成作废——
+        # delivered_at 仍然空着，因为确实没有人被唤醒过。
+        assert (tick["claimed"], tick["delivered"], tick["deferred"], tick["voided"]) == (3, 2, 0, 1)
         detail = checked(client.get(PREFIX + plans_path(project, requirement_id)
                                     + f"/{plan['plan']['plan_id']}", headers=fresh))
         assert [entry["status"] for entry in detail["work_items"]] == ["running", "waiting_agent"]
+        # 作废是终态：下一轮认领不再看见它，围栏之后不再有无限重试的派发事件。
+        assert checked(client.post(PREFIX + f"/projects/{pid}/scheduler/tick",
+                                   headers=fresh))["claimed"] == 0
     with Database(restored / "metadata.sqlite3").read() as conn:
-        stuck = [(row[0], row[1]) for row in conn.execute(
-            "SELECT topic,last_error FROM outbox_events WHERE delivered_at IS NULL")]
-        assert stuck == [("attempt.assigned", "AdmissionDenied")]
+        unread = [(row[0], row[1], row[2]) for row in conn.execute(
+            "SELECT topic,last_error,voided_at IS NOT NULL FROM outbox_events "
+            "WHERE delivered_at IS NULL")]
+        assert unread == [("attempt.assigned", "DeliveryVoided", 1)]
         # 重放不重复造计划：需求早已走过 approved，那一条被认成「不再适用」而不是再生成一版。
         assert conn.execute("SELECT COUNT(*) FROM plans").fetchone()[0] == 1
 
