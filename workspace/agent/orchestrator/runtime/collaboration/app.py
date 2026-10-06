@@ -324,6 +324,12 @@ _ERRORS = {
     500: "Internal server error", 503: "Service unavailable",
 }
 
+# The panel is one HTML file, one stylesheet and one script, all from this origin; it talks to
+# its own API and renders every server string as text. Saying that in a header is what keeps a
+# later "let this be markup" edit from running in this site without passing here first.
+_PANEL_CSP = ("default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; "
+              "base-uri 'none'; form-action 'self'; frame-ancestors 'none'")
+
 
 def _error(status: int) -> JSONResponse:
     return JSONResponse({"detail": _ERRORS.get(status, "Request failed")}, status_code=status,
@@ -572,6 +578,11 @@ def create_app(config: AppConfig) -> FastAPI:
             # Do not pass exception text, SQL, request bodies or credentials to logs.
             return _error(500)
         response.headers["Cache-Control"] = "no-store"
+        path = request.url.path
+        if path == "/ui" or path.startswith("/ui/"):
+            # Only the panel gets this policy: the API's own responses carry data, not markup,
+            # and the artifact download already answers with a sandbox of its own.
+            response.headers["Content-Security-Policy"] = _PANEL_CSP
         return response
 
     async def domain_error(request: Request, exc: Exception):

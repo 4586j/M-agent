@@ -2779,6 +2779,13 @@ def test_the_panel_is_static_and_gives_nobody_a_data_free_path(api):
         assert response.status_code in (400, 401, 404), (escape, response.status_code)
     typed = asset("/ui")
     assert typed.status_code == 200 and typed.url.path == "/ui/" and 'id="todos"' in typed.text
+    # 这一页只有一张样式表、一个脚本、自己的 API：策略写死在这里，将来谁要放宽就得先让它变红。
+    policy = ("default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; "
+              "base-uri 'none'; form-action 'self'; frame-ancestors 'none'")
+    for served in (page, asset("/ui/app.js"), asset("/ui/styles.css"), typed):
+        assert served.headers["content-security-policy"] == policy, served.url.path
+    # 只管面板：API 送的是数据不是标记，它的响应头不跟着改，产物下载另有自己那行 sandbox。
+    assert "content-security-policy" not in api.send(None, "GET", "/inbox").headers
 
 
 def test_the_panel_drafting_chain_creates_clarifies_and_submits(api):
