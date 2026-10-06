@@ -90,6 +90,63 @@ const NEWS = {
   "attempt.reconciled.cancelled": "对账为已停止且无副作用",
   "attempt.reconciled.failed": "对账为已产生副作用",
 };
+// 界面给人看的枚举词。左边一个字都不改：那是服务端 CHECK 约束里的原词，用例把两边钉在一起
+// （schema 里多一个词而这张表没有，那条用例会红）。少一个词不会少一条事实——named() 仍把原词
+// 显出来，只是难看，与上面 NEWS 同一规矩。
+const REQUIREMENT_STATE = {
+  draft: "草稿",
+  in_review: "等评审这一版原文",
+  approved: "已批准，等拆解",
+  planning: "正在拆解",
+  planning_blocked: "拆解被挡住",
+  executing: "执行中",
+  integrating: "交付齐了，等人核对覆盖",
+  awaiting_acceptance: "等提出人签字",
+  rework: "退回返工",
+  paused: "已暂停，不再派新活",
+  cancelling: "正在取消",
+  cancelled: "已取消",
+  completed: "已签字验收",
+};
+const WORK_ITEM_STATE = {
+  pending_dependency: "还在等前置项",
+  ready: "可派发",
+  waiting_agent: "等一台可用的执行机",
+  running: "执行中",
+  awaiting_owner_review: "等负责人确认产出",
+  submitted: "已交回产出",
+  accepted: "已验收通过",
+  changes_requested: "被要求改动",
+  blocked: "受阻",
+  failed: "失败",
+  cancelled: "已取消",
+};
+const MACHINE_STATE = {
+  pending: "等人认领",
+  active: "在用",
+  disabled: "已禁用",
+};
+const ISOLATION_STATE = {
+  none: "无隔离",
+  os_account: "独立系统账户",
+  container: "容器",
+  vm: "虚拟机",
+};
+const VERDICT_STATE = {
+  accepted: "验收通过",
+  changes_requested: "退回",
+};
+const ROLE_STATE = {
+  owner: "所有者",
+  manager: "管理者",
+  reviewer: "评审人",
+  member: "成员",
+};
+
+function named(map, value) {
+  return map[value] || value;
+}
+
 const ACTIVITY_LIMIT = 20;
 const FEED_LIMIT = 20;
 const TODO_LIMIT = 20;
@@ -310,10 +367,11 @@ async function refresh() {
 
 function renderInstance(parent, instance) {
   const row = add(parent, "dl", null);
-  add(row, "dd", null, `节点 ${instance.node_id} · 状态 ${instance.status}`
+  add(row, "dd", null, `节点 ${instance.node_id} · 状态 ${named(MACHINE_STATE, instance.status)}`
                         + ` · 控制纪元 ${instance.control_epoch}`);
   add(row, "dd", null, `心跳 ${when(instance.heartbeat_at)} · 认领于 ${when(instance.claimed_at)}`);
-  add(row, "dd", null, `隔离声明 ${instance.isolation_mode || "未声明"} · 负责人已核验 `
+  add(row, "dd", null, `隔离声明 ${instance.isolation_mode
+    ? named(ISOLATION_STATE, instance.isolation_mode) : "未声明"} · 负责人已核验 `
                         + `${instance.isolation_verified ? "是" : "否"}`);
 }
 
@@ -359,7 +417,7 @@ function renderTodo(entry) {
     add(head, "span", "unread", "未读");
   }
   add(row, "div", "locator", `${projectNames[entry.project_id] ?? entry.project_id} · `
-                             + `${entry.title} · ${entry.item_type} · 版本 ${entry.expected_version}`);
+                             + `${entry.title} · 版本 ${entry.expected_version}`);
   if (spec.hint && !spec.reason) {
     // 没有理由输入框时 hint 无处可显：把这条待办的边界摊成一行字，免得"禁用"被读成"这轮作废"。
     add(row, "div", "locator", spec.hint);
@@ -557,7 +615,8 @@ function integrationOpener(form, entry) {
               const item = await post(entry.links.integration_item,
                                       {binding_id: select.value, estimated_units: amount,
                                        expected_version: entry.expected_version});
-              await report(`集成工作项 ${item.key} 已开出来（${item.status}）：`
+              await report(`集成工作项 ${item.key} 已开出来`
+                           + `（${named(WORK_ITEM_STATE, item.status)}）：`
                            + "在下方那一行点「派发一次尝试」才真的跑。");
             } catch (error) {
               submit.disabled = false;
@@ -672,7 +731,7 @@ function reviewerSelect(form) {
   for (const member of roster.filter(item => item.status === "active")) {
     const option = document.createElement("option");
     option.value = member.user_id;
-    option.textContent = `${member.display_name}（${member.access_role}）`;
+    option.textContent = `${member.display_name}（${named(ROLE_STATE, member.access_role)}）`;
     select.appendChild(option);
   }
   return select;
@@ -863,7 +922,8 @@ async function renderRequirement(projectId, requirementId) {
   const facts = add(block, "dl");
   for (const [key, label] of [["status", "状态"], ["version", "版本"]]) {
     add(facts, "dt", null, label);
-    add(facts, "dd", null, String(requirement[key]));
+    add(facts, "dd", null, String(key === "status"
+      ? named(REQUIREMENT_STATE, requirement[key]) : requirement[key]));
   }
   if (["executing", "rework", "paused"].includes(requirement.status)) {
     renderPauseState(block, requirement, await get(`${path}/pauses`));
@@ -908,7 +968,8 @@ async function renderRequirement(projectId, requirementId) {
       draftButton(form, "恢复需求", null, async () => {
         const back = await post(`${path}/actions`, {action: "resume",
                                                     expected_version: requirement.version});
-        await report(`需求已恢复为 ${back.status}；未开始的工作项重新可派发。`);
+        await report(`需求已恢复为 ${named(REQUIREMENT_STATE, back.status)}；`
+                     + "未开始的工作项重新可派发。");
       });
     }
     const form = add(block, "div", "form-row");
@@ -957,7 +1018,7 @@ async function renderRequirement(projectId, requirementId) {
       add(block, "dt", null, "交付证据");
       for (const item of delivery.delivery.items) {
         const row = add(block, "dl", null);
-        add(row, "dd", null, `${item.key} · ${item.status} · 已接受尝试 `
+        add(row, "dd", null, `${item.key} · ${named(WORK_ITEM_STATE, item.status)} · 已接受尝试 `
                           + `${item.attempt_number ?? "无"} · 摘要 ${item.result_hash ?? "无"}`);
         add(row, "dd", null,
             `验收项：${item.acceptance.map(entry => entry.text).join("、") || "无"}`);
@@ -966,7 +1027,7 @@ async function renderRequirement(projectId, requirementId) {
       }
       add(block, "dd", "locator", `本次交付摘要 ${delivery.delivery.evidence_hash}`);
       for (const verdict of delivery.acceptances) {
-        add(block, "dd", null, [`提出人裁定：${verdict.decision}`,
+        add(block, "dd", null, [`提出人裁定：${named(VERDICT_STATE, verdict.decision)}`,
                                 verdict.reason || "无理由文本",
                                 returnScopeOf(verdict),
                                 signedSameBundle(verdict.evidence_hash,
@@ -1034,7 +1095,8 @@ async function renderWorkItems(block, projectId, requirementId, paused) {
   }
   for (const item of detail.work_items) {
     const row = add(block, "dl", null);
-    add(row, "dd", null, `${item.key} · ${item.title} · ${item.status} · 版本 ${item.version}`
+    add(row, "dd", null, `${item.key} · ${item.title} · ${named(WORK_ITEM_STATE, item.status)}`
+                          + ` · 版本 ${item.version}`
                           + ` · 估算 ${item.estimated_units}`
                           // 被人批准的那份计划里没有这一行：它是管理者后来点名的那一轮，得说清来源。
                           + (item.kind === "integration" ? " · 集成这一轮（不在批准的计划里）" : ""));
@@ -1143,9 +1205,7 @@ async function loadRequirements() {
   for (const requirement of list) {
     const option = document.createElement("option");
     option.value = requirement.requirement_id;
-    option.textContent = requirement.status === "paused"
-      ? `${requirement.title}（paused · 已暂停，不再派发）`
-      : `${requirement.title}（${requirement.status}）`;
+    option.textContent = `${requirement.title}（${named(REQUIREMENT_STATE, requirement.status)}）`;
     fields.requirement.appendChild(option);
   }
   if ([...fields.requirement.options].some(option => option.value === kept)) {

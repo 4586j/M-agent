@@ -2830,6 +2830,8 @@ def test_the_panel_renders_every_kind_of_to_do_the_inbox_can_advertise():
     source = (RUNTIME / "collaboration" / "web" / "app.js").read_text(encoding="utf-8")
     block = source.split("const DECISIONS = {", 1)[1].split("\n};", 1)[0]
     assert set(re.findall(r"^  (\w+): \{", block, re.MULTILINE)) == set(ACTIONS) | set(DRAFT_ACTIONS)
+    # 卡片抬头那句中文就是这一格的类型；定位行不该再把机器名重复一遍给人读。
+    assert "${entry.item_type}" not in source
 
 
 def test_the_panel_asks_for_a_page_of_todos_and_says_what_it_left_out():
@@ -2926,6 +2928,42 @@ def test_the_panel_hands_server_text_to_the_dom_only_as_text():
     # 产物只给下载链接，不给预览：href 由服务端算好的路径拼出，且不带到新窗口的返回引用。
     assert 'link.rel = "noopener"' in app
     assert "srcdoc" not in app and "target = \"_blank\"" not in app
+
+
+def test_every_word_the_schema_allows_has_a_chinese_label(tmp_path):
+    # 面板那几张对照表是服务端约束的镜像：值集从 SQLite 自己的建表语句里读，不在测试里抄一份。
+    # 少了哪一格都不会少一条事实（named() 仍把原词显出来），但人会看见一排机器名——这条守住它。
+    database = Database(tmp_path / "labels.sqlite3")
+    database.initialize()
+
+    def allowed(table, column):
+        with database.read() as conn:
+            sql = conn.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
+                               (table,)).fetchone()[0]
+        clause = re.search(column + r"\s+TEXT.*?\bIN\s*\((.*?)\)", sql, re.S)
+        assert clause is not None, (table, column)
+        return set(re.findall(r"'([\w_]+)'", clause.group(1)))
+
+    source = (RUNTIME / "collaboration" / "web" / "app.js").read_text(encoding="utf-8")
+
+    def labeled(name):
+        block = re.search(r"const " + name + r" = \{(.*?)\n\};", source, re.S)
+        assert block is not None, name
+        return set(re.findall(r"^\s+(\w+):", block.group(1), re.M))
+
+    assert labeled("REQUIREMENT_STATE") == allowed("requirements", "status")
+    assert labeled("WORK_ITEM_STATE") == allowed("work_items", "status")
+    assert labeled("MACHINE_STATE") == allowed("execution_instances", "status")
+    assert labeled("ISOLATION_STATE") == allowed("execution_instances", "isolation_mode")
+    assert labeled("VERDICT_STATE") == allowed("requirement_acceptance", "decision")
+    assert labeled("ROLE_STATE") == allowed("project_members", "access_role")
+    # 兜底必须还在：映射漏一个词时难看但不撒谎，删掉这句等于把「漏词」变成「漏事实」。
+    assert "return map[value] || value" in source
+    # 面板里任何一处直接把枚举词插进模板，都会绕过上面这几张表——这条守住那个「任何一处」。
+    # 唯一放行的是 response.status：那是 HTTP 状态码，一个数字，不是这套词表里的词。
+    leaky = re.findall(r"\$\{(?!response\.)[a-z]+\."
+                       r"(?:status|item_type|access_role|decision|isolation_mode)\}", source)
+    assert leaky == [], leaky
 
 
 def test_a_manager_opens_the_integration_round_over_http(api):
