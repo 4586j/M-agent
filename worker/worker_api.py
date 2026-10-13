@@ -168,6 +168,7 @@ def create_worker_app(runner: AgentRunner, cfg: WorkerConfig) -> FastAPI:
         with lock:
             if task_id in cancelled:
                 res.status = "cancelled"
+            res.meta = {**(res.meta or {}), "execution_finished": True}
             receipts.finish(res)
             state[task_id] = res
             # 已终态结果封顶，防长期运行内存增长；running 不清理
@@ -182,7 +183,7 @@ def create_worker_app(runner: AgentRunner, cfg: WorkerConfig) -> FastAPI:
         with lock:
             event = cancel_events[body.task_id]
         if event.is_set():
-            _record(body.task_id, TaskResult(body.task_id, "cancelled"))
+            _record(body.task_id, TaskResult(body.task_id, "cancelled", meta={"cost_usd": 0}))
             return
         req = TaskRequest(body.task_id, body.prompt, body.context_memory,
                           body.model, cancel_event=event, trace_id=body.trace_id,
@@ -235,9 +236,8 @@ def create_worker_app(runner: AgentRunner, cfg: WorkerConfig) -> FastAPI:
                 with lock:
                     active.discard(body.task_id)
             with lock:
-                should_callback = body.task_id not in cancelled
                 res = state.get(body.task_id)
-            if body.callback_url and should_callback:
+            if body.callback_url:
                 _send_callback(body.callback_url, res, api_key=cfg.api_key,
                                trace_id=body.trace_id)
 
@@ -260,7 +260,7 @@ def create_worker_app(runner: AgentRunner, cfg: WorkerConfig) -> FastAPI:
             cancelled.add(task_id)
             res = state.get(task_id)
             if res is not None:
-                state[task_id] = TaskResult(task_id, "cancelled")
+                state[task_id] = TaskResult(task_id, "cancelled", meta={"execution_finished": False})
                 receipts.finish(state[task_id])
         # 传播到执行体：runner 在消息/turn 边界协作退出
         with lock:

@@ -33,10 +33,11 @@ def e2e(tmp_path_factory):
     # 加固：try/finally 包裹 setup+yield（module 级 fixture 无法用 function 级
     # monkeypatch fixture），setup 中途失败（如服务未就绪 pytest.fail）也能恢复
     # 环境，杜绝 ORCH_MODE 等泄露到其他测试模块的跨模块 flake。
-    _saved = {k: os.environ.get(k) for k in ("ORCH_API_KEY", "ORCH_MODE", "ORCH_WORK_DIR")}
+    _saved = {k: os.environ.get(k) for k in ("ORCH_API_KEY", "ORCH_MODE", "ORCH_WORK_DIR", "ORCH_BUDGETS_FILE")}
     os.environ["ORCH_API_KEY"] = KEY
     os.environ["ORCH_MODE"] = "remote"
     os.environ["ORCH_WORK_DIR"] = work_dir
+    os.environ["ORCH_BUDGETS_FILE"] = str(Path(work_dir) / "budgets.json")
     try:
         wapp = worker_api.create_worker_app(
             FakeAgentRunner(work_dir),

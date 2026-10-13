@@ -17,7 +17,7 @@ from async_dispatcher import AsyncRemoteDispatcher
 from audit_log import record_security_event
 from budget_store import BudgetStore
 from config import Config
-from dispatch_context import approved_dispatch
+from dispatch_context import BudgetAdmissionRejected, approved_dispatch
 from dispatcher import Dispatcher
 from event_bus import TERMINAL_STATUSES, TaskEvent, TaskEventBus, publish_task_event
 from experience_store import ExperienceStore
@@ -388,7 +388,7 @@ def _preflight(deps: BrainDeps, req: DispatchReq, request: Request) -> _Prefligh
     """
     # 预算总闸：全局/当日超限直接阻断新派发（进行中任务不受影响）
     if deps.budget_store is not None:
-        allowed, reason = deps.budget_store.check()
+        allowed, reason = deps.budget_store.check(deps.cfg.budget_reservation_usd)
         if not allowed:
             record_security_event(
                 task_id=None, stage="dispatch", decision="budget_exceeded",
@@ -830,6 +830,8 @@ def create_dispatch_router(deps: BrainDeps) -> APIRouter:
                     use_experience=req.use_experience,
                     enable_subagents=req.enable_subagents,
                     worker_id=req.worker_id, provider=pf.provider)
+        except BudgetAdmissionRejected as e:
+            raise HTTPException(status_code=429, detail=str(e)) from e
         except RuntimeError as e:
             return {"status": "failed", "error": str(e)}
         _record_session_turn(deps, req, res.task_id)
@@ -858,6 +860,8 @@ def create_dispatch_router(deps: BrainDeps) -> APIRouter:
                     enable_subagents=req.enable_subagents,
                     worker_id=req.worker_id, provider=pf.provider,
                 )
+        except BudgetAdmissionRejected as e:
+            raise HTTPException(status_code=429, detail=str(e)) from e
         except RuntimeError as e:
             return {"status": "failed", "error": str(e)}
         _record_session_turn(deps, req, task_id)
@@ -1043,6 +1047,17 @@ def create_budget_router(deps: BrainDeps) -> APIRouter:
         if deps.budget_store is None:
             raise HTTPException(status_code=400, detail="budget_store 未配置")
         return deps.budget_store.snapshot()
+
+    @router.get("/budgets/reservations")
+    def budget_reservations():
+        if deps.budget_store is None:
+            raise HTTPException(status_code=400, detail="budget_store 未配置")
+        items = deps.budget_store.reservations()
+        for item in items:
+            rec = deps.task_store.get(item["task_id"])
+            item["task_status"] = rec.status if rec else "missing"
+            item["reconciliation_required"] = rec is None or rec.status not in ("pending", "running")
+        return items
 
     @router.put("/budgets")
     def put_budgets(req: _BudgetPutReq):

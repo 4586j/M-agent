@@ -59,7 +59,16 @@ class TaskReceipts:
 
     def finish(self, result) -> None:
         with self.connection() as conn:
-            conn.execute("UPDATE receipts SET status=?, result=? WHERE task_id=? AND status='running'",
+            conn.execute("BEGIN IMMEDIATE")
+            old = conn.execute("SELECT status, result FROM receipts WHERE task_id=?", (result.task_id,)).fetchone()
+            if old is None:
+                return
+            previous = json.loads(old[1]) if old[1] else {}
+            if old[0] != "running":
+                if old[0] != "cancelled" or (previous.get("meta") or {}).get("execution_finished") is not False:
+                    return
+                result.status = "cancelled"
+            conn.execute("UPDATE receipts SET status=?, result=? WHERE task_id=?",
                          (result.status, json.dumps(asdict(result), ensure_ascii=False), result.task_id))
 
     def get(self, task_id: str) -> dict | None:

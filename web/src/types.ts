@@ -94,6 +94,7 @@ export interface TaskRecord {
   verdict?: SecurityVerdict
   trace_id?: string | null  // 链路追踪 ID（brain 派发时生成，旧任务为 null）
   meta?: TaskMeta  // 执行元数据（worker 回传 / 审批详情）
+  cost_report?: { cost_usd: number; day: string } | null // 可重放的持久费用报告
   retry_count?: number  // 已重试次数（retry_manager 自愈递增）
   max_retries?: number  // 重试上限（超过即 failed 终态，进入待办中心可重派）
   last_retry_at?: string  // 最近一次重试时间（epoch 秒字符串）
@@ -386,6 +387,8 @@ export interface AuditEntry {
 
 /** 全局/每日预算快照（GET/PUT /budgets；null 上限 = 不限制） */
 export interface BudgetSnapshot {
+  reserved_usd?: number // 尚未结算的执行预占，旧服务不返回此字段
+  unsettled_count?: number
   global_limit_usd: number | null
   daily_limit_usd: number | null
   spent_total_usd: number

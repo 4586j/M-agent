@@ -54,6 +54,8 @@ class TaskRecord:
     # worker 回传的执行元数据（usage/cost_usd/num_turns/model 等），终态化时由
     # dispatcher 写入；无数据时保持空 dict，查询端点原样透出供 eval/前端消费
     meta: dict = field(default_factory=dict)
+    # Durable accounting outbox, independent of task status and worker metadata.
+    cost_report: dict | None = None
 
 
 class TaskStore:
@@ -113,6 +115,8 @@ class TaskStore:
                 raise ValueError(f"invalid status: {fields['status']}")
             for k, v in fields.items():
                 setattr(rec, k, v)
+            if rec.cost_report and "meta" in fields:
+                rec.meta = {**(rec.meta or {}), "cost_usd": rec.cost_report["cost_usd"]}
             self.write(rec)
             return rec
 
@@ -153,9 +157,26 @@ class TaskStore:
                 raise ValueError(f"invalid status: {fields['status']}")
             for k, v in fields.items():
                 setattr(rec, k, v)
+            if rec.cost_report and "meta" in fields:
+                rec.meta = {**(rec.meta or {}), "cost_usd": rec.cost_report["cost_usd"]}
             rec.updated_at = str(int(time.time()))
             self.write(rec)
             return rec
+
+    def record_cost(self, task_id: str, cost_usd, day: str) -> dict:
+        from budget_store import cost_units
+        units = cost_units(cost_usd)
+        with self._lock:
+            rec = self.get(task_id)
+            if rec is None:
+                raise KeyError(task_id)
+            if rec.cost_report and cost_units(rec.cost_report["cost_usd"]) >= units:
+                return rec.cost_report
+            report = {"cost_usd": units / 1e6,
+                      "day": rec.cost_report["day"] if rec.cost_report else day}
+            self.update(task_id, cost_report=report,
+                        meta={**(rec.meta or {}), "cost_usd": report["cost_usd"]})
+            return report
 
     def list_lost(self) -> list[TaskRecord]:
         return [r for r in self._all() if r.status == "lost"]

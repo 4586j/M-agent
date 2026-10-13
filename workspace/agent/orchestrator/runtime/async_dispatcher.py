@@ -3,11 +3,11 @@ import asyncio
 import logging
 import os
 import time
-import uuid
 from typing import Any, Awaitable, Callable
 
 from audit_log import record_verdict_event
-from dispatch_context import retry_fields
+from dispatch_context import new_dispatch_id, retry_fields
+from cost_accounting import capture_cost, release_refused
 from event_bus import TERMINAL_STATUSES, TaskEventBus, publish_task_event
 from experience_store import ExperienceStore
 from memory_store import MemoryStore
@@ -38,6 +38,8 @@ class AsyncRemoteDispatcher:
     双保险：Worker 完成后可主动 POST 回调（/tasks/{id}/callback），
     后台轮询仍在运行但会在 finalize 时检查状态避免覆盖。
     """
+
+    supports_budget_accounting = True
 
     def __init__(
         self,
@@ -132,7 +134,7 @@ class AsyncRemoteDispatcher:
         pinned = worker_id is not None
         if pinned:
             role = worker.role
-        task_id = f"task-{uuid.uuid4().hex[:8]}"
+        task_id = new_dispatch_id()
         trace_id = new_trace_id()
         ts = self._now()
         meta = {**({"model": model} if model else {}),
@@ -172,6 +174,7 @@ class AsyncRemoteDispatcher:
             log.exception("task=%s POST response unavailable; reconciling", task_id)
             resp = {"status_code": 200}
         if resp.get("status_code") != 200:
+            release_refused(self, task_id, resp.get("status_code"))
             log.warning("[trace=%s] task=%s post failed: %s", trace_id, task_id, resp)
             self._record_breaker(worker.worker_id, ok=False)
             changed = self.task_store.finalize_if(task_id, ("pending", "running"),
@@ -201,8 +204,13 @@ class AsyncRemoteDispatcher:
     def resume_polls(self) -> int:
         """恢复已持久化且节点重新注册的在途任务；只查询，绝不重新 POST。"""
         resumed = 0
+        budget = getattr(self, "budget_store", None)
+        unsettled = budget.unsettled_ids() if budget else set()
         for rec in self.task_store.list_all():
-            if rec.status not in ("pending", "running") or rec.task_id in self._tasks:
+            if rec.task_id in self._tasks:
+                continue
+            if rec.status not in ("pending", "running") and (
+                    rec.task_id not in unsettled or (rec.meta or {}).get("accounting_reconciliation_required")):
                 continue
             worker = self.registry.get_worker(rec.worker_id)
             if worker is None:
@@ -218,6 +226,8 @@ class AsyncRemoteDispatcher:
     async def handle_callback(self, task_id: str, data: dict) -> bool:
         """Worker 主动回调任务结果；已终结/裁决中/派发占位中的任务一律拒绝，返回是否确实处理了。"""
         rec = self.task_store.get(task_id)
+        if rec is not None and rec.status in _NON_FINALIZABLE and data.get("status") in ("done", "failed", "cancelled"):
+            await asyncio.to_thread(capture_cost, self, task_id, data.get("meta"))
         if rec is None or rec.status in _NON_FINALIZABLE:
             # 迟到/矛盾回调：不改写状态、不广播事件，记日志供排查
             if rec is not None:
@@ -240,6 +250,11 @@ class AsyncRemoteDispatcher:
         async with self._semaphore:
             await self._poll_worker(task_id, base, worker_id, role, prompt, ts)
 
+    def _needs_cost(self, task_id: str) -> bool:
+        budget = getattr(self, "budget_store", None)
+        entry = budget.attempt(task_id) if budget else None
+        return entry is not None and entry["state"] == "reserved"
+
     async def _poll_worker(self, task_id: str, base: str, worker_id: str,
                            role: str, prompt: str, ts: str) -> None:
         """后台轮询 worker 任务状态，done/failed 时写入结果。"""
@@ -247,9 +262,9 @@ class AsyncRemoteDispatcher:
         for i in range(self.poll_max):
             await asyncio.sleep(self.poll_interval)
             rec = self.task_store.get(task_id)
-            if rec is None or rec.status in _NON_FINALIZABLE:
+            if rec is None or (rec.status in _NON_FINALIZABLE and not self._needs_cost(task_id)):
                 return
-            if i % 10 == 0:
+            if i % 10 == 0 and rec.status in ("pending", "running"):
                 # 轮询进展心跳（每 10 轮约 10s 一次，避免刷屏）；无订阅者时零开销
                 publish_task_event(self.event_bus, task_id, event="status",
                                    state="running", trace_id=rec.trace_id,
@@ -264,10 +279,17 @@ class AsyncRemoteDispatcher:
             st = data.get("status")
             if st in ("done", "failed", "cancelled"):
                 await self._finalize(task_id, worker_id, role, prompt, ts, data)
+                if self._needs_cost(task_id) and (data.get("meta") or {}).get("execution_finished") is False:
+                    continue  # A cancellation acknowledgment is not an execution receipt.
+                if self._needs_cost(task_id):
+                    current = self.task_store.get(task_id)
+                    self.task_store.update(task_id, meta={**current.meta, "accounting_reconciliation_required": True})
                 return
         log.warning("[trace=%s] task=%s async poll timeout",
                     rec.trace_id if rec else None, task_id)
         if rec is None or rec.status in _NON_FINALIZABLE:
+            if rec is not None and self._needs_cost(task_id):
+                self.task_store.update(task_id, meta={**rec.meta, "accounting_reconciliation_required": True})
             return  # 已被其他路径终态化/裁决中：不覆盖为 failed
         changed = self.task_store.finalize_if(task_id, ("pending", "running"),
             status="failed", error="async poll timeout",
@@ -283,6 +305,9 @@ class AsyncRemoteDispatcher:
         幂等：终态/awaiting_approval/dispatching 状态一律拒绝改写。
         """
         rec = self.task_store.get(task_id)
+        managed_cost = False
+        if rec is not None and data.get("status") in ("done", "failed", "cancelled"):
+            managed_cost = await asyncio.to_thread(capture_cost, self, task_id, data.get("meta"))
         if rec is None or rec.status in _NON_FINALIZABLE:
             if rec is not None:
                 log.warning(
@@ -314,7 +339,8 @@ class AsyncRemoteDispatcher:
         )
         if committed is None:
             return False
-        self._report_spend(meta)
+        if not managed_cost:
+            self._report_spend(meta)
         self._record_breaker(worker_id, ok=(st == "done"))
         log.info("[trace=%s] task=%s terminal status=%s", rec.trace_id, task_id, st)
         publish_task_event(self.event_bus, task_id, event="done", state=st,

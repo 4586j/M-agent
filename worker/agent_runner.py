@@ -71,9 +71,9 @@ class FakeAgentRunner(AgentRunner):
 
     def run(self, req: TaskRequest) -> TaskResult:
         if "FORCE_ERROR" in req.prompt:
-            return TaskResult(req.task_id, "failed", error="forced error for test")
+            return TaskResult(req.task_id, "failed", error="forced error for test", meta={"cost_usd": 0})
         out = f"fake 执行完成：{req.prompt}"
-        return TaskResult(req.task_id, "done", output=out, artifacts=[], error=None)
+        return TaskResult(req.task_id, "done", output=out, artifacts=[], error=None, meta={"cost_usd": 0})
 
 
 def build_worker_kernel(cfg, mcp_servers: dict | None = None) -> Any:

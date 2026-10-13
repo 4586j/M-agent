@@ -65,6 +65,7 @@ class Config:
     budgets_file: str = str(_default_runtime_dir() / "budgets.json")
     budget_global_usd: float = 0.0
     budget_daily_usd: float = 0.0
+    budget_reservation_usd: float = 0.05  # 每次执行的预估预占额，不是模型硬限额
     # 持久会话（派发链路连续对话；每会话一个 JSON 文件）
     sessions_dir: str = str(_default_runtime_dir() / ".sessions")
     # 文档知识库（人工上传的参考资料层；派发自动检索注入，空库零影响）
@@ -121,6 +122,7 @@ def load_config() -> Config:
             str(_default_runtime_dir() / "budgets.json")),
         budget_global_usd=float(os.environ.get("ORCH_BUDGET_GLOBAL_USD", "0") or 0),
         budget_daily_usd=float(os.environ.get("ORCH_BUDGET_DAILY_USD", "0") or 0),
+        budget_reservation_usd=float(os.environ.get("ORCH_BUDGET_RESERVATION_USD", "0.05")),
         sessions_dir=os.environ.get(
             "ORCH_SESSIONS_DIR",
             str(_default_runtime_dir() / ".sessions")),

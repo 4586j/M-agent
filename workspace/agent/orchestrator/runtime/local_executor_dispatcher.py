@@ -13,7 +13,6 @@ import logging
 import sys
 import threading
 import time
-import uuid
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, Callable
@@ -37,6 +36,8 @@ from event_bus import TaskEventBus, publish_task_event  # noqa: E402
 from experience_store import ExperienceStore  # noqa: E402
 from memory_store import MemoryStore  # noqa: E402
 from task_store import TaskRecord, TaskStore, new_trace_id  # noqa: E402
+from dispatch_context import new_dispatch_id
+from cost_accounting import capture_cost
 
 log = logging.getLogger(__name__)
 
@@ -69,6 +70,8 @@ class LocalExecutorDispatcher(Dispatcher):
     - product_check: 可选，Callable[[str], dict]，对产物做 security-guard 裁决
     - persona_dir: 可选，人设定义目录（缺省用 config.persona_dir）
     """
+
+    supports_budget_accounting = True
 
     def __init__(self, task_store: TaskStore, config: AgentConfig | None = None,
                  experience_store: ExperienceStore | None = None,
@@ -261,7 +264,7 @@ class LocalExecutorDispatcher(Dispatcher):
             raise RuntimeError(
                 f"本地执行不支持定点节点 {worker_id}（进程内直跑，没有独立 worker）。"
                 "单机本地执行请省略 worker_id，或在 ORCH_MODE=remote 下注册 worker 后按节点派发。")
-        task_id = f"task-{uuid.uuid4().hex[:8]}"
+        task_id = new_dispatch_id()
         trace_id = new_trace_id()
         ts = self._now()
 
@@ -333,6 +336,7 @@ class LocalExecutorDispatcher(Dispatcher):
         output = result.output
         artifacts = list(result.artifacts or [])
         error = output if result.is_error else None
+        managed_cost = capture_cost(self, task_id, _kernel_meta(result))
 
         verdict = None
         if status == "done" and self.product_check:
@@ -346,7 +350,7 @@ class LocalExecutorDispatcher(Dispatcher):
         put_provider_name(meta, provider)
         meta.update(_kernel_meta(result))
         # 预算记账：内核真实花费（含被取消任务的已消耗部分）上报账本
-        if self.on_spend is not None:
+        if self.on_spend is not None and not managed_cost:
             cost = meta.get("cost_usd")
             if isinstance(cost, (int, float)) and not isinstance(cost, bool) \
                     and cost > 0:

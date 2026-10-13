@@ -123,3 +123,35 @@ def test_heartbeat_registers_again_after_brain_restart(tmp_path):
     stop.set()
     assert not thread.is_alive()
     assert len(registrations) == 2
+
+
+def test_cancelled_execution_cost_survives_restart_and_is_sent_in_callback(tmp_path, monkeypatch):
+    started, release, callback = threading.Event(), threading.Event(), threading.Event()
+    payloads = []
+    class Runner:
+        def run(self, req):
+            started.set()
+            assert release.wait(3)
+            return TaskResult(req.task_id, "done", meta={"cost_usd": 0.04})
+    def send(url, result, **kwargs):
+        payloads.append(result)
+        callback.set()
+    monkeypatch.setattr("worker_api._send_callback", send)
+    client = client_for(tmp_path, Runner())
+    client.post("/task", json={"task_id": "task-cancel-cost", "prompt": "fixture",
+                               "callback_url": "http://brain/tasks/task-cancel-cost/callback"})
+    try:
+        assert started.wait(2)
+        client.post("/task/task-cancel-cost/cancel")
+        ack = client.get("/task/task-cancel-cost").json()
+        assert ack["meta"]["execution_finished"] is False
+    finally:
+        release.set()
+    assert callback.wait(2)
+    assert payloads[0].status == "cancelled"
+    assert payloads[0].meta["cost_usd"] == 0.04
+    restarted = client_for(tmp_path, Runner())
+    saved = restarted.get("/task/task-cancel-cost").json()
+    assert saved["status"] == "cancelled"
+    assert saved["meta"]["execution_finished"] is True
+    assert saved["meta"]["cost_usd"] == 0.04

@@ -61,6 +61,7 @@ from brain_routers import (
     create_tasks_router,
 )
 from budget_store import BudgetStore
+from cost_accounting import replay_costs
 from config import Config
 from dispatch_context import AdmittedDispatcher
 from dispatcher import Dispatcher, RemoteDispatcher
@@ -178,14 +179,15 @@ def create_brain_app(registry: WorkerRegistry, task_store: TaskStore, cfg: Confi
     """
     @asynccontextmanager
     async def lifespan(app):
-        recovery = None
-        if async_dispatcher is not None and hasattr(async_dispatcher, "resume_polls"):
-            recovery = asyncio.create_task(reconcile_remote())
+        await asyncio.to_thread(replay_costs, task_store, budget_store)
+        recovery = asyncio.create_task(reconcile_remote())
         try:
             yield
         finally:
             if recovery is not None:
-                pending = [recovery, *async_dispatcher._tasks.values()]
+                pending = [recovery]
+                if async_dispatcher is not None and hasattr(async_dispatcher, "_tasks"):
+                    pending.extend(async_dispatcher._tasks.values())
                 for task in pending:
                     task.cancel()
                 await asyncio.gather(*pending, return_exceptions=True)
@@ -247,22 +249,26 @@ def create_brain_app(registry: WorkerRegistry, task_store: TaskStore, cfg: Confi
         return brain_routers.security_check(prompt, use_llm=cfg.security_llm)
 
     if dispatcher is not None:
-        dispatcher = AdmittedDispatcher(dispatcher, budget_store, admit_security, task_store)
+        dispatcher = AdmittedDispatcher(dispatcher, budget_store, admit_security, task_store,
+                                        reservation_usd=cfg.budget_reservation_usd)
         if retry_manager is not None:
             retry_manager.dispatcher = dispatcher
         if task_scheduler is not None:
             task_scheduler.dispatcher = dispatcher
     if async_dispatcher is not None:
         async_dispatcher = AdmittedDispatcher(
-            async_dispatcher, budget_store, admit_security, task_store)
+            async_dispatcher, budget_store, admit_security, task_store,
+            reservation_usd=cfg.budget_reservation_usd)
 
-        async def reconcile_remote():
-            while True:
-                try:
+    async def reconcile_remote():
+        while True:
+            try:
+                await asyncio.to_thread(replay_costs, task_store, budget_store)
+                if async_dispatcher is not None and hasattr(async_dispatcher, "resume_polls"):
                     async_dispatcher.resume_polls()
-                except Exception:
-                    log.exception("Remote task reconciliation failed")
-                await asyncio.sleep(max(1.0, cfg.async_poll_interval))
+            except Exception:
+                log.exception("Task/cost reconciliation failed")
+            await asyncio.sleep(max(1.0, cfg.async_poll_interval))
 
     deps = BrainDeps(
         cfg=cfg, registry=registry, task_store=task_store, bus=bus,

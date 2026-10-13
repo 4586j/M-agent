@@ -7,7 +7,8 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from audit_log import record_verdict_event
-from dispatch_context import retry_fields
+from dispatch_context import new_dispatch_id, retry_fields
+from cost_accounting import capture_cost, release_refused
 from event_bus import TaskEventBus, publish_task_event
 from experience_store import ExperienceStore
 from memory_store import MemoryStore
@@ -125,6 +126,8 @@ class LocalDispatcher(Dispatcher):
 class RemoteDispatcher(Dispatcher):
     """HTTP 派发到 worker：选 worker、写 pending、POST /task、轮询 GET /task/{id}。"""
 
+    supports_budget_accounting = True
+
     def __init__(self, task_store: TaskStore, registry: WorkerRegistry,
                  http_call: Callable[..., dict], now_fn: Callable[[], str] | None = None,
                  select_strategy: str = "round_robin",
@@ -223,7 +226,7 @@ class RemoteDispatcher(Dispatcher):
         pinned = worker_id is not None
         if pinned:
             role = worker.role
-        task_id = f"task-{uuid.uuid4().hex[:8]}"
+        task_id = new_dispatch_id()
         trace_id = new_trace_id()
         ts = self._now()
         meta = {"model": model} if model else {}
@@ -255,6 +258,7 @@ class RemoteDispatcher(Dispatcher):
         body.update(provider_body(provider))
         resp = self.http_call("POST", f"{base}/task", json=body)
         if resp.get("status_code") != 200:
+            release_refused(self, task_id, resp.get("status_code"))
             log.warning("[trace=%s] task=%s post failed: %s", trace_id, task_id, resp)
             self._record_breaker(worker.worker_id, ok=False)
             changed = self.task_store.finalize_if(task_id, ("pending", "running"),
@@ -279,6 +283,7 @@ class RemoteDispatcher(Dispatcher):
             data = r.get("json", {})
             st = data.get("status")
             if st in ("done", "failed", "cancelled"):
+                managed_cost = capture_cost(self, task_id, data.get("meta"))
                 out = data.get("output")
                 arts = data.get("artifacts", [])
                 verdict = None
@@ -302,7 +307,8 @@ class RemoteDispatcher(Dispatcher):
                 )
                 if changed is None:
                     return self._stored_result(task_id)
-                self._report_spend(meta)
+                if not managed_cost:
+                    self._report_spend(meta)
                 # 节点健康记账：failed 计入连击（含任务级失败——保守口径），
                 # done 重置；重试链路的最终成败经此自然反馈给熔断器
                 self._record_breaker(worker.worker_id, ok=(st == "done"))
