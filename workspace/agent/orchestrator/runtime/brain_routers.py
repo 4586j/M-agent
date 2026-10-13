@@ -13,29 +13,30 @@ from dataclasses import asdict, dataclass
 from datetime import datetime
 from typing import Any, Callable
 
+from async_dispatcher import AsyncRemoteDispatcher
+from audit_log import record_security_event
+from budget_store import BudgetStore
+from config import Config
+from dispatch_context import approved_dispatch
+from dispatcher import Dispatcher
+from event_bus import TERMINAL_STATUSES, TaskEvent, TaskEventBus, publish_task_event
+from experience_store import ExperienceStore
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
-
-from task_store import TaskStore, TaskRecord, new_trace_id
-from worker_registry import WorkerRegistry, WorkerInfo
-from dispatcher import Dispatcher
-from async_dispatcher import AsyncRemoteDispatcher
-from config import Config
-from security_guard import check_with_llm as security_check
-from experience_store import ExperienceStore
 from memory_store import MemoryStore
 from procedural_store import ProceduralStore
-from retry_manager import RetryManager
 from providers import ProviderStore
-from schedule_store import ScheduleStore, ScheduleRecord, compute_next_run
-from task_scheduler import TaskScheduler
-from safe_id import validate_id, validate_host
-from dispatch_common import (USAGE_KEYS, clamp_context, assemble_context)
-from audit_log import record_security_event
-from event_bus import TaskEvent, TaskEventBus, TERMINAL_STATUSES, publish_task_event
-from budget_store import BudgetStore
+from pydantic import BaseModel
+from retry_manager import RetryManager
+from safe_id import validate_host, validate_id
+from schedule_store import ScheduleRecord, ScheduleStore, compute_next_run
+from security_guard import check_with_llm as security_check
 from session_store import SessionStore
+from task_scheduler import TaskScheduler
+from worker_registry import WorkerInfo, WorkerRegistry
+
+from dispatch_common import USAGE_KEYS, assemble_context, clamp_context
+from task_store import TaskRecord, TaskStore, new_trace_id
 
 log = logging.getLogger(__name__)
 
@@ -465,8 +466,8 @@ def create_auth_router(deps: BrainDeps) -> APIRouter:
 
     @router.post("/heartbeat")
     def heartbeat(req: HeartbeatReq):
-        deps.registry.heartbeat(req.worker_id, req.load)
-        return {"status": "ok"}
+        known = deps.registry.heartbeat(req.worker_id, req.load)
+        return {"status": "ok" if known else "registration_required"}
 
     @router.get("/workers")
     def list_workers():
@@ -566,7 +567,9 @@ def create_tasks_router(deps: BrainDeps) -> APIRouter:
                 deps.dispatcher.cancel(task_id)
             except Exception:  # noqa: BLE001 - 取消信号失败不阻断状态置终
                 pass
-        rec = deps.task_store.update(task_id, status="cancelled")
+        rec = deps.task_store.finalize_if(task_id, ("pending", "running"), status="cancelled")
+        if rec is None:
+            raise HTTPException(status_code=409, detail="任务已完成或已被其他请求处理")
         # cancelled 属终态：发布 done 事件让 SSE 订阅流关闭
         publish_task_event(deps.bus, task_id, event="done", state="cancelled",
                            trace_id=rec.trace_id, summary="cancelled by request")
@@ -610,6 +613,8 @@ def create_tasks_router(deps: BrainDeps) -> APIRouter:
             validate_id(req.worker_id, "worker_id")
         # 待审批/派发占位中的任务不可重派：需先走 approve/reject 人工裁决流程
         rec0 = deps.task_store.get(task_id)
+        if rec0 is None:
+            raise HTTPException(status_code=404, detail="task not found")
         if rec0 is not None and rec0.status == "awaiting_approval":
             raise HTTPException(status_code=400,
                                 detail="待审批任务不可重派，请先走 approve/reject 流程")
@@ -736,9 +741,10 @@ def create_approval_router(deps: BrainDeps) -> APIRouter:
         # 老任务该键缺失 → None → 自动选节点（向后兼容）
         worker_id = approval.get("worker_id")
         try:
-            res = deps.dispatcher.dispatch(role=rec.role, prompt=prompt,
-                                           context_memory=context or None, model=model,
-                                           worker_id=worker_id, provider=provider)
+            with approved_dispatch(prompt):
+                res = deps.dispatcher.dispatch(role=rec.role, prompt=prompt,
+                                               context_memory=context or None, model=model,
+                                               worker_id=worker_id, provider=provider)
         except Exception as e:  # noqa: BLE001 - 派发失败回滚占位，任务回到待审批
             deps.task_store.transition(task_id, "dispatching", "awaiting_approval")
             publish_task_event(deps.bus, task_id, event="status", state="awaiting_approval",
@@ -817,12 +823,13 @@ def create_dispatch_router(deps: BrainDeps) -> APIRouter:
         if pf.approval is not None:
             return pf.approval
         try:
-            res = deps.dispatcher.dispatch(
-                role=req.role, prompt=req.prompt,
-                context_memory=pf.context or None, model=pf.model,
-                use_experience=req.use_experience,
-                enable_subagents=req.enable_subagents,
-                worker_id=req.worker_id, provider=pf.provider)
+            with approved_dispatch(req.prompt):
+                res = deps.dispatcher.dispatch(
+                    role=req.role, prompt=req.prompt,
+                    context_memory=pf.context or None, model=pf.model,
+                    use_experience=req.use_experience,
+                    enable_subagents=req.enable_subagents,
+                    worker_id=req.worker_id, provider=pf.provider)
         except RuntimeError as e:
             return {"status": "failed", "error": str(e)}
         _record_session_turn(deps, req, res.task_id)
@@ -843,13 +850,14 @@ def create_dispatch_router(deps: BrainDeps) -> APIRouter:
         if pf.approval is not None:
             return pf.approval
         try:
-            task_id = await deps.async_dispatcher.dispatch_async(
-                role=req.role, prompt=req.prompt,
-                context_memory=pf.context or None, model=pf.model,
-                use_experience=req.use_experience,
-                enable_subagents=req.enable_subagents,
-                worker_id=req.worker_id, provider=pf.provider,
-            )
+            with approved_dispatch(req.prompt):
+                task_id = await deps.async_dispatcher.dispatch_async(
+                    role=req.role, prompt=req.prompt,
+                    context_memory=pf.context or None, model=pf.model,
+                    use_experience=req.use_experience,
+                    enable_subagents=req.enable_subagents,
+                    worker_id=req.worker_id, provider=pf.provider,
+                )
         except RuntimeError as e:
             return {"status": "failed", "error": str(e)}
         _record_session_turn(deps, req, task_id)

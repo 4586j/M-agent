@@ -957,7 +957,10 @@ def test_approve_concurrent_only_dispatches_once(tmp_path, monkeypatch):
     entered = threading.Barrier(2)  # 强制两个请求都进入 CAS 段，消除调度不确定性
 
     def racing_transition(self, tid, from_status, to_status):
-        entered.wait()
+        # Synchronize only the two approval claims. Execution also uses CAS now;
+        # waiting there would require a second dispatch and deadlock this test.
+        if tid == task_id and from_status == "awaiting_approval":
+            entered.wait(timeout=5)
         return real_transition(self, tid, from_status, to_status)
 
     monkeypatch.setattr(_TS, "transition", racing_transition)

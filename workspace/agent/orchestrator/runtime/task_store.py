@@ -5,9 +5,13 @@
 迁移，供审批流占位防并发双重派发（TOCTOU）。
 """
 import json
+import logging
+import os
+import tempfile
 import threading
 import time
 import uuid
+from copy import deepcopy
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -74,20 +78,30 @@ class TaskStore:
         if record.status not in VALID_STATUSES:
             raise ValueError(f"invalid status: {record.status}")
         with self._lock:
-            with open(self._path(record.task_id), "w", encoding="utf-8") as f:
-                json.dump(asdict(record), f, ensure_ascii=False, indent=2)
+            destination = self._path(record.task_id)
+            fd, temporary = tempfile.mkstemp(dir=self.store_dir, suffix=".tmp")
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    json.dump(asdict(record), f, ensure_ascii=False, indent=2)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(temporary, destination)
+            finally:
+                if os.path.exists(temporary):
+                    os.unlink(temporary)
             # 只更新受影响条目的缓存（若已装填），不整表失效
             if self._cache is not None:
-                self._cache[record.task_id] = record
+                self._cache[record.task_id] = deepcopy(record)
 
     def get(self, task_id: str) -> TaskRecord | None:
-        if self._cache is not None:
-            return self._cache.get(task_id)  # 热路径 O(1)
-        p = self._path(task_id)
-        if not p.exists():
-            return None
-        with open(p, encoding="utf-8") as f:
-            return TaskRecord(**json.load(f))
+        with self._lock:
+            p = self._path(task_id)
+            if self._cache is not None:
+                return deepcopy(self._cache.get(task_id))
+            if not p.exists():
+                return None
+            with open(p, encoding="utf-8") as f:
+                return TaskRecord(**json.load(f))
 
     def update(self, task_id: str, **fields) -> TaskRecord:
         """读改写全流程持锁：并发 update 不同字段不互相覆盖。"""
@@ -160,17 +174,55 @@ class TaskStore:
         return [r for r in self._all()
                 if r.status in ("lost", "failed")
                 and r.max_retries > 0
-                and r.retry_count < r.max_retries]
+                and r.retry_count < r.max_retries
+                and not any((r.meta or {}).get(k) for k in (
+                    "retry_parent_id", "retry_in_flight", "retry_succeeded",
+                    "reconciliation_required"))]
+
+    def claim_retry(self, task_id: str, timestamp: str) -> TaskRecord | None:
+        """Reserve a root task's retry before executing. Interrupted claims require review."""
+        with self._lock:
+            rec = self.get(task_id)
+            if rec is None or task_id not in {r.task_id for r in self.list_retryable()}:
+                return None
+            return self.update(task_id, retry_count=rec.retry_count + 1,
+                last_retry_at=timestamp, updated_at=timestamp,
+                meta={**(rec.meta or {}), "retry_in_flight": True})
+
+    def release_retry(self, task_id: str) -> None:
+        """Restore a reserved attempt only when admission definitively refused it."""
+        with self._lock:
+            rec = self.get(task_id)
+            if rec is not None and (rec.meta or {}).get("retry_in_flight"):
+                self.update(task_id, retry_count=max(0, rec.retry_count - 1),
+                    meta={**rec.meta, "retry_in_flight": False})
+
+    def finish_retry(self, task_id: str, child_id: str | None, status: str) -> None:
+        with self._lock:
+            rec = self.get(task_id)
+            meta = dict(rec.meta or {})
+            meta.update(retry_in_flight=False, retry_succeeded=status == "done")
+            if child_id:
+                meta["last_retry_task_id"] = child_id
+                child = self.get(child_id)
+                if child and (child.meta or {}).get("reconciliation_required"):
+                    meta["reconciliation_required"] = True
+            if status not in ("done", "failed", "cancelled"):
+                meta["reconciliation_required"] = True
+            self.update(task_id, meta=meta)
 
     def _all(self) -> list[TaskRecord]:
         with self._lock:
             if self._cache is None:
                 loaded: dict[str, TaskRecord] = {}
                 for p in sorted(self.store_dir.glob("*.json")):
-                    with open(p, encoding="utf-8") as f:
-                        rec = TaskRecord(**json.load(f))
-                        loaded[rec.task_id] = rec
+                    try:
+                        with open(p, encoding="utf-8") as f:
+                            rec = TaskRecord(**json.load(f))
+                            loaded[rec.task_id] = rec
+                    except (ValueError, TypeError, OSError):
+                        logging.getLogger(__name__).error("Unreadable task record: %s", p.name)
                 self._cache = loaded
             # 按 task_id 排序返回，保持与 disk 文件名序一致的确定性输出（调用方
             # 多会再按 updated_at 倒序，此处保证列表视图稳定不变）
-            return sorted(self._cache.values(), key=lambda r: r.task_id)
+            return deepcopy(sorted(self._cache.values(), key=lambda r: r.task_id))

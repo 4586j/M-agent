@@ -10,74 +10,76 @@ DispatchReq` 兼容旧引用）。
 GET /stats 附带 cost 成本聚合（按日近 7 天 / 按 role / 按 model，源自 TaskRecord.meta）
 与 quality 输出质量聚合（按 model 统计退化任务数与比率）。
 """
+import asyncio
 import logging
 import os
 import sys
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 import httpx
 import requests
-
 from fastapi import FastAPI
-from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 
 log = logging.getLogger(__name__)
 
-from task_store import TaskStore
-from worker_registry import WorkerRegistry
-from dispatcher import Dispatcher, RemoteDispatcher
 from async_dispatcher import AsyncRemoteDispatcher
-from config import Config
-from security_guard import check_with_llm as security_check
-from experience_store import ExperienceStore
-from memory_store import FileMemoryStore, MemoryStore
-from procedural_store import ProceduralStore
-from retry_manager import RetryManager
-from providers import ProviderStore
-from embedding_model import create_embedding_model
-from schedule_store import ScheduleStore
-from task_scheduler import TaskScheduler
 from auth import add_auth_middleware
-from event_bus import TaskEventBus
-from budget_store import BudgetStore
-from session_store import SessionStore
-from webhook import WebhookNotifier, DEFAULT_WEBHOOK_EVENTS
-from knowledge_store import KnowledgeStore
-
 from brain_routers import (
-    BrainDeps,
-    RegisterReq,
-    HeartbeatReq,
-    NodeWorkspaceProxyReq,
-    DispatchReq,
     AdvisorReq,
-    TranslateReq,
+    ApproveReq,
+    BrainDeps,
+    DispatchReq,
+    ExperienceSearchReq,
+    HeartbeatReq,
     MemoryWriteReq,
+    NodeWorkspaceProxyReq,
     ProceduralProposalReq,
     ProceduralVoteReq,
     RedispatchReq,
-    ApproveReq,
+    RegisterReq,
     RejectReq,
-    ExperienceSearchReq,
     ScheduleReq,
-    create_auth_router,
-    create_providers_router,
-    create_tasks_router,
+    TranslateReq,
     create_approval_router,
+    create_auth_router,
+    create_budget_router,
     create_dispatch_router,
-    create_secretary_router,
-    create_sse_router,
-    create_stats_router,
+    create_experiences_router,
+    create_knowledge_router,
     create_memory_router,
     create_procedural_router,
-    create_experiences_router,
-    create_schedules_router,
+    create_providers_router,
     create_proxy_router,
-    create_budget_router,
+    create_schedules_router,
+    create_secretary_router,
     create_sessions_router,
-    create_knowledge_router,
+    create_sse_router,
+    create_stats_router,
+    create_tasks_router,
 )
+from budget_store import BudgetStore
+from config import Config
+from dispatch_context import AdmittedDispatcher
+from dispatcher import Dispatcher, RemoteDispatcher
+from embedding_model import create_embedding_model
+from event_bus import TaskEventBus
+from experience_store import ExperienceStore
+from knowledge_store import KnowledgeStore
+from memory_store import FileMemoryStore, MemoryStore
+from procedural_store import ProceduralStore
+from providers import ProviderStore
+from retry_manager import RetryManager
+from schedule_store import ScheduleStore
+from security_guard import check_with_llm as security_check
+from session_store import SessionStore
+from task_scheduler import TaskScheduler
+from webhook import DEFAULT_WEBHOOK_EVENTS, WebhookNotifier
+from worker_registry import WorkerRegistry
+
+from task_store import TaskStore
 
 
 def _default_web_dist() -> str:
@@ -174,7 +176,21 @@ def create_brain_app(registry: WorkerRegistry, task_store: TaskStore, cfg: Confi
     event_bus 可选：SSE 实时流的事件总线；未传入时自建。advisor 可选：
     AdvisorService（独立上下文推荐/解释）；translator 可选：TranslatorService。
     """
-    app = FastAPI()
+    @asynccontextmanager
+    async def lifespan(app):
+        recovery = None
+        if async_dispatcher is not None and hasattr(async_dispatcher, "resume_polls"):
+            recovery = asyncio.create_task(reconcile_remote())
+        try:
+            yield
+        finally:
+            if recovery is not None:
+                pending = [recovery, *async_dispatcher._tasks.values()]
+                for task in pending:
+                    task.cancel()
+                await asyncio.gather(*pending, return_exceptions=True)
+
+    app = FastAPI(lifespan=lifespan)
     # 全链路共享事件总线：dispatcher/async_dispatcher/retry/brain 同一实例；
     # 配置 webhook 时总线事件经旁路回调外发（只转发终态 done 事件）
     if event_bus is None:
@@ -223,6 +239,30 @@ def create_brain_app(registry: WorkerRegistry, task_store: TaskStore, cfg: Confi
     # 文档知识库：与经验库共享同一 embedding 模型实例（brain 启动时已创建）
     if knowledge_store is None:
         knowledge_store = KnowledgeStore(cfg.knowledge_dir, embedding_model=None)
+
+    # Every execution source gets the same application-layer admission boundary.
+    # The HTTP preflight can exempt an explicitly approved prompt, never the budget.
+    def admit_security(prompt):
+        import brain_routers
+        return brain_routers.security_check(prompt, use_llm=cfg.security_llm)
+
+    if dispatcher is not None:
+        dispatcher = AdmittedDispatcher(dispatcher, budget_store, admit_security, task_store)
+        if retry_manager is not None:
+            retry_manager.dispatcher = dispatcher
+        if task_scheduler is not None:
+            task_scheduler.dispatcher = dispatcher
+    if async_dispatcher is not None:
+        async_dispatcher = AdmittedDispatcher(
+            async_dispatcher, budget_store, admit_security, task_store)
+
+        async def reconcile_remote():
+            while True:
+                try:
+                    async_dispatcher.resume_polls()
+                except Exception:
+                    log.exception("Remote task reconciliation failed")
+                await asyncio.sleep(max(1.0, cfg.async_poll_interval))
 
     deps = BrainDeps(
         cfg=cfg, registry=registry, task_store=task_store, bus=bus,
@@ -420,10 +460,8 @@ def _build_app() -> FastAPI:
             event_bus=bus,
             provider_resolver=provider_resolver,
         )
-        retry_mgr.start()
         scheduler = TaskScheduler(schedule_store=sched_store, dispatcher=dispatcher,
                                   provider_resolver=provider_resolver)
-        scheduler.start()
     elif cfg.mode == "local" and os.environ.get("ORCH_LOCAL_EXEC", "0") in ("1", "true", "True"):
         # 单机本地执行：brain 进程内直接运行 AgentKernel（默认不启用，行为不变）
         from local_executor_dispatcher import LocalExecutorDispatcher
@@ -464,7 +502,7 @@ def _build_app() -> FastAPI:
         translator = TranslatorService(_build_local_core_config(cfg))
     except Exception:  # noqa: BLE001 - 翻译不可用时 brain 仍正常启动
         translator = None
-    return create_brain_app(registry, store, cfg, dispatcher=dispatcher,
+    app = create_brain_app(registry, store, cfg, dispatcher=dispatcher,
                             experience_store=exp_store, memory_store=mem_store,
                             procedural_store=proc_store,
                             retry_manager=retry_mgr,
@@ -476,6 +514,12 @@ def _build_app() -> FastAPI:
                             webhook=webhook,
                             knowledge_store=KnowledgeStore(
                                 cfg.knowledge_dir, embedding_model=emb_model))
+    # Start background dispatch only after create_brain_app installs admission.
+    if retry_mgr is not None:
+        retry_mgr.start()
+    if scheduler is not None:
+        scheduler.start()
+    return app
 
 
 if __name__ == "__main__":

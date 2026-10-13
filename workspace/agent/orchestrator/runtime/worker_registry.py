@@ -41,13 +41,14 @@ class WorkerRegistry:
                 self._rr.pop(w.role, None)
             return w is not None
 
-    def heartbeat(self, worker_id: str, load: int = 0) -> None:
+    def heartbeat(self, worker_id: str, load: int = 0) -> bool:
         with self._lock:
             w = self._workers.get(worker_id)
             if w is None:
-                return
+                return False
             w.last_heartbeat = self._now()
             w.load = load
+            return True
 
     def _alive(self) -> list[WorkerInfo]:
         now = self._now()

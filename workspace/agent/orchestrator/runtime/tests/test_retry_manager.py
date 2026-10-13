@@ -182,7 +182,7 @@ def test_check_worker_healing_redispatches_lost_tasks(tmp_path):
     store = TaskStore(str(tmp_path))
     reg = WorkerRegistry(heartbeat_timeout=45, now_fn=lambda: 0.0)
     reg.register(make_info("worker-A"))
-    store.write(make_record("task-1", status="lost", worker_id="worker-A"))
+    store.write(make_record("task-1", status="lost", worker_id="worker-A", max_retries=1))
     store.write(make_record("task-2", status="done", worker_id="worker-A"))
 
     fake_disp = FakeDispatcher()
@@ -194,7 +194,8 @@ def test_check_worker_healing_redispatches_lost_tasks(tmp_path):
     # role 一致时新派发定点回刚恢复的节点（与 old 记录 worker_id 改写一致）
     assert fake_disp.calls[0]["worker_id"] == "worker-A"
     rec = store.get("task-1")
-    assert rec.status == "running"
+    assert rec.status == "lost"  # 原记录留证，新任务结果由显式关联表达。
+    assert rec.meta["retry_succeeded"] is True
     assert rec.retry_count == 1
 
 

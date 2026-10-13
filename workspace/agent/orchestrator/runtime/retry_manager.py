@@ -4,6 +4,7 @@ import threading
 import time
 from typing import Callable
 
+from dispatch_context import AdmissionRejected, retry_dispatch
 from dispatcher import Dispatcher
 from event_bus import TaskEventBus, publish_task_event
 from worker_registry import WorkerRegistry
@@ -94,11 +95,14 @@ class RetryManager:
         for rec in self.task_store.list_all():
             if rec.status != "running" or rec.worker_id not in dead_ids:
                 continue
-            self.task_store.update(
-                rec.task_id, status="lost",
+            changed = self.task_store.finalize_if(
+                rec.task_id, ("running",), status="lost",
                 error=f"worker {rec.worker_id} heartbeat timeout",
                 updated_at=self._ts(),
+                meta={**(rec.meta or {}), "reconciliation_required": True},
             )
+            if changed is None:
+                continue
             log.info("[trace=%s] task=%s marked lost (worker=%s heartbeat timeout)",
                      rec.trace_id, rec.task_id, rec.worker_id)
             # lost 属终态：发布 done 事件让 SSE 订阅流关闭
@@ -128,23 +132,26 @@ class RetryManager:
         for rec in self.task_store.list_retryable():
             if not self._backoff_elapsed(rec, now):
                 continue
+            claimed = self.task_store.claim_retry(rec.task_id, self._ts())
+            if claimed is None:
+                continue
             try:
-                res = self.dispatcher.dispatch(
-                    role=rec.role, prompt=rec.prompt,
-                    context_memory=self._retry_context(rec),
-                    **self._resume_overrides(rec),
-                )
-                self.task_store.update(
-                    rec.task_id,
-                    retry_count=rec.retry_count + 1,
-                    last_retry_at=self._ts(),
-                    updated_at=self._ts(),
-                )
+                with retry_dispatch(rec.task_id):
+                    res = self.dispatcher.dispatch(
+                        role=rec.role, prompt=rec.prompt,
+                        context_memory=self._retry_context(rec),
+                        **self._resume_overrides(rec),
+                    )
+                self.task_store.finish_retry(rec.task_id, res.task_id, res.status)
                 log.info("[trace=%s] retry task=%s -> new task=%s (trace=%s, attempt=%s)",
                          rec.trace_id, rec.task_id, res.task_id, res.trace_id,
                          rec.retry_count + 1)
                 count += 1
+            except AdmissionRejected as exc:
+                self.task_store.release_retry(rec.task_id)
+                log.info("retry admission refused for %s: %s", rec.task_id, exc)
             except Exception:
+                self.task_store.finish_retry(rec.task_id, None, "unknown")
                 log.exception("retry dispatch failed for %s (trace=%s)",
                               rec.task_id, rec.trace_id)
         return count
@@ -160,36 +167,36 @@ class RetryManager:
         return (now - last) >= delay
 
     def check_worker_healing(self, worker_id: str) -> int:
-        """Worker 重新注册时调用：将其 lost 任务重新派发。"""
+        """注册恢复不自动重放未知副作用；仅重试仍有额度的已失败任务。"""
         w = self.registry.get_worker(worker_id)
         if w is None:
             return 0
-        lost = [r for r in self.task_store.list_by_worker(worker_id)
-                if r.status == "lost"]
+        lost = [r for r in self.task_store.list_retryable()
+                if r.status == "lost" and r.worker_id == worker_id]
         count = 0
         for rec in lost:
+            claimed = self.task_store.claim_retry(rec.task_id, self._ts())
+            if claimed is None:
+                continue
             try:
-                # 修复节点一致性：新派发定点到刚恢复的 worker（仅当 role 一致，
-                # 否则轮询选节点），因为下面 old 记录的 worker_id 会改写为该节点——
-                # 新任务若落到别处，任务记录与事实不符。
+                # 新尝试尽量落到恢复的节点；原记录保留历史终态与节点。
                 heal_pin = worker_id if w.role == rec.role else None
-                res = self.dispatcher.dispatch(
-                    role=rec.role, prompt=rec.prompt,
-                    context_memory=self._retry_context(rec),
-                    worker_id=heal_pin,
-                    **self._resume_overrides(rec),
-                )
-                self.task_store.update(
-                    rec.task_id, status="running",
-                    worker_id=worker_id,
-                    retry_count=rec.retry_count + 1,
-                    last_retry_at=self._ts(),
-                    updated_at=self._ts(),
-                )
+                with retry_dispatch(rec.task_id):
+                    res = self.dispatcher.dispatch(
+                        role=rec.role, prompt=rec.prompt,
+                        context_memory=self._retry_context(rec),
+                        worker_id=heal_pin,
+                        **self._resume_overrides(rec),
+                    )
+                self.task_store.finish_retry(rec.task_id, res.task_id, res.status)
                 log.info("[trace=%s] healing task=%s -> new task=%s (trace=%s)",
                          rec.trace_id, rec.task_id, res.task_id, res.trace_id)
                 count += 1
+            except AdmissionRejected as exc:
+                self.task_store.release_retry(rec.task_id)
+                log.info("healing admission refused for %s: %s", rec.task_id, exc)
             except Exception:
+                self.task_store.finish_retry(rec.task_id, None, "unknown")
                 log.exception("healing dispatch failed for %s (trace=%s)",
                               rec.task_id, rec.trace_id)
         return count

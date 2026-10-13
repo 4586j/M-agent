@@ -1,4 +1,6 @@
 """worker HTTP 服务：接受任务、查询状态、回传产出文件；启动即向大脑注册并定期心跳。"""
+import hashlib
+import json
 import logging
 import os
 import sys
@@ -14,11 +16,11 @@ from pathlib import Path
 # 永远优先，与进程 CWD 无关。
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from agent_runner import AgentRunner, TaskRequest, TaskResult
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-
-from agent_runner import AgentRunner, TaskRequest, TaskResult
+from task_receipts import TaskReceipts
 from worker_config import WorkerConfig
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "workspace" / "agent" / "orchestrator" / "runtime"))
@@ -74,16 +76,25 @@ def start_auto_heartbeat(cfg: WorkerConfig, interval: int | None = None,
     def loop():
         import requests
         post = http_post or requests.post
-        register_to_brain(cfg, http_post=post)
+        registered = register_to_brain(cfg, http_post=post)
         hb_url = f"{cfg.brain_url}/heartbeat"
         headers = {"X-API-Key": cfg.api_key} if cfg.api_key else {}
         while not stop_event.is_set():
             try:
-                post(hb_url, json={"worker_id": cfg.worker_id,
+                if not registered:
+                    registered = register_to_brain(cfg, http_post=post)
+                response = post(hb_url, json={"worker_id": cfg.worker_id,
                                    "load": load_fn() if load_fn else 0},
                      timeout=5, headers=headers)
+                if getattr(response, "status_code", 200) == 404:
+                    registered = False
+                elif getattr(response, "status_code", 200) == 200:
+                    try:
+                        registered = response.json().get("status") != "registration_required"
+                    except (ValueError, AttributeError, TypeError):
+                        pass
             except Exception:
-                pass
+                registered = False
             stop_event.wait(interval)
 
     t = threading.Thread(target=loop, daemon=True, name="worker-heartbeat")
@@ -122,6 +133,10 @@ def create_worker_app(runner: AgentRunner, cfg: WorkerConfig) -> FastAPI:
     cancelled: set[str] = set()
     cancel_events: dict[str, threading.Event] = {}
     lock = threading.Lock()
+    receipts = TaskReceipts(cfg.work_dir)
+    receipts.recover_interrupted()
+    active: set[str] = set()
+    capacity = max(1, int(os.environ.get("ORCH_WORKER_MAX_CONCURRENT", "4")))
     state_max = int(os.environ.get("ORCH_WORKER_STATE_MAX", "1000"))
 
     # CORS：开发期前端直连 worker 查任务/产物
@@ -151,19 +166,24 @@ def create_worker_app(runner: AgentRunner, cfg: WorkerConfig) -> FastAPI:
 
     def _record(task_id: str, res: TaskResult):
         with lock:
+            if task_id in cancelled:
+                res.status = "cancelled"
+            receipts.finish(res)
             state[task_id] = res
             # 已终态结果封顶，防长期运行内存增长；running 不清理
-            finished = [tid for tid, r in state.items() if r.status != "running"]
-            excess = len(finished) - state_max
+            finished = [tid for tid, r in state.items() if r.status != "running" and tid not in active]
+            excess = max(0, len(finished) - state_max)
             for tid in finished[:excess]:
                 del state[tid]
                 cancelled.discard(tid)
                 cancel_events.pop(tid, None)
 
     def _execute(body: TaskBody):
-        event = threading.Event()
         with lock:
-            cancel_events[body.task_id] = event
+            event = cancel_events[body.task_id]
+        if event.is_set():
+            _record(body.task_id, TaskResult(body.task_id, "cancelled"))
+            return
         req = TaskRequest(body.task_id, body.prompt, body.context_memory,
                           body.model, cancel_event=event, trace_id=body.trace_id,
                           provider=body.provider,
@@ -186,7 +206,24 @@ def create_worker_app(runner: AgentRunner, cfg: WorkerConfig) -> FastAPI:
     def post_task(body: TaskBody):
         # 异步执行：起后台线程跑 runner，立即返回 accepted；
         # state 先占位 running 供 brain 轮询，完成或异常时覆盖。
-        _record(body.task_id, TaskResult(body.task_id, "running"))
+        validate_id(body.task_id, "task_id")
+        # Transport metadata and rotating credentials do not change task semantics.
+        content = {k: v for k, v in body.model_dump().items()
+                   if k not in ("callback_url", "trace_id", "provider_auth_token")}
+        digest = hashlib.sha256(json.dumps(content, sort_keys=True).encode()).hexdigest()
+        with lock:
+            if len(active) >= capacity and receipts.get(body.task_id) is None:
+                raise HTTPException(status_code=429, detail="worker execution capacity reached")
+            admitted = receipts.claim(body.task_id, digest, capacity)
+            if admitted == "conflict":
+                raise HTTPException(status_code=409, detail="task_id already has different input")
+            if admitted == "busy":
+                raise HTTPException(status_code=429, detail="worker execution capacity reached")
+            if admitted == "duplicate":
+                return {"task_id": body.task_id, "status": "accepted", "duplicate": True}
+            cancel_events[body.task_id] = threading.Event()
+            state[body.task_id] = TaskResult(body.task_id, "running")
+            active.add(body.task_id)
 
         def _bg():
             try:
@@ -194,24 +231,37 @@ def create_worker_app(runner: AgentRunner, cfg: WorkerConfig) -> FastAPI:
             except Exception as e:
                 _record(body.task_id, TaskResult(
                     body.task_id, "failed", error=f"execute error: {e}"))
+            finally:
+                with lock:
+                    active.discard(body.task_id)
             with lock:
                 should_callback = body.task_id not in cancelled
                 res = state.get(body.task_id)
-                cancelled.discard(body.task_id)
             if body.callback_url and should_callback:
                 _send_callback(body.callback_url, res, api_key=cfg.api_key,
                                trace_id=body.trace_id)
 
-        threading.Thread(target=_bg, daemon=True, name=f"task-{body.task_id}").start()
+        try:
+            threading.Thread(target=_bg, daemon=True, name=f"task-{body.task_id}").start()
+        except Exception:
+            with lock:
+                active.discard(body.task_id)
+            _record(body.task_id, TaskResult(body.task_id, "failed", error="executor thread failed to start"))
+            raise
         return {"task_id": body.task_id, "status": "accepted"}
 
     @app.post("/task/{task_id}/cancel")
     def cancel_task(task_id: str):
+        validate_id(task_id, "task_id")
         with lock:
+            existing = state.get(task_id)
+            if existing is not None and existing.status != "running":
+                return {"task_id": task_id, "status": existing.status}
             cancelled.add(task_id)
             res = state.get(task_id)
             if res is not None:
                 state[task_id] = TaskResult(task_id, "cancelled")
+                receipts.finish(state[task_id])
         # 传播到执行体：runner 在消息/turn 边界协作退出
         with lock:
             ev = cancel_events.get(task_id)
@@ -221,8 +271,13 @@ def create_worker_app(runner: AgentRunner, cfg: WorkerConfig) -> FastAPI:
 
     @app.get("/task/{task_id}")
     def get_task(task_id: str):
+        validate_id(task_id, "task_id")
         with lock:
             res = state.get(task_id)
+        if res is None:
+            saved = receipts.get(task_id)
+            if saved is not None:
+                res = TaskResult(**saved)
         if res is None:
             raise HTTPException(status_code=404, detail="task not found")
         return {
@@ -259,7 +314,7 @@ def create_worker_app(runner: AgentRunner, cfg: WorkerConfig) -> FastAPI:
 
     def _running_count() -> int:
         with lock:
-            return sum(1 for r in state.values() if r.status == "running")
+            return len(active)
 
     app.state.get_load = _running_count
 
@@ -269,8 +324,9 @@ def create_worker_app(runner: AgentRunner, cfg: WorkerConfig) -> FastAPI:
 def _build_app():
     """从配置装配 worker_app，Fake runner 默认，可经环境变量切换 Sdk。"""
     import os
-    from worker_config import load_worker_config
+
     from agent_runner import FakeAgentRunner, SdkAgentRunner
+    from worker_config import load_worker_config
 
     cfg = load_worker_config()
     if cfg.skillhub_auto:

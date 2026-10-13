@@ -10,6 +10,10 @@ import logging
 import re
 import sys
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from agent_core.config import AgentConfig
 
 log = logging.getLogger(__name__)
 
@@ -159,8 +163,7 @@ def _load_embedding_model(config):
     model: object | None = None
     if key not in ("none", "off"):
         try:
-            from embedding_model import (SentenceTransformerModel,
-                                         create_embedding_model)
+            from embedding_model import SentenceTransformerModel, create_embedding_model
             model = (SentenceTransformerModel(name) if name
                      else create_embedding_model())
         except Exception:
@@ -178,8 +181,8 @@ def _make_local_backend(config):
     FileMemoryStore / ExperienceStore。runtime 不可用时抛出异常，由工具层转 is_error。
     """
     rt = ensure_runtime_on_path(config)
-    from memory_store import FileMemoryStore  # noqa: E402  延迟导入避免循环依赖
     from experience_store import ExperienceStore  # noqa: E402
+    from memory_store import FileMemoryStore  # noqa: E402  延迟导入避免循环依赖
 
     mem = FileMemoryStore(config.memory_core_dir, config.memory_context_dir)
     # 阶段四记忆修复：注入 embedding 模型启用语义检索（与 brain 侧 brain_api
@@ -378,7 +381,17 @@ async def _guarded_run(config: "AgentConfig", spec: dict,
     （记忆工具 1 次）、响应结构校验全部生效；写工具成功后失效读缓存，
     避免后续读到陈旧快照。
     """
+    import hashlib
+
     from agent_core.tool_guard import guarded_tool_call, invalidate_tool_cache
+
+    if config.memory_backend == "remote":
+        identity = ["remote", config.brain_url.rstrip("/"), config.api_key]
+    else:
+        identity = ["local", *[str(Path(p).resolve()) for p in (
+            config.memory_core_dir, config.memory_context_dir, config.experience_store_dir)]]
+    # 凭据只参与摘要；不会进入缓存键明文或日志。
+    scope = hashlib.sha256(json.dumps(identity).encode()).hexdigest()
 
     async def _invoke(a):
         # 成功结果包成 MCP 文本格式（与 _run_tool 一致），守卫的错误路径
@@ -392,9 +405,10 @@ async def _guarded_run(config: "AgentConfig", spec: dict,
         cache_ttl=config.tool_guard_cache_ttl,
         guard_enabled=True,
         response_validation=config.tool_response_validation_enabled,
+        cache_scope=scope,
     )
     if not record.is_error and spec["name"].startswith(("write_", "delete_")):
-        invalidate_tool_cache()
+        invalidate_tool_cache(scope + ":")
     if record.is_error:
         log.warning("记忆工具 %s 守卫记录：%s", spec["name"], record.to_dict())
     else:

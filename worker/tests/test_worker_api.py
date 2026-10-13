@@ -127,8 +127,9 @@ def test_state_capped_for_finished_tasks(tmp_path, monkeypatch):
         client.post("/task", json={
             "task_id": f"task-{i}", "prompt": "p", "context_memory": "", "model": None})
     _wait_terminal(client, "task-4")
-    assert client.get("/task/task-0").status_code == 404  # 最老的被清理
-    assert client.get("/task/task-1").status_code == 404
+    # 内存结果可淘汰；持久接收记录仍可查询，避免清理后重复执行。
+    assert client.get("/task/task-0").json()["status"] == "done"
+    assert client.get("/task/task-1").json()["status"] == "done"
     assert client.get("/task/task-4").status_code == 200
 
 

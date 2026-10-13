@@ -4,6 +4,13 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
+    inputs:
+      run_sdk_smoke:
+        description: 'Run the paid real SDK smoke test (maximum SDK query budget $0.05)'
+        required: false
+        default: false
+        type: boolean
 
 jobs:
   python-tests:
@@ -70,7 +77,8 @@ jobs:
       - name: 导入冒烟（核心模块可加载）
         run: |
           . /tmp/cleanenv/bin/activate
-          python -c "import agent_core, agent_core.kernel, agent_core.run_store, agent_core.execution_host, agent_core.isolated_executor, agent_core.tool_policy; print('import ok', agent_core.__name__)"
+          cd /tmp
+          python -c "import agent_core, agent_core.kernel, agent_core.run_store, agent_core.tool_guard, agent_core.planning; print('installed import ok', agent_core.__file__)"
 
   eval-smoke:
     name: eval 冒烟（不依赖 brain / API key）
@@ -108,9 +116,9 @@ jobs:
 
   # 真实 SDK 冒烟（Slice 4）：与 mock 测试分离——用真实 claude-agent-sdk 跑一个
   # 最小任务，验证「安装的 SDK/CLI 组合」确实可执行（而非仅 mock 契约通过）。
-  # 需 ANTHROPIC_API_KEY，故默认 if: false；就绪后移除即启用，并据此固定 SDK 版本。
+  # 需 ANTHROPIC_API_KEY；仅由 workflow_dispatch 显式勾选，普通 CI 不调用付费模型。
   sdk-smoke:
-    if: false
+    if: github.event_name == 'workflow_dispatch' && inputs.run_sdk_smoke
     name: 真实 SDK 冒烟（需 API key，与 mock 分离）
     runs-on: ubuntu-latest
     steps:
@@ -125,8 +133,11 @@ jobs:
           pip install -e ./agent_core
       - name: 真实 SDK 最小任务冒烟
         env:
+          RUN_AGENT_SDK_SMOKE: "1"
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-        run: python -m pytest agent_core/tests -q -m sdk_smoke
+        run: |
+          pip install pytest
+          python -m pytest agent_core/tests -q -m sdk_smoke
 
   frontend:
     name: 前端（Vitest 单测 + 构建，门禁）   # 硬门禁：前端挂了阻塞合并

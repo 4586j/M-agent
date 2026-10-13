@@ -6,14 +6,21 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from dispatch_common import (is_text_artifact, enrich_experience,
-                             write_result_note, put_provider_name, provider_body)
+from audit_log import record_verdict_event
+from dispatch_context import retry_fields
 from event_bus import TaskEventBus, publish_task_event
-from task_store import TaskStore, TaskRecord, new_trace_id
-from worker_registry import WorkerRegistry
 from experience_store import ExperienceStore
 from memory_store import MemoryStore
-from audit_log import record_verdict_event
+from worker_registry import WorkerRegistry
+
+from dispatch_common import (
+    enrich_experience,
+    is_text_artifact,
+    provider_body,
+    put_provider_name,
+    write_result_note,
+)
+from task_store import TaskRecord, TaskStore, new_trace_id
 
 _POLL_MAX = 1000  # 轮询上限，防死循环
 
@@ -229,8 +236,7 @@ class RemoteDispatcher(Dispatcher):
             task_id=task_id, role=role, prompt=prompt, worker_id=worker.worker_id,
             status="pending", created_at=ts, updated_at=ts,
             output=None, artifacts=[], error=None,
-            max_retries=self.max_retries,
-            trace_id=trace_id, meta=meta,
+            trace_id=trace_id, **retry_fields(self.max_retries, meta),
         ))
         log.info("[trace=%s] dispatch role=%s -> worker=%s task=%s",
                  trace_id, role, worker.worker_id, task_id)
@@ -251,21 +257,28 @@ class RemoteDispatcher(Dispatcher):
         if resp.get("status_code") != 200:
             log.warning("[trace=%s] task=%s post failed: %s", trace_id, task_id, resp)
             self._record_breaker(worker.worker_id, ok=False)
-            self.task_store.update(task_id, status="failed", error=f"post failed: {resp}")
+            changed = self.task_store.finalize_if(task_id, ("pending", "running"),
+                status="failed", error=f"post failed: {resp}")
+            if changed is None:
+                return self._stored_result(task_id)
             publish_task_event(self.event_bus, task_id, event="done",
                                state="failed", trace_id=trace_id,
                                summary=f"post failed: {resp}")
             return DispatchResult(task_id, "failed", error=f"post failed: {resp}",
                                   trace_id=trace_id)
-        self.task_store.update(task_id, status="running")
+        if not self.task_store.transition(task_id, "pending", "running"):
+            return self._stored_result(task_id)
         publish_task_event(self.event_bus, task_id, event="status",
                            state="running", trace_id=trace_id)
         # 轮询：每 0.5s 拉一次，直到 done/failed 或达 _POLL_MAX 上限
         for _ in range(_POLL_MAX):
+            current = self.task_store.get(task_id)
+            if current.status not in ("pending", "running"):
+                return self._stored_result(task_id)
             r = self.http_call("GET", f"{base}/task/{task_id}")
             data = r.get("json", {})
             st = data.get("status")
-            if st in ("done", "failed"):
+            if st in ("done", "failed", "cancelled"):
                 out = data.get("output")
                 arts = data.get("artifacts", [])
                 verdict = None
@@ -281,12 +294,14 @@ class RemoteDispatcher(Dispatcher):
                 if pinned:
                     meta["pinned"] = True
                 put_provider_name(meta, provider)
-                meta = {**meta, **(data.get("meta") or {})}
-                self.task_store.update(
-                    task_id, status=st, output=out,
+                meta = {**(current.meta or {}), **meta, **(data.get("meta") or {})}
+                changed = self.task_store.finalize_if(
+                    task_id, ("pending", "running"), status=st, output=out,
                     artifacts=arts, error=data.get("error"), verdict=verdict,
                     meta=meta,
                 )
+                if changed is None:
+                    return self._stored_result(task_id)
                 self._report_spend(meta)
                 # 节点健康记账：failed 计入连击（含任务级失败——保守口径），
                 # done 重置；重试链路的最终成败经此自然反馈给熔断器
@@ -308,10 +323,20 @@ class RemoteDispatcher(Dispatcher):
                 )
             time.sleep(0.5)
         log.warning("[trace=%s] task=%s poll timeout", trace_id, task_id)
-        self.task_store.update(task_id, status="failed", error="poll timeout")
+        current = self.task_store.get(task_id)
+        changed = self.task_store.finalize_if(task_id, ("pending", "running"),
+            status="failed", error="poll timeout",
+            meta={**(current.meta or {}), "reconciliation_required": True})
+        if changed is None:
+            return self._stored_result(task_id)
         publish_task_event(self.event_bus, task_id, event="done", state="failed",
                            trace_id=trace_id, summary="poll timeout")
         return DispatchResult(task_id, "failed", error="poll timeout", trace_id=trace_id)
+
+    def _stored_result(self, task_id: str) -> DispatchResult:
+        rec = self.task_store.get(task_id)
+        return DispatchResult(task_id, rec.status, rec.output, rec.artifacts,
+                              rec.error, rec.verdict, rec.trace_id)
 
     def _check_product(self, base: str, task_id: str, output: Any,
                        artifacts: list) -> dict | None:

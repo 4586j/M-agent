@@ -10,9 +10,11 @@ import asyncio
 import hashlib
 import json
 import logging
+import threading
 import time
 from collections import OrderedDict
-from dataclasses import dataclass, field
+from copy import deepcopy
+from dataclasses import dataclass
 
 from agent_core.tool_response_guard import validate_tool_response
 
@@ -59,14 +61,24 @@ def _hash_input(tool_name: str, args: dict) -> str:
 
 
 class _ToolCache:
-    """简单的 LRU 缓存，带 TTL 过期。线程不安全（仅 async 单线程使用）。"""
+    """进程内线程安全 LRU；失效代数防止在途旧读取重新填回缓存。"""
 
     def __init__(self, max_size: int = 128, default_ttl: int = 300):
         self._store: OrderedDict[str, tuple[float, object]] = OrderedDict()
         self._max_size = max_size
         self._default_ttl = default_ttl
+        self._lock = threading.RLock()
+        self._generation = 0
+
+    def generation(self) -> int:
+        with self._lock:
+            return self._generation
 
     def get(self, key: str) -> object | None:
+        with self._lock:
+            return self._get(key)
+
+    def _get(self, key: str) -> object | None:
         """命中且未过期返回值；否则返回 None。"""
         if key not in self._store:
             return None
@@ -76,21 +88,33 @@ class _ToolCache:
             return None
         # 移到末尾（LRU）
         self._store.move_to_end(key)
-        return value
+        return deepcopy(value)
 
-    def put(self, key: str, value: object, ttl: int | None = None) -> None:
+    def put(self, key: str, value: object, ttl: int | None = None,
+            generation: int | None = None) -> None:
+        with self._lock:
+            if generation is not None and generation != self._generation:
+                return
+            self._put(key, value, ttl)
+
+    def _put(self, key: str, value: object, ttl: int | None = None) -> None:
         """写入缓存。超过 max_size 时淘汰最久未使用的条目。"""
         expire_at = time.monotonic() + (ttl if ttl is not None else self._default_ttl)
         if key in self._store:
             self._store.move_to_end(key)
-        self._store[key] = (expire_at, value)
+        self._store[key] = (expire_at, deepcopy(value))
         while len(self._store) > self._max_size:
             self._store.popitem(last=False)
 
     def clear(self) -> None:
-        self._store.clear()
+        self.invalidate()
 
     def invalidate(self, prefix: str | None = None) -> int:
+        with self._lock:
+            self._generation += 1
+            return self._invalidate(prefix)
+
+    def _invalidate(self, prefix: str | None = None) -> int:
         """使读缓存失效（写动作提交后调用）。prefix=None 清空全部，
         否则只清除 cache_key 以 prefix 开头的条目。返回被清除的条目数。
 
@@ -159,7 +183,8 @@ async def guarded_tool_call(tool_name: str, handler, args: dict | None,
                             timeout: int = 30,
                             cache_ttl: int = 300,
                             guard_enabled: bool = True,
-                            response_validation: bool = True
+                            response_validation: bool = True,
+                            cache_scope: str = ""
                             ) -> tuple[dict, ToolCallRecord]:
     """带守卫的工具调用包装器。
 
@@ -195,7 +220,8 @@ async def guarded_tool_call(tool_name: str, handler, args: dict | None,
             }, record
 
     # 2. 查缓存（仅读操作缓存）
-    cache_key = f"{tool_name}:{input_hash}"
+    cache_key = f"{cache_scope + ':' if cache_scope else ''}{tool_name}:{input_hash}"
+    generation = _tool_cache.generation()
     if guard_enabled and not _is_write_tool(tool_name):
         cached = _tool_cache.get(cache_key)
         if cached is not None:
@@ -245,7 +271,7 @@ async def guarded_tool_call(tool_name: str, handler, args: dict | None,
 
     # 5. 写缓存（仅成功的读操作）
     if guard_enabled and not record.is_error and not _is_write_tool(tool_name):
-        _tool_cache.put(cache_key, result, ttl=cache_ttl)
+        _tool_cache.put(cache_key, result, ttl=cache_ttl, generation=generation)
 
     # 6. 工具响应验证（仅记录警告，不阻断）
     if guard_enabled and response_validation and not record.is_error \

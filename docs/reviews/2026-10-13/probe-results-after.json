@@ -1,0 +1,56 @@
+{
+  "cancel_during_finalize": {
+    "expected": "cancelled",
+    "actual": "cancelled"
+  },
+  "duplicate_callback_spend": {
+    "expected_entries": 1,
+    "actual_entries": 1
+  },
+  "callback_before_post_returns": {
+    "expected": "done",
+    "actual": "done"
+  },
+  "memory_cache_scope": {
+    "expected_second_contains": "PROJECT_B",
+    "actual_second": {
+      "name": "same-name",
+      "content": "PROJECT_B"
+    },
+    "same_as_first": false
+  },
+  "worker_duplicate_post": {
+    "http_statuses": [
+      200,
+      200
+    ],
+    "expected_runner_calls": 1,
+    "actual_runner_calls": 1
+  },
+  "heartbeat_after_registry_reset": {
+    "registration_required": true,
+    "registered_after_heartbeat": false
+  },
+  "schedule_budget_gate": {
+    "budget_allows": false,
+    "dispatch_calls": 0,
+    "note": "Scheduler uses the same admitted dispatcher as the Brain application."
+  },
+  "retry_lineage_limit_one": {
+    "task_counts_after_sweeps": [
+      1,
+      2,
+      2,
+      2,
+      2
+    ],
+    "retryable_tasks_after_four_sweeps": 0,
+    "expected_total_max_attempts_for_one_logical_task": 2
+  },
+  "ci_missing_modules": {
+    "execution_host": false,
+    "isolated_executor": false,
+    "tool_policy": false
+  },
+  "ci_obsolete_imports_removed": true
+}

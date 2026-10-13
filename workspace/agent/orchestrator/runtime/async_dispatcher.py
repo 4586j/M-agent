@@ -6,14 +6,21 @@ import time
 import uuid
 from typing import Any, Awaitable, Callable
 
-from task_store import TaskStore, TaskRecord, new_trace_id
-from worker_registry import WorkerRegistry
+from audit_log import record_verdict_event
+from dispatch_context import retry_fields
+from event_bus import TERMINAL_STATUSES, TaskEventBus, publish_task_event
 from experience_store import ExperienceStore
 from memory_store import MemoryStore
-from dispatch_common import (is_text_artifact, enrich_experience,
-                             write_result_note, put_provider_name, provider_body)
-from audit_log import record_verdict_event
-from event_bus import TaskEventBus, TERMINAL_STATUSES, publish_task_event
+from worker_registry import WorkerRegistry
+
+from dispatch_common import (
+    enrich_experience,
+    is_text_artifact,
+    provider_body,
+    put_provider_name,
+    write_result_note,
+)
+from task_store import TaskRecord, TaskStore, new_trace_id
 
 log = logging.getLogger(__name__)
 
@@ -138,9 +145,8 @@ class AsyncRemoteDispatcher:
             task_id=task_id, role=role, prompt=prompt,
             worker_id=worker.worker_id, status="pending",
             created_at=ts, updated_at=ts,
-            max_retries=self.max_retries,
             trace_id=trace_id,
-            meta=meta,
+            **retry_fields(self.max_retries, meta),
         ))
         log.info("[trace=%s] async dispatch role=%s -> worker=%s task=%s",
                  trace_id, role, worker.worker_id, task_id)
@@ -159,24 +165,55 @@ class AsyncRemoteDispatcher:
             body["model"] = model
         # provider 三元组瞬时转发 worker（内存仅本次任务；不落任何持久化）
         body.update(provider_body(provider))
-        resp = await self.async_http("POST", f"{base}/task", json=body)
+        try:
+            resp = await self.async_http("POST", f"{base}/task", json=body)
+        except Exception:
+            # 请求可能已到达 worker：保留原 ID，由轮询对账，不能自动再执行。
+            log.exception("task=%s POST response unavailable; reconciling", task_id)
+            resp = {"status_code": 200}
         if resp.get("status_code") != 200:
             log.warning("[trace=%s] task=%s post failed: %s", trace_id, task_id, resp)
             self._record_breaker(worker.worker_id, ok=False)
-            self.task_store.update(task_id, status="failed",
-                                   error=f"post failed: {resp}")
-            publish_task_event(self.event_bus, task_id, event="done",
-                               state="failed", trace_id=trace_id,
-                               summary=f"post failed: {resp}")
+            changed = self.task_store.finalize_if(task_id, ("pending", "running"),
+                status="failed", error=f"post failed: {resp}")
+            if changed:
+                publish_task_event(self.event_bus, task_id, event="done",
+                                   state="failed", trace_id=trace_id,
+                                   summary=f"post failed: {resp}")
             return task_id
-        self.task_store.update(task_id, status="running")
+        if not self.task_store.transition(task_id, "pending", "running"):
+            return task_id  # 快速回调/取消已提交，不能复活任务。
         publish_task_event(self.event_bus, task_id, event="status",
                            state="running", trace_id=trace_id)
         poll_task = asyncio.create_task(
             self._limited_poll(task_id, base, worker.worker_id, role, prompt, ts),
         )
         self._tasks[task_id] = poll_task
+        poll_task.add_done_callback(lambda done: self._discard_poll(task_id, done))
         return task_id
+
+    def _discard_poll(self, task_id: str, done: asyncio.Task) -> None:
+        if self._tasks.get(task_id) is done:
+            self._tasks.pop(task_id, None)
+        if not done.cancelled() and done.exception() is not None:
+            log.error("task=%s poll failed: %s", task_id, type(done.exception()).__name__)
+
+    def resume_polls(self) -> int:
+        """恢复已持久化且节点重新注册的在途任务；只查询，绝不重新 POST。"""
+        resumed = 0
+        for rec in self.task_store.list_all():
+            if rec.status not in ("pending", "running") or rec.task_id in self._tasks:
+                continue
+            worker = self.registry.get_worker(rec.worker_id)
+            if worker is None:
+                continue
+            pending = asyncio.create_task(self._limited_poll(
+                rec.task_id, f"http://{worker.host}:{worker.port}", rec.worker_id,
+                rec.role, rec.prompt, rec.created_at))
+            self._tasks[rec.task_id] = pending
+            pending.add_done_callback(lambda done, tid=rec.task_id: self._discard_poll(tid, done))
+            resumed += 1
+        return resumed
 
     async def handle_callback(self, task_id: str, data: dict) -> bool:
         """Worker 主动回调任务结果；已终结/裁决中/派发占位中的任务一律拒绝，返回是否确实处理了。"""
@@ -194,9 +231,8 @@ class AsyncRemoteDispatcher:
         publish_task_event(self.event_bus, task_id, event="callback",
                            state=rec.status, trace_id=rec.trace_id,
                            summary=data.get("output"), status=data.get("status"))
-        await self._finalize(task_id, rec.worker_id, rec.role, rec.prompt,
-                             rec.created_at, data)
-        return True
+        return await self._finalize(task_id, rec.worker_id, rec.role, rec.prompt,
+                                    rec.created_at, data)
 
     async def _limited_poll(self, task_id: str, base: str, worker_id: str,
                             role: str, prompt: str, ts: str) -> None:
@@ -207,6 +243,7 @@ class AsyncRemoteDispatcher:
     async def _poll_worker(self, task_id: str, base: str, worker_id: str,
                            role: str, prompt: str, ts: str) -> None:
         """后台轮询 worker 任务状态，done/failed 时写入结果。"""
+        rec = None
         for i in range(self.poll_max):
             await asyncio.sleep(self.poll_interval)
             rec = self.task_store.get(task_id)
@@ -225,20 +262,22 @@ class AsyncRemoteDispatcher:
                 continue
             data = r.get("json", {})
             st = data.get("status")
-            if st in ("done", "failed"):
+            if st in ("done", "failed", "cancelled"):
                 await self._finalize(task_id, worker_id, role, prompt, ts, data)
                 return
         log.warning("[trace=%s] task=%s async poll timeout",
                     rec.trace_id if rec else None, task_id)
         if rec is None or rec.status in _NON_FINALIZABLE:
             return  # 已被其他路径终态化/裁决中：不覆盖为 failed
-        self.task_store.update(task_id, status="failed", error="async poll timeout")
-        publish_task_event(self.event_bus, task_id, event="done", state="failed",
-                           trace_id=rec.trace_id if rec else None,
-                           summary="async poll timeout")
+        changed = self.task_store.finalize_if(task_id, ("pending", "running"),
+            status="failed", error="async poll timeout",
+            meta={**(rec.meta or {}), "reconciliation_required": True})
+        if changed:
+            publish_task_event(self.event_bus, task_id, event="done", state="failed",
+                               trace_id=changed.trace_id, summary="async poll timeout")
 
     async def _finalize(self, task_id: str, worker_id: str, role: str,
-                        prompt: str, ts: str, data: dict) -> None:
+                        prompt: str, ts: str, data: dict) -> bool:
         """写入最终结果（产物检验 + 经验记录 + meta 入库）。
 
         幂等：终态/awaiting_approval/dispatching 状态一律拒绝改写。
@@ -249,8 +288,10 @@ class AsyncRemoteDispatcher:
                 log.warning(
                     "[trace=%s] task=%s 终态化被拒绝（status=%s，不覆盖）",
                     rec.trace_id, task_id, rec.status)
-            return
+            return False
         st = data.get("status", "failed")
+        if st not in ("done", "failed", "cancelled"):
+            return False
         out = data.get("output")
         arts = data.get("artifacts", [])
         err = data.get("error")
@@ -267,10 +308,12 @@ class AsyncRemoteDispatcher:
         # worker 回传 meta（usage/cost_usd/num_turns）并入 TaskRecord（brain 侧
         # 已记录路由 model，callback 同名字段以 worker 为准），供 /tasks 与 /stats 透出
         meta = {**(rec.meta or {}), **(data.get("meta") or {})}
-        self.task_store.update(
-            task_id, status=st, output=out,
+        committed = self.task_store.finalize_if(
+            task_id, ("pending", "running"), status=st, output=out,
             artifacts=arts, error=err, verdict=verdict, meta=meta,
         )
+        if committed is None:
+            return False
         self._report_spend(meta)
         self._record_breaker(worker_id, ok=(st == "done"))
         log.info("[trace=%s] task=%s terminal status=%s", rec.trace_id, task_id, st)
@@ -284,7 +327,7 @@ class AsyncRemoteDispatcher:
                 verdict=verdict, artifacts=arts, created_at=ts,
             )
         write_result_note(self.memory_store, task_id, st, out, err)
-        self._tasks.pop(task_id, None)
+        return True
 
     def _record_breaker(self, worker_id: str | None, ok: bool) -> None:
         """节点健康记账：done → success，failed/派发失败 → failure。"""

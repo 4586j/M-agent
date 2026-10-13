@@ -1,0 +1,9 @@
+Processing .\agent_core
+  Preparing metadata (pyproject.toml): started
+  Preparing metadata (pyproject.toml): finished with status 'done'
+Building wheels for collected packages: agent-core
+  Building wheel for agent-core (pyproject.toml): started
+  Building wheel for agent-core (pyproject.toml): finished with status 'done'
+  Created wheel for agent-core: filename=agent_core-0.1.0-py3-none-any.whl size=277765 sha256=f5294bf58cea605385be6b30352ccc36ec2448f1e7d56295601b2a35cbcccff1
+  Stored in directory: C:\Users\33833\AppData\Local\Temp\pip-ephem-wheel-cache-4ro3o8mg\wheels\0d\dd\b2\dc97c1bd96892982d4173e8c6637f9b6b23d2a483af86c8465
+Successfully built agent-core

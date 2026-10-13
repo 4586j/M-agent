@@ -10,8 +10,8 @@ import json
 
 import pytest
 
-from agent_core.config import AgentConfig
 from agent_core import tools as tools_mod
+from agent_core.config import AgentConfig
 from agent_core.tool_guard import _tool_cache
 
 
@@ -46,6 +46,55 @@ def test_memory_tools_register(local_cfg):
              for t in tools_mod.build_memory_tools(cfg)]
     assert names == ["search_experiences", "read_core_memory",
                      "write_core_memory", "write_task_context"]
+
+
+def test_memory_cache_separates_local_stores(tmp_path):
+    async def scenario():
+        from agent_core.tools import _TOOL_SPECS, _guarded_run, _make_local_backend
+        spec = next(s for s in _TOOL_SPECS if s["name"] == "read_core_memory")
+        outputs = []
+        for name in ("A", "B"):
+            cfg = AgentConfig(memory_core_dir=str(tmp_path / name / "core"),
+                memory_context_dir=str(tmp_path / name / "ctx"),
+                experience_store_dir=str(tmp_path / name / "exp"))
+            backend = _make_local_backend(cfg)
+            await backend["write_core_memory"]("same-name", name)
+            result = await _guarded_run(cfg, spec, backend, {"name": "same-name"})
+            outputs.append(json.loads(result["content"][0]["text"])["content"])
+        assert outputs == ["A", "B"]
+    asyncio.run(scenario())
+
+
+def test_memory_cache_separates_remote_credentials():
+    async def scenario():
+        from agent_core.tools import _TOOL_SPECS, _guarded_run
+        spec = next(s for s in _TOOL_SPECS if s["name"] == "read_core_memory")
+        for secret in ("key-A", "key-B"):
+            cfg = AgentConfig(memory_backend="remote", brain_url="https://example.invalid", api_key=secret)
+            async def read(name, value=secret):
+                return {"content": value}
+            result = await _guarded_run(cfg, spec, {"read_core_memory": read}, {"name": "same"})
+            assert json.loads(result["content"][0]["text"])["content"] == secret
+        assert all("key-A" not in key and "key-B" not in key for key in _tool_cache._store)
+    asyncio.run(scenario())
+
+
+def test_inflight_read_does_not_repopulate_cache_after_write():
+    from agent_core.tool_guard import guarded_tool_call, invalidate_tool_cache
+    async def scenario():
+        entered, release = asyncio.Event(), asyncio.Event()
+        async def stale_read(args):
+            entered.set()
+            await release.wait()
+            return {"content": [{"type": "text", "text": "old"}]}
+        read = asyncio.create_task(guarded_tool_call("read_core_memory", stale_read,
+                                  {"name": "x"}, cache_scope="scope"))
+        await entered.wait()
+        invalidate_tool_cache("scope:")
+        release.set()
+        await read
+        assert not _tool_cache._store
+    asyncio.run(scenario())
 
 
 def test_write_success_returns_mcp_format(local_cfg):

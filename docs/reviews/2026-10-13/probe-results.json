@@ -1,0 +1,54 @@
+{
+  "cancel_during_finalize": {
+    "expected": "cancelled",
+    "actual": "done"
+  },
+  "duplicate_callback_spend": {
+    "expected_entries": 1,
+    "actual_entries": 2
+  },
+  "callback_before_post_returns": {
+    "expected": "done",
+    "actual": "running"
+  },
+  "memory_cache_scope": {
+    "expected_second_contains": "PROJECT_B",
+    "actual_second": {
+      "name": "same-name",
+      "content": "PROJECT_A"
+    },
+    "same_as_first": true
+  },
+  "worker_duplicate_post": {
+    "http_statuses": [
+      200,
+      200
+    ],
+    "expected_runner_calls": 1,
+    "actual_runner_calls": 2
+  },
+  "heartbeat_after_registry_reset": {
+    "registered_after_heartbeat": false
+  },
+  "schedule_budget_gate": {
+    "budget_allows": false,
+    "dispatch_calls": 1,
+    "note": "Scheduler has no budget dependency; mirrors production wiring."
+  },
+  "retry_lineage_limit_one": {
+    "task_counts_after_sweeps": [
+      1,
+      2,
+      3,
+      4,
+      5
+    ],
+    "retryable_tasks_after_four_sweeps": 1,
+    "expected_total_max_attempts_for_one_logical_task": 2
+  },
+  "ci_missing_modules": {
+    "execution_host": false,
+    "isolated_executor": false,
+    "tool_policy": false
+  }
+}
