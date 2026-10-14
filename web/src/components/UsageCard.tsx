@@ -8,8 +8,11 @@ export default function UsageCard({ meta }: { meta?: TaskMeta }) {
   const cacheHit = cacheHitRate(usage)
   if (tokens == null && meta?.num_turns == null && meta?.cost_usd == null) return null
   return (
-    <div className="bg-mint-50/50 border border-mint-100 rounded-xl p-4">
-      <h4 className="text-xs font-bold text-slate-600 mb-2">执行消耗度量</h4>
+    <div className="bg-zinc-900/60 backdrop-blur-xl border border-white/[0.07] rounded-xl p-4 shadow-[inset_0_1px_0_0_rgba(255,255,255,0.05)]">
+      <h4 className="text-xs font-bold text-zinc-300 mb-2.5 flex items-center gap-2">
+        <span className="w-1.5 h-1.5 rounded-full bg-indigo-400" />
+        执行消耗度量
+      </h4>
       <div className="grid grid-cols-4 gap-2 text-center text-xs">
         <Cell label="Tokens" value={tokens != null ? tokens.toLocaleString() : '—'} />
         <Cell label="Turns" value={meta?.num_turns != null ? `${meta.num_turns} 轮` : '—'} />
@@ -20,7 +23,7 @@ export default function UsageCard({ meta }: { meta?: TaskMeta }) {
         />
       </div>
       {meta?.model && (
-        <div className="mt-2 text-[11px] text-slate-400 font-mono">model: {meta.model}</div>
+        <div className="mt-2.5 text-[11px] text-zinc-400 font-mono">model: {meta.model}</div>
       )}
     </div>
   )
@@ -28,9 +31,9 @@ export default function UsageCard({ meta }: { meta?: TaskMeta }) {
 
 function Cell({ label, value, accent }: { label: string; value: string; accent?: boolean }) {
   return (
-    <div className="bg-white p-2 rounded-lg border border-mint-100/60">
-      <div className="text-slate-400">{label}</div>
-      <div className={`font-bold mt-0.5 ${accent ? 'text-mint-700' : 'text-slate-700'}`}>{value}</div>
+    <div className="bg-zinc-950/70 p-2.5 rounded-lg border border-white/[0.05] transition hover:border-white/10">
+      <div className="text-zinc-400 text-[11px] font-medium">{label}</div>
+      <div className={`font-mono font-bold text-sm mt-1 tabular-nums ${accent ? 'text-emerald-400' : 'text-zinc-100'}`}>{value}</div>
     </div>
   )
 }

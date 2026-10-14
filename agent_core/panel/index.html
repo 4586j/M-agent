@@ -366,7 +366,7 @@
   /* 内嵌终端 */
   .term{flex:1;display:none;flex-direction:column;overflow:hidden;background:var(--bg-0)}
   .term.show{display:flex}
-  #term-xterm{flex:1;min-height:0;padding:8px 10px}
+  #term-xterm{display:none;flex:1;min-height:0;padding:8px 10px}
   .term.xterm-on #term-out{display:none}
   .term.xterm-on #term-xterm{display:block}
   #term-xterm.fallback{display:none}
@@ -474,14 +474,17 @@
     <div class="composer" id="composer">
       <div class="card">
         <div id="attach-strip" class="attach-strip"></div>
-        <textarea id="prompt" placeholder="给 Agent 下发任务…（Ctrl + Enter 派发，可直接粘贴截图）"></textarea>
+        <textarea id="prompt" placeholder="输入任务，或 /plan 你的要求 · /usage 查看用量（Ctrl + Enter 发送）"></textarea>
+        <div id="slash-hints" class="row" hidden aria-label="命令提示"></div>
+        <div class="row"><button class="btn-art" onclick="showCommandHelp()">/ 帮助</button><span class="modal-hint">/plan 要求 · /usage 用量 · /new 新会话</span></div>
         <div class="row">
           <label class="field">会话
             <select id="session-sel" onchange="onSessionChange(this.value)">
               <option value="">🆕 新会话（不记忆）</option>
             </select>
           </label>
-          <button class="btn-art" onclick="newSession()" title="创建持久会话：历史轮次自动注入上下文，重启后可回看续聊">＋</button>
+          <button class="btn-art" id="session-new" onclick="newSession()" title="创建持久会话：历史轮次自动注入上下文，重启后可回看续聊">＋</button>
+          <button class="btn-art" id="session-delete" onclick="confirmDeleteSession()" disabled title="删除当前会话的对话历史">删除会话</button>
           <label class="field">model
             <input type="text" id="model" placeholder="默认"/>
           </label>
@@ -554,10 +557,19 @@ function newTask(){
 
 /* ================= 持久会话（连续对话：历史注入上下文，重启可回看） ================= */
 let sessionId = '';
+let sessionDeleting = false, sessionListVersion = 0;
 try{ sessionId = localStorage.getItem('agent_panel_sid') || ''; }catch(e){}
 
+function updateSessionControls(){
+  $('session-delete').disabled = !sessionId || live || sessionDeleting;
+  $('session-delete').textContent = sessionDeleting ? '删除中…' : '删除会话';
+  $('session-new').disabled = live || sessionDeleting;
+  $('session-sel').disabled = live || sessionDeleting;
+}
 function loadSessions(keepId){
-  fetch(apiUrl('/agent/persisted-sessions')).then(r => r.json()).then(d => {
+  const version = ++sessionListVersion;
+  return panelJSON('/agent/persisted-sessions').then(d => {
+    if(version !== sessionListVersion) return;
     const sel = $('session-sel');
     sel.innerHTML = '<option value="">🆕 新会话（不记忆）</option>' +
       (d.sessions || []).map(s =>
@@ -566,20 +578,24 @@ function loadSessions(keepId){
     const want = keepId || sessionId;
     if(want && (d.sessions || []).some(s => s.session_id === want)) sel.value = want;
     else if(want){ sessionId = ''; try{ localStorage.removeItem('agent_panel_sid'); }catch(e){} }
+    updateSessionControls();
   }).catch(() => {});
 }
 
 function onSessionChange(v){
   sessionId = v;
+  updateSessionControls();
   try{ v ? localStorage.setItem('agent_panel_sid', v) : localStorage.removeItem('agent_panel_sid'); }catch(e){}
   if(v) loadSessionHistory(v);
   else newTask();
 }
 
 function newSession(){
-  fetch(apiUrl('/agent/session/persist'), { method:'POST' })
-    .then(r => r.json()).then(d => {
+  if(live || sessionDeleting) return;
+  return panelJSON('/agent/session/persist', { method:'POST' }).then(d => {
       sessionId = d.session_id;
+      updateSessionControls();
+      $('prompt').value = ''; updateSlashHints();
       try{ localStorage.setItem('agent_panel_sid', sessionId); }catch(e){}
       loadSessions(sessionId);
       loadSessionHistory(sessionId);
@@ -588,12 +604,38 @@ function newSession(){
     .catch(e => appendError('新建会话失败：' + (e.message || e)));
 }
 
+function confirmDeleteSession(){
+  if(!sessionId){ commandNotice('删除会话', '请先在会话下拉框中选择要删除的会话。'); return; }
+  if(live || sessionDeleting){ commandNotice('暂不能删除', '请等待当前任务结束后再删除会话。'); return; }
+  const sid = sessionId;
+  const name = $('session-sel').selectedOptions[0]?.textContent || sid;
+  showModal({title:'删除会话？',
+    bodyHTML:'<p>将永久删除会话「' + esc(name) + '」的对话历史，此操作无法撤销。</p>' +
+      '<p>运行记录和生成的文件会保留。</p>',
+    buttons:[{label:'取消'}, {label:'确认删除', cls:'btn-primary', onClick:async () => {
+      if(live || sessionDeleting || sessionId !== sid) return;
+      sessionDeleting = true; updateSessionControls();
+      try {
+        try { await panelJSON(`/agent/persisted-sessions/${encodeURIComponent(sid)}`, {method:'DELETE'}); }
+        catch(e){ if(e.status !== 404) throw e; }
+        sessionId = ''; $('session-sel').value = '';
+        try{ localStorage.removeItem('agent_panel_sid'); }catch(e){}
+        currentRunId = null; lastSeq = 0; planSteps = null; hideRunbar();
+        streamEl().innerHTML = '<div class="empty">会话已删除。可以直接派发独立任务，或创建新会话。</div>';
+        renderRight(null);
+        await loadSessions();
+      } catch(e){ commandNotice('删除失败', e.message || String(e)); }
+      finally { sessionDeleting = false; updateSessionControls(); }
+    }}]});
+}
+
 function loadSessionHistory(sid){
   abortRun(true);
   currentRunId = null; lastSeq = 0; planSteps = null; hideRunbar();
   $('prompt').focus();
   fetch(apiUrl(`/agent/persisted-sessions/${encodeURIComponent(sid)}`)).then(r => r.json())
     .then(rec => {
+      if(sessionId !== sid) return;
       const turns = rec.turns || [];
       if(!turns.length){
         streamEl().innerHTML = '<div class="empty"><div class="glyph">💬</div>会话已就绪（暂无历史轮次）</div>';
@@ -611,12 +653,106 @@ function loadSessionHistory(sid){
     .catch(e => appendError('会话历史加载失败：' + (e.message || e)));
 }
 
-function dispatch(){
-  const prompt = $('prompt').value.trim();
+/* ================= 输入框斜杠命令（本地控制命令不发送给模型） ================= */
+const SLASH_COMMANDS = [
+  ['/plan', '要求', '本次使用规划引擎分步执行'],
+  ['/usage', '', '查看服务累计用量及最近展示结果的 token'],
+  ['/cost', '', '查看用量（与 /usage 相同）'],
+  ['/new', '', '创建并切换到空白持久会话'],
+  ['/delete', '', '确认后删除当前会话的对话历史，保留运行记录和文件'],
+  ['/model', '模型名', '查看或设置后续任务模型；default 恢复默认'],
+  ['/stop', '', '请求中断当前任务'],
+  ['/help', '', '查看命令帮助'],
+];
+let displayedResult = null;
+async function panelJSON(path, options){
+  const resp = await fetch(apiUrl(path), options);
+  const data = await resp.json();
+  if(!resp.ok){ const error = new Error(data.message || data.detail || ('HTTP ' + resp.status)); error.status = resp.status; throw error; }
+  return data;
+}
+function commandNotice(title, text){
+  showModal({title, bodyHTML: '<pre style="white-space:pre-wrap">' + esc(text) + '</pre>',
+    buttons: [{label:'关闭'}]});
+}
+function showCommandHelp(){
+  commandNotice('输入框命令', SLASH_COMMANDS.map(([cmd,arg,desc]) =>
+    cmd + (arg ? ' ' + arg : '') + '：' + desc).join('\n') +
+    '\n\nCtrl + Enter 或点击派发执行。/plan 仅对本次生效，会实际执行计划。\n' +
+    '直接输入文字沿用当前设置。要把以 / 开头的原文发给 Agent，请以 // 开头。\n' +
+    '/new 不删除运行历史。这些命令用于任务输入框，不是终端命令。');
+}
+function updateSlashHints(){
+  const box = $('slash-hints'), value = $('prompt').value;
+  const liveCommand = /^\/(usage|cost|help|stop|interrupt)\s*$/i.test(value.trim());
+  $('btn-dispatch').disabled = live && !liveCommand;
+  $('btn-dispatch').textContent = live ? (liveCommand ? '执行命令' : '执行中…') : '派发 ▸';
+  box.replaceChildren();
+  const matches = /^\/[a-z]*$/i.test(value) ? SLASH_COMMANDS.filter(([c]) => c.startsWith(value.toLowerCase())) : [];
+  box.hidden = !matches.length;
+  box.style.display = matches.length ? 'flex' : 'none';
+  for(const [cmd,arg,desc] of matches){
+    const button = document.createElement('button');
+    button.className = 'btn-art'; button.textContent = cmd + ' · ' + desc;
+    button.onclick = () => { $('prompt').value = cmd + (arg ? ' ' : ''); $('prompt').focus(); box.style.display='none'; };
+    box.appendChild(button);
+  }
+}
+async function slashCommand(text){
+  if(!text.startsWith('/')) return {prompt:text};
+  if(text.startsWith('//')) return {prompt:text.slice(1)};
+  if(text === '/'){ showCommandHelp(); return null; }
+  const match = text.match(/^(\/\S+)(?:\s+([\s\S]*))?$/);
+  const cmd = match[1].toLowerCase(), arg = (match[2] || '').trim();
+  if(!SLASH_COMMANDS.some(([c]) => c === cmd) && cmd !== '/interrupt'){
+    commandNotice('未知命令', cmd + ' 未发送给模型。输入 /help 查看命令；发送原文请以 // 开头。'); return null;
+  }
+  if(cmd === '/plan'){
+    if(!arg){ commandNotice('计划模式', '用法：/plan 你的要求，例如 /plan 分析项目并修复测试。'); return null; }
+    return {prompt:arg, planning:true};
+  }
+  if(arg && cmd !== '/model'){ commandNotice('命令参数', cmd + ' 不接受参数。输入 /help 查看用法。'); return null; }
+  if(cmd === '/help') showCommandHelp();
+  else if(cmd === '/usage' || cmd === '/cost'){
+    const d = await panelJSON('/agent/status'), u = d.oneshot_usage || {}, s = d.session_usage || {};
+    const money = value => value == null ? '未回传' : '$' + Number(value).toFixed(6);
+    let message = '统计范围：当前服务进程启动后累计，不是供应商额度。\n' +
+      '任务执行：' + (u.runs ?? 0) + ' 次，失败 ' + (u.errors ?? 0) + ' 次\n' +
+      '任务累计轮次：' + (u.total_turns ?? 0) + '，成本：' + money(u.total_cost_usd) + '\n' +
+      '活跃 SDK 会话：' + (s.sessions ?? 0) + '，成本：' + money(s.total_cost_usd);
+    if(displayedResult){
+      const t = displayedResult.usage || {};
+      message += '\n\n最近展示的执行结果（可能是历史回放）：\n输入 token：' + (t.input_tokens ?? '未回传') +
+        '\n输出 token：' + (t.output_tokens ?? '未回传') + '\n缓存读取 token：' + (t.cache_read_input_tokens ?? '未回传') +
+        '\n缓存写入 token：' + (t.cache_creation_input_tokens ?? '未回传') + '\n成本：' + money(displayedResult.cost_usd);
+    }
+    commandNotice('用量统计', message);
+  } else if(cmd === '/stop' || cmd === '/interrupt'){
+    if(live) abortRun(); else commandNotice('中断任务', '当前没有正在执行的任务。');
+  } else if(live){ commandNotice('任务执行中', '请先等待完成或使用 /stop 中断，再切换会话或模型。');
+  } else if(cmd === '/new') await newSession();
+  else if(cmd === '/delete') confirmDeleteSession();
+  else if(cmd === '/model'){
+    if(arg) $('model').value = arg.toLowerCase() === 'default' ? '' : arg;
+    commandNotice('任务模型', $('model').value || '使用服务默认模型');
+  }
+  return null;
+}
+$('prompt').addEventListener('input', updateSlashHints);
+
+async function dispatch(){
+  let prompt = $('prompt').value.trim();
+  let planning = $('plan-cb').checked;
+  try {
+    const action = await slashCommand(prompt);
+    if(!action) return;
+    prompt = action.prompt; planning = action.planning ?? planning;
+  } catch(e){ commandNotice('命令执行失败', e.message || String(e)); return; }
+  if(live || sessionDeleting){ commandNotice('操作进行中', '请等待当前操作完成，或使用 /stop 中断任务。'); return; }
   if(!prompt && !pendingImages.length) return;
   const model = $('model').value.trim();
-  const planning = $('plan-cb').checked;
   planSteps = null; lastSeq = 0; currentRunId = null; live = true;
+  updateSessionControls();
   // 持久会话激活时保留历史轮次展示，本轮流式追加在其后
   if(!sessionId) streamEl().innerHTML = '';
   $('btn-dispatch').disabled = true; $('btn-dispatch').textContent = '执行中…';
@@ -678,13 +814,14 @@ function handlePasteImages(e){
 function dispatchAsync(body){
   fetch(apiUrl('/agent/run/async'), {
     method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)
-  }).then(r => r.json()).then(d => {
+  }).then(async r => { const d = await r.json(); if(!r.ok) throw new Error(d.message || d.detail || ('HTTP ' + r.status)); return d; }).then(d => {
     currentRunId = d.run_id;
     showRunbar(d.run_id, '规划引擎 · 分步执行');
     renderRight({ num_turns: 0 });
     const poll = () => {
       if(!live || currentRunId !== d.run_id) return;
-      fetch(apiUrl(`/agent/run/${d.run_id}/events`)).then(r => r.json()).then(events => {
+      panelJSON(`/agent/run/${d.run_id}/events`).then(async events => {
+        if(!live || currentRunId !== d.run_id) return;
         for(const e of events){
           if(e.seq <= lastSeq) continue;
           lastSeq = e.seq;
@@ -692,6 +829,15 @@ function dispatchAsync(body){
           if(e.type === 'plan_update'){ renderPlan(e.data); continue; }
           if(e.type === 'error'){ appendError(typeof e.data === 'string' ? e.data : JSON.stringify(e.data)); continue; }
           handleEvent(e.type, e.data);
+        }
+        // 异常退出可能没有 result 事件；以任务终态收尾，避免界面永久显示执行中。
+        const state = await panelJSON(`/agent/run/${d.run_id}`);
+        if(!live || currentRunId !== d.run_id) return;
+        if(state.status !== 'running'){
+          if(state.result) renderResult({...state.result, result:state.result.output,
+            num_turns:state.result.turns}, false);
+          else appendError(state.error?.message || ('任务已结束：' + state.status));
+          finishRun(); return;
         }
         if(live) setTimeout(poll, 2000);
       }).catch(() => { if(live) setTimeout(poll, 4000); });
@@ -743,11 +889,13 @@ function abortRun(silent){
 
 function finishRun(){
   live = false; abortCtl = null;
+  updateSessionControls();
   $('btn-dispatch').disabled = false; $('btn-dispatch').textContent = '派发 ▸';
   setConn('ok', '就绪');
   $('runbar-state').textContent = '已结束';
   setTimeout(hideRunbar, 1200);
   loadRuns();
+  loadSessions(sessionId);
 }
 
 /* ================= 事件渲染 ================= */
@@ -881,6 +1029,7 @@ function appendError(text){
 
 /* ================= 右栏 ================= */
 function renderRight(result, replay){
+  displayedResult = result;
   const rb = $('rightbar');
   if(!result){
     rb.innerHTML = '<div class="empty"><div class="glyph">📊</div>运行开始后显示<br/>用量统计 · 产物预览 · trace</div>';
@@ -1115,25 +1264,44 @@ function editWorkspace(){
 /* ================= 内嵌终端（WebSocket 直连，持久 cwd 会话） ================= */
 let termWS = null, termBusy = false, termHistory = [], termHistIdx = 0;
 let termX = null;  // xterm 实例（CDN 加载成功后启用；失败降级 DOM 输出）
+let termXLoading = null;
 const TERM_HIST_KEY = 'agent_panel_term_history';
+const termAssets = new Map();
 
-function loadScriptOnce(src) {
-  return new Promise((resolve, reject) => {
-    if (document.querySelector(`script[src="${src}"]`)) return resolve();
-    const s = document.createElement('script');
-    s.src = src; s.onload = resolve; s.onerror = () => reject(new Error('load ' + src));
-    document.head.appendChild(s);
+function loadTerminalAsset(src, stylesheet = false) {
+  if (termAssets.has(src)) return termAssets.get(src);
+  const pending = new Promise((resolve, reject) => {
+    const el = document.createElement(stylesheet ? 'link' : 'script');
+    if(stylesheet){ el.rel = 'stylesheet'; el.href = src; }
+    else { el.src = src; }
+    const timer = setTimeout(() => finish(new Error('timeout ' + src)), 5000);
+    function finish(error){
+      clearTimeout(timer);
+      el.onload = el.onerror = null;
+      if(error){ el.remove(); reject(error); } else resolve();
+    }
+    el.onload = () => finish();
+    el.onerror = () => finish(new Error('load ' + src));
+    document.head.appendChild(el);
   });
+  termAssets.set(src, pending);
+  return pending;
 }
 
 async function ensureXterm(){
   if (termX) return true;
   if (window.__xtermFailed) return false;
+  if (termXLoading) return termXLoading;
+  termXLoading = (async () => {
+  let candidate = null;
   try{
-    await loadScriptOnce('https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.min.js');
-    await loadScriptOnce('https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.min.js');
+    await Promise.all([
+      loadTerminalAsset('https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.css', true),
+      loadTerminalAsset('https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.min.js'),
+      loadTerminalAsset('https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.min.js'),
+    ]);
     if (!window.Terminal) throw new Error('no Terminal');
-    termX = new window.Terminal({
+    candidate = new window.Terminal({
       convertEol: true, fontSize: 12.5,
       fontFamily: "'JetBrains Mono','Cascadia Code',monospace",
       theme: { background: '#080a0f', foreground: '#c9d4e3',
@@ -1142,19 +1310,32 @@ async function ensureXterm(){
       scrollback: 5000, disableStdin: true,
     });
     const fit = new window.FitAddon.FitAddon();
-    termX.loadAddon(fit);
-    termX.open($('term-xterm'));
-    fit.fit();
+    candidate.loadAddon(fit);
     $('term-view').classList.add('xterm-on');
-    window.addEventListener('resize', () => { try{ fit.fit(); }catch(e){} });
-    termX.writeln('\x1b[90m[终端就绪 · 输入命令直接执行]\x1b[0m');
+    candidate.open($('term-xterm'));
+    const fitVisible = () => {
+      if($('term-xterm').clientWidth && $('term-xterm').clientHeight){
+        try{ fit.fit(); }catch(e){}
+      }
+    };
+    fitVisible();
+    new ResizeObserver(fitVisible).observe($('term-xterm'));
+    termX = candidate;
+    // WS 可能先于资源就绪：迁移已有输出，避免切换渲染器后丢失连接信息和命令结果。
+    for(const span of $('term-out').children) termWrite(span.textContent, span.className);
+    $('term-out').innerHTML = '';
     return true;
   }catch(e){
+    if(candidate){ try{ candidate.dispose(); }catch(_){} }
+    termX = null;
     window.__xtermFailed = true;
+    $('term-view').classList.remove('xterm-on');
     $('term-xterm').classList.add('fallback');
     termPrint('[xterm 不可用，降级纯文本输出]\n', 'info');
     return false;
   }
+  })();
+  return termXLoading;
 }
 function termWrite(text, cls){
   if (termX){
@@ -1176,7 +1357,8 @@ function switchView(v){
   $('vt-terminal').classList.toggle('active', isTerm);
   if(isTerm){
     termConnect();
-    ensureXterm().then(() => { if(!termX) $('term-out').classList.remove('fallback'); $('term-in').focus(); });
+    $('term-in').focus();
+    ensureXterm();
   }
 }
 
@@ -1221,8 +1403,8 @@ function termPrint(text, cls){
   out.scrollTop = out.scrollHeight;
 }
 function termClear(){
-  if (termX){ termX.clear(); return; }
   $('term-out').innerHTML = '';
+  if (termX) termX.reset();
 }
 
 function termRun(){
@@ -1270,8 +1452,6 @@ function termConfirm(m){
 function termInterrupt(){
   if(termWS && termWS.readyState === 1) termWS.send(JSON.stringify({ type:'interrupt' }));
 }
-function termClear(){ $('term-out').innerHTML = ''; }
-
 $('term-in').addEventListener('keydown', e => {
   if(e.key === 'Enter'){ e.preventDefault(); termRun(); return; }
   if(e.key === 'ArrowUp'){

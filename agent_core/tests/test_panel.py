@@ -1,7 +1,11 @@
 """Agent 面板与运行事件持久化测试。"""
 import base64
 import json
+import os
+import shutil
 import sys
+import threading
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -218,6 +222,52 @@ def test_terminal_ws_bad_cd_reports_error(client, monkeypatch):
         assert msgs[-1]["code"] == 1
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows shell/encoding integration")
+@pytest.mark.parametrize("shell", [None, "pwsh.exe", "powershell.exe", "cmd.exe"])
+def test_terminal_windows_unicode_and_actual_shell(client, monkeypatch, shell):
+    """真实 shell + WebSocket：中文文件、中文 stdout/stderr、shell 覆盖和退出码。"""
+    if shell and not shutil.which(shell):
+        pytest.skip(f"{shell} unavailable")
+    monkeypatch.setenv("AGENT_API_KEY", "k1")
+    if shell:
+        monkeypatch.setenv("AGENT_TERMINAL_SHELL", shell)
+    else:
+        monkeypatch.delenv("AGENT_TERMINAL_SHELL", raising=False)
+    filename = "中文文件名.md"
+    (service._workspace_path() / filename).write_text("测试", encoding="utf-8")
+    with client.websocket_connect("/agent/terminal?api_key=k1") as ws:
+        ready = ws.receive_json()
+        actual_shell = Path(ready["shell"]).stem.lower()
+        if shell:
+            assert actual_shell == Path(shell).stem.lower()
+        else:
+            assert actual_shell in {"pwsh", "powershell"}
+
+        def run(command):
+            ws.send_json({"type": "run", "cmd": command})
+            output = ""
+            while True:
+                message = ws.receive_json()
+                if message["type"] == "output":
+                    output += message["data"]
+                elif message["type"] == "done":
+                    return output, message["code"]
+                elif message["type"] in {"error", "confirm"}:
+                    pytest.fail(str(message))
+
+        output, code = run("dir" if actual_shell == "cmd" else "ls")
+        assert code == 0 and filename in output and "\ufffd" not in output
+        output, code = run("echo 中文输出")
+        assert code == 0 and "中文输出" in output and "\ufffd" not in output
+        output, code = run('python -c "print(chr(20013)+chr(25991))"')
+        assert code == 0 and "中文" in output and "\ufffd" not in output
+        output, code = run("不存在的命令_terminal_test")
+        assert code != 0 and "不存在的命令_terminal_test" in output
+        assert "\ufffd" not in output and "#< CLIXML" not in output
+        _, code = run("exit 7")
+        assert code == 7
+
+
 def test_terminal_ws_ping(client, monkeypatch):
     monkeypatch.setenv("AGENT_API_KEY", "k1")
     with client.websocket_connect("/agent/terminal?api_key=k1") as ws:
@@ -431,6 +481,52 @@ def test_persisted_session_endpoints(client):
     assert client.get(f"/agent/persisted-sessions/{sid}").status_code == 404
 
 
+def test_delete_session_preserves_runs_and_rejects_late_save(client):
+    sid = client.post("/agent/session/persist").json()["session_id"]
+    other = client.post("/agent/session/persist").json()["session_id"]
+    with client.stream("POST", "/agent/run/stream",
+                       json={"prompt": "保留执行记录", "session_id": sid}) as response:
+        "".join(response.iter_text())
+    stale = service._load_session(sid)
+    runs = client.get("/agent/runs").json()["runs"]
+    artifact = Path(runs[0]["cwd"]) / "keep.txt"
+    artifact.write_text("保留产物", encoding="utf-8")
+    assert client.delete(f"/agent/persisted-sessions/{sid}").status_code == 200
+    with pytest.raises(service.HTTPException) as exc:
+        service._save_session(stale, require_existing=True)
+    assert exc.value.status_code == 404
+    assert client.get(f"/agent/persisted-sessions/{sid}").status_code == 404
+    assert client.get(f"/agent/persisted-sessions/{other}").status_code == 200
+    assert client.get("/agent/runs").json()["runs"] == runs
+    assert artifact.read_text(encoding="utf-8") == "保留产物"
+
+
+def test_deleted_session_not_recreated_by_running_async_task(client, monkeypatch):
+    sid = client.post("/agent/session/persist").json()["session_id"]
+    started, finish = threading.Event(), threading.Event()
+    original = client.kernel.run_oneshot
+
+    def delayed(*args, **kwargs):
+        started.set()
+        assert finish.wait(5)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(client.kernel, "run_oneshot", delayed)
+    response = client.post("/agent/run/async", json={"prompt": "正在执行", "session_id": sid})
+    rid = response.json()["run_id"]
+    try:
+        assert started.wait(3)
+        assert client.delete(f"/agent/persisted-sessions/{sid}").status_code == 200
+    finally:
+        finish.set()
+    deadline = time.monotonic() + 5
+    while not service._ASYNC_RUNS[rid]["task"].done() and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert service._ASYNC_RUNS[rid]["task"].done()
+    assert client.get(f"/agent/run/{rid}").json()["status"] == "completed"
+    assert client.get(f"/agent/persisted-sessions/{sid}").status_code == 404
+
+
 def test_persisted_session_rejects_bad_sid(client):
     assert client.get("/agent/persisted-sessions/../evil").status_code in (400, 404)
     assert client.get("/agent/persisted-sessions/ZZZ").status_code in (400, 404)
@@ -453,6 +549,76 @@ def test_run_stream_with_session_persists_turn(client, monkeypatch):
     # run meta 也带 session_id（回放端定位）
     runs = client.get("/agent/runs").json()["runs"]
     assert any(r.get("session_id") == sid for r in runs)
+
+
+@pytest.mark.parametrize("fails", [False, True])
+def test_planning_session_context_model_and_persistence(client, monkeypatch, fails):
+    sid = client.post("/agent/session/persist").json()["session_id"]
+    with client.stream("POST", "/agent/run/stream",
+                       json={"prompt": "此前需求", "session_id": sid}) as response:
+        "".join(response.iter_text())
+    seen = {}
+
+    def kernel_factory(config):
+        seen["planning"] = config.planning_enabled
+        return client.kernel
+
+    original = client.kernel.run_oneshot
+
+    def run(prompt, persona, cwd, context_memory="", *args, **kwargs):
+        seen.update(prompt=prompt, model=persona.model, context=context_memory)
+        if fails:
+            raise RuntimeError("fixture planner failure")
+        return original(prompt, persona, cwd, context_memory, *args, **kwargs)
+
+    monkeypatch.setattr(service, "AgentKernel", kernel_factory)
+    monkeypatch.setattr(client.kernel, "run_oneshot", run)
+    response = client.post("/agent/run/async", json={"prompt": "继续制定并执行计划",
+        "planning_enabled": True, "session_id": sid, "model": "test-model",
+        "context_memory": "额外要求"})
+    assert response.status_code == 202
+    rid = response.json()["run_id"]
+    deadline = time.monotonic() + 5
+    turns = []
+    while time.monotonic() < deadline:
+        turns = client.get(f"/agent/persisted-sessions/{sid}").json()["turns"]
+        if len(turns) == 2:
+            break
+        time.sleep(0.02)
+    assert len(turns) == 2
+    assert seen["planning"] and seen["model"] == "test-model"
+    assert "此前需求" in seen["context"] and "额外要求" in seen["context"]
+    assert turns[-1]["run_id"] == rid
+    assert turns[-1]["status"] == ("failed" if fails else "completed")
+    if not fails:
+        assert turns[-1]["output"] == "最终输出"
+    assert any(r.get("run_id") == rid and r.get("session_id") == sid
+               for r in client.get("/agent/runs").json()["runs"])
+
+
+def test_async_missing_session_rejected_before_execution(client):
+    response = client.post("/agent/run/async", json={"prompt": "不得执行",
+        "session_id": "012345abcdef", "planning_enabled": True})
+    assert response.status_code == 404
+    assert not client.kernel.oneshot_calls
+
+
+def test_stream_model_override_preserves_cached_persona(client, monkeypatch):
+    original = client.kernel.stream
+    cached = service.resolve_persona("executor")
+    previous_model = cached.model
+    seen = []
+
+    def stream(prompt, persona, *args, **kwargs):
+        seen.append(persona.model)
+        return original(prompt, persona, *args, **kwargs)
+
+    monkeypatch.setattr(client.kernel, "stream", stream)
+    with client.stream("POST", "/agent/run/stream",
+                       json={"prompt": "指定模型", "model": "test-model"}) as response:
+        "".join(response.iter_text())
+    assert seen == ["test-model"]
+    assert cached.model == previous_model
 
 
 def test_run_stream_session_history_injected(client, monkeypatch):

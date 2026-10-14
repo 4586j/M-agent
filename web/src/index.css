@@ -1,3 +1,105 @@
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
+
+@layer base {
+  :root {
+    --bg-canvas: #09090b;
+    --bg-surface: rgba(24, 24, 27, 0.6);
+    --border-hairline: rgba(255, 255, 255, 0.07);
+    --accent-mint: #10b981;
+    --accent-indigo: #6366f1;
+  }
+
+  body {
+    background-color: #09090b;
+    color: #e4e4e7;
+    font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    text-rendering: optimizeLegibility;
+  }
+}
+
+/* 微妙科技感网格/点阵底纹 */
+.bg-dot-grid {
+  background-image: radial-gradient(rgba(255, 255, 255, 0.05) 1px, transparent 1px);
+  background-size: 24px 24px;
+}
+
+/* 数字等宽排版（防止轮询数据跳变引起的微抖动） */
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}
+
+/* 现代暗黑极简滚动条 */
+.custom-scroll::-webkit-scrollbar {
+  width: 5px;
+  height: 5px;
+}
+.custom-scroll::-webkit-scrollbar-track {
+  background: transparent;
+}
+.custom-scroll::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.12);
+  border-radius: 9999px;
+}
+.custom-scroll::-webkit-scrollbar-thumb:hover {
+  background: rgba(16, 185, 129, 0.4);
+}
+
+/* 触感微交互按压反馈 */
+.btn-press {
+  transition: transform 0.12s cubic-bezier(0.16, 1, 0.3, 1), filter 0.12s ease;
+}
+.btn-press:active {
+  transform: scale(0.97);
+}
+
+/* Linear 风格微对比度聚光灯卡片 */
+.spotlight-card {
+  position: relative;
+  transition: transform 0.2s cubic-bezier(0.16, 1, 0.3, 1), box-shadow 0.2s cubic-bezier(0.16, 1, 0.3, 1), border-color 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+}
+.spotlight-card:hover {
+  border-color: rgba(16, 185, 129, 0.35);
+  box-shadow: 0 12px 30px -10px rgba(0, 0, 0, 0.5), 0 0 20px -5px rgba(16, 185, 129, 0.15);
+}
+
+/* 状态徽章暗黑适配（保留原类名契约，视觉渲染为半透明光晕胶囊） */
+.bg-amber-100 {
+  background-color: rgba(245, 158, 11, 0.12) !important;
+  color: #fbbf24 !important;
+  border-color: rgba(245, 158, 11, 0.25) !important;
+}
+.bg-mint-100 {
+  background-color: rgba(16, 185, 129, 0.12) !important;
+  color: #34d399 !important;
+  border-color: rgba(16, 185, 129, 0.25) !important;
+}
+.bg-rose-100 {
+  background-color: rgba(244, 63, 94, 0.12) !important;
+  color: #fb7185 !important;
+  border-color: rgba(244, 63, 94, 0.25) !important;
+}
+.bg-sky-100 {
+  background-color: rgba(14, 165, 233, 0.12) !important;
+  color: #38bdf8 !important;
+  border-color: rgba(14, 165, 233, 0.25) !important;
+}
+.bg-slate-100 {
+  background-color: rgba(148, 163, 184, 0.12) !important;
+  color: #94a3b8 !important;
+  border-color: rgba(148, 163, 184, 0.2) !important;
+}
+.bg-slate-200 {
+  background-color: rgba(148, 163, 184, 0.1) !important;
+  color: #71717a !important;
+  border-color: rgba(148, 163, 184, 0.15) !important;
+}
+.bg-zinc-200 {
+  background-color: rgba(113, 113, 122, 0.12) !important;
+  color: #a1a1aa !important;
+  border-color: rgba(113, 113, 122, 0.2) !important;
+}
+

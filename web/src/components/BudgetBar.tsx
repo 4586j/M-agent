@@ -13,16 +13,16 @@ function BudgetRow({ label, spent, limit }: {
   const pct = limit != null && limit > 0 ? Math.min(100, (spent / limit) * 100) : 0
   return (
     <div className="flex items-center gap-2 min-w-45" data-testid={`budget-${label}`}>
-      <span className="text-xs text-slate-500 shrink-0">{label}</span>
-      <div className="flex-1 h-1.5 rounded-full bg-slate-100 overflow-hidden">
+      <span className="text-xs text-zinc-400 font-medium shrink-0">{label}</span>
+      <div className="flex-1 h-1.5 rounded-full bg-zinc-800/90 overflow-hidden border border-white/[0.04]">
         {limit != null && (
           <div
-            className={`h-full rounded-full transition-all ${over ? 'bg-rose-500' : pct > 80 ? 'bg-amber-500' : 'bg-mint-500'}`}
+            className={`h-full rounded-full transition-all duration-300 ${over ? 'bg-rose-500 shadow-[0_0_8px_rgba(244,63,94,0.5)]' : pct > 80 ? 'bg-amber-400 shadow-[0_0_8px_rgba(251,191,36,0.5)]' : 'bg-emerald-400 shadow-[0_0_8px_rgba(52,211,153,0.4)]'}`}
             style={{ width: `${pct}%` }}
           />
         )}
       </div>
-      <span className={`text-xs font-mono shrink-0 ${over ? 'text-rose-600 font-semibold' : 'text-slate-600'}`}>
+      <span className={`text-xs font-mono tabular-nums shrink-0 ${over ? 'text-rose-400 font-semibold' : 'text-zinc-300'}`}>
         {fmtUsd(spent)} / {limit != null ? fmtUsd(limit) : '不限'}
       </span>
     </div>
@@ -63,36 +63,39 @@ export default function BudgetBar({ budget, onChange }: {
   }
 
   return (
-    <div className="bg-white rounded-2xl border border-mint-100 shadow-mint-sm p-4 mb-5">
+    <div className="bg-zinc-900/60 backdrop-blur-xl rounded-2xl border border-white/[0.07] shadow-[inset_0_1px_0_0_rgba(255,255,255,0.05)] p-4 mb-5">
       <div className="flex flex-wrap items-center gap-x-6 gap-y-2">
-        <span className="text-xs font-semibold text-slate-700 shrink-0">预算总闸</span>
+        <span className="text-xs font-semibold text-zinc-200 shrink-0 flex items-center gap-1.5">
+          <span className="w-1.5 h-1.5 rounded-full bg-emerald-400" />
+          预算总闸
+        </span>
         <BudgetRow label="全局" spent={budget.spent_total_usd} limit={budget.global_limit_usd} />
         <BudgetRow label="当日" spent={budget.spent_today_usd} limit={budget.daily_limit_usd} />
         <div className="ml-auto flex items-center gap-2">
-          {msg && <span className="text-xs text-rose-600">{msg}</span>}
+          {msg && <span className="text-xs text-rose-400 font-mono">{msg}</span>}
           {editing ? (
             <>
               <input
                 value={gLimit}
                 onChange={(e) => setGLimit(e.target.value)}
                 placeholder="全局上限 USD"
-                className="w-28 px-2 py-1 text-xs rounded-lg border border-mint-200/70 focus:outline-none focus:ring-2 focus:ring-mint-400"
+                className="w-28 px-2 py-1 text-xs font-mono rounded-lg border border-white/[0.1] bg-zinc-950/80 text-zinc-100 placeholder-zinc-500 focus:outline-none focus:ring-1 focus:ring-emerald-500/50"
               />
               <input
                 value={dLimit}
                 onChange={(e) => setDLimit(e.target.value)}
                 placeholder="每日上限 USD"
-                className="w-28 px-2 py-1 text-xs rounded-lg border border-mint-200/70 focus:outline-none focus:ring-2 focus:ring-mint-400"
+                className="w-28 px-2 py-1 text-xs font-mono rounded-lg border border-white/[0.1] bg-zinc-950/80 text-zinc-100 placeholder-zinc-500 focus:outline-none focus:ring-1 focus:ring-emerald-500/50"
               />
               <button
                 onClick={save}
-                className="px-2.5 py-1 text-xs rounded-lg bg-mint-600 text-white hover:bg-mint-700"
+                className="btn-press px-2.5 py-1 text-xs font-semibold rounded-lg bg-emerald-500 text-zinc-950 hover:bg-emerald-400 transition"
               >
                 保存
               </button>
               <button
                 onClick={() => setEditing(false)}
-                className="px-2 py-1 text-xs text-slate-500 hover:text-slate-700"
+                className="btn-press px-2 py-1 text-xs text-zinc-400 hover:text-zinc-200 transition"
               >
                 取消
               </button>
@@ -100,7 +103,7 @@ export default function BudgetBar({ budget, onChange }: {
           ) : (
             <button
               onClick={startEdit}
-              className="px-2.5 py-1 text-xs rounded-lg bg-mint-50 text-mint-700 hover:bg-mint-100"
+              className="btn-press px-2.5 py-1 text-xs font-medium rounded-lg bg-zinc-800/80 hover:bg-zinc-800 text-zinc-300 border border-white/[0.06] hover:border-emerald-500/30 transition"
             >
               调整上限
             </button>

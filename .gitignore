@@ -63,3 +63,6 @@ workspace/agent/orchestrator/runtime/.knowledge/
 .agent_policy.json
 web/test-results/
 web/playwright-report/
+.tmp/
+.codex/
+gemini-code-*.md

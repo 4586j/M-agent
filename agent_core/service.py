@@ -50,7 +50,7 @@ import subprocess
 import threading
 import time
 import uuid
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any, AsyncIterator
 
@@ -66,6 +66,7 @@ from agent_core.errors import humanize_sdk_error
 from agent_core.kernel import AgentEvent, AgentKernel
 from agent_core.persona import Persona, list_persona_names, load_persona_by_name, parse_subagents, strip_frontmatter
 from agent_core.run_history import RunHistoryStore, build_run_record
+from agent_core.terminal_shell import terminal_command, terminal_shell
 from agent_core.tools import load_mcp_servers, scan_skills, valid_memory_name
 
 logger = logging.getLogger(__name__)
@@ -479,6 +480,7 @@ def _make_event_sink(run_id: str):
 # 注入（复用内核既有通道），刷新/重启后对话不丢。
 
 _SESSIONS_DIR_LOCK = threading.Lock()
+_SESSION_WRITE_LOCK = threading.Lock()
 _SID_RE = re.compile(r"[0-9a-f]{12}")
 # 注入上下文的历史轮次预算：最近 8 轮，每轮输出截 1500 字符，总块 6000 字符
 _SESSION_HISTORY_TURNS = 8
@@ -513,11 +515,14 @@ def _load_session(sid: str) -> dict:
     return rec
 
 
-def _save_session(rec: dict) -> None:
+def _save_session(rec: dict, *, require_existing: bool = False) -> None:
     p = _session_path(rec["session_id"])
-    tmp = p.with_suffix(".tmp")
-    tmp.write_text(json.dumps(rec, ensure_ascii=False, indent=2), encoding="utf-8")
-    os.replace(tmp, p)
+    with _SESSION_WRITE_LOCK:
+        if require_existing and not p.exists():
+            raise HTTPException(status_code=404, detail="session not found")
+        tmp = p.with_suffix(".tmp")
+        tmp.write_text(json.dumps(rec, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(tmp, p)
 
 
 def _session_history_block(rec: dict) -> str:
@@ -973,6 +978,8 @@ def create_runs_router() -> APIRouter:
         带 session_id 时：历史轮次注入 context_memory（连续对话），本轮
         prompt/output 落盘会话文件（重启后可回看续聊）。"""
         persona = resolve_persona(req.persona or _DEFAULT_PERSONA)
+        if req.model:
+            persona = replace(persona, model=req.model)
         cwd = _prepare_cwd(req.cwd, tag="run")
         kernel = get_kernel()
         # 持久会话：先校验/加载（404 早失败），历史并入上下文
@@ -1042,7 +1049,7 @@ def create_runs_router() -> APIRouter:
                     if not session_rec.get("title"):
                         session_rec["title"] = req.prompt[:40]
                     try:
-                        _save_session(session_rec)
+                        _save_session(session_rec, require_existing=True)
                     except HTTPException:
                         pass  # sid 合法性已在入口校验；落盘失败不影响本轮结果
 
@@ -1055,7 +1062,12 @@ def create_runs_router() -> APIRouter:
         用 GET /agent/run/{run_id} 查询状态与结果；DELETE 触发协作式取消
         （cancel_event 在消息边界生效，非强杀）。
         """
+        session_rec = _load_session(req.session_id) if req.session_id else None
+        history_ctx = _session_history_block(session_rec) if session_rec else ""
+        context = "\n\n".join(x for x in (history_ctx, req.context_memory or "") if x)
         persona = resolve_persona(req.persona or _DEFAULT_PERSONA)
+        if req.model:
+            persona = replace(persona, model=req.model)
         cwd = _prepare_cwd(req.cwd, tag="run")
         if req.planning_enabled:
             # 请求级规划开关：replace 出独立 config，避免污染共享内核
@@ -1079,6 +1091,7 @@ def create_runs_router() -> APIRouter:
         _write_run_meta(run_id, cwd=cwd,
                         prompt=req.prompt[:2000], persona=persona.name,
                         model=req.model or "", status="running",
+                        session_id=req.session_id or "",
                         started_at=round(time.time(), 3))
         sink = _make_event_sink(run_id)
 
@@ -1086,7 +1099,7 @@ def create_runs_router() -> APIRouter:
             try:
                 result = await asyncio.to_thread(
                     kernel.run_oneshot, prompt_text, persona, cwd,
-                    req.context_memory or "", cancel_event,
+                    context, cancel_event,
                     run_id=run_id, event_sink=sink)
                 d = asdict(result)
                 entry["result"] = d
@@ -1100,6 +1113,25 @@ def create_runs_router() -> APIRouter:
                 error_type, message, hint = humanize_sdk_error(e)
                 entry["error"] = {"code": error_type, "message": message,
                                   "hint": hint, "raw": str(e)}
+                _write_run_meta(run_id, status="failed", error=message)
+            finally:
+                if session_rec is not None:
+                    try:
+                        rec = _load_session(req.session_id)
+                        rec.setdefault("turns", []).append({
+                            "at": round(time.time(), 3), "prompt": req.prompt,
+                            "output": str((entry.get("result") or {}).get("output") or ""),
+                            "status": entry["status"], "run_id": run_id,
+                        })
+                        rec["updated_at"] = round(time.time(), 3)
+                        if not rec.get("title"):
+                            rec["title"] = req.prompt[:40]
+                        _save_session(rec, require_existing=True)
+                    except HTTPException as exc:
+                        if exc.status_code != 404:
+                            logger.exception("保存计划任务会话失败: %s", req.session_id)
+                    except Exception:
+                        logger.exception("保存计划任务会话失败: %s", req.session_id)
 
         entry["task"] = asyncio.create_task(_worker())
         return JSONResponse(status_code=202,
@@ -1157,8 +1189,7 @@ def create_terminal_router() -> APIRouter:
         cfg = get_config()
         ws_root = _workspace_path()
         cwd = str(ws_root)
-        shell = os.environ.get("AGENT_TERMINAL_SHELL") or (
-            "cmd.exe" if os.name == "nt" else (os.environ.get("SHELL") or "/bin/sh"))
+        shell = terminal_shell()
         session = {"cwd": cwd, "proc": None, "outside_allowed": False}
         await ws.send_json({"type": "ready", "cwd": cwd, "shell": shell,
                             "workspace": str(ws_root)})
@@ -1229,13 +1260,16 @@ def create_terminal_router() -> APIRouter:
 
             loop = asyncio.get_running_loop()
             queue: asyncio.Queue = asyncio.Queue()
-            kwargs: dict = dict(shell=True, cwd=session["cwd"], stdout=subprocess.PIPE,
+            argv, encoding = terminal_command(shell, raw)
+            child_env = dict(os.environ, PYTHONIOENCODING=encoding)
+            kwargs: dict = dict(shell=False, cwd=session["cwd"], stdout=subprocess.PIPE,
                                 stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
-                                text=True, encoding="utf-8", errors="replace", bufsize=1)
+                                text=True, encoding=encoding, errors="replace", bufsize=1,
+                                env=child_env)
             if os.name == "nt":
                 kwargs["creationflags"] = 0x08000000  # CREATE_NO_WINDOW
             try:
-                proc = subprocess.Popen(raw, **kwargs)
+                proc = subprocess.Popen(argv, **kwargs)
             except Exception as e:  # noqa: BLE001
                 await ws.send_json({"type": "error", "message": f"启动失败: {e}"})
                 await ws.send_json({"type": "done", "code": 1, "cwd": session["cwd"]})
@@ -1544,9 +1578,10 @@ def create_sessions_router() -> APIRouter:
     def agent_persisted_session_delete(session_id: str) -> dict:
         """删除持久会话文件。"""
         p = _session_path(session_id)
-        if not p.exists():
-            raise HTTPException(status_code=404, detail="session not found")
-        p.unlink()
+        with _SESSION_WRITE_LOCK:
+            if not p.exists():
+                raise HTTPException(status_code=404, detail="session not found")
+            p.unlink()
         return {"status": "deleted", "session_id": session_id}
 
     return router

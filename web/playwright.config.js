@@ -14,6 +14,8 @@ export default defineConfig({
   },
   webServer: {
     command: 'python -m agent_core.service --port 8100',
+    // 浏览器回归在同一分钟内反复加载页面/API；仅提高测试服务的额度。
+    env: { AGENT_RATE_LIMIT_PER_MINUTE: '600' },
     url: 'http://127.0.0.1:8100/health',
     reuseExistingServer: true,
     timeout: 20_000,

@@ -1,0 +1,3 @@
+{"model": "ark-code-latest", "status": "done", "output": "ARK_BUDGET_OK", "cost_usd": 0.00248, "usage": {"input_tokens": 331, "output_tokens": 33, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0}, "reservation_observed": [0.05], "reserved_after": 0.0, "replay_idempotent": true, "insufficient_budget_rejected": true}
+.
+1 passed in 3.53s

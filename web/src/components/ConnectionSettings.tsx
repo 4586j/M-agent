@@ -27,16 +27,16 @@ function OperatorField() {
     } catch { /* 隐私模式等存储不可用：静默 */ }
   }
   return (
-    <div className="border-t border-slate-100 mt-2 pt-2">
+    <div className="border-t border-white/[0.07] mt-3 pt-3">
       <div className="flex items-center gap-1.5">
         <input
           value={name}
           onChange={(e) => setName(e.target.value)}
           onBlur={save}
           placeholder="操作者（审计/审批归属，如 zhang）"
-          className="flex-1 min-w-0 px-2 py-1 text-sm border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-mint-400"
+          className="flex-1 min-w-0 px-2.5 py-1.5 text-xs bg-zinc-900 border border-white/[0.08] text-zinc-200 placeholder-zinc-500 rounded-lg focus:outline-none focus:ring-1 focus:ring-emerald-500/50"
         />
-        {saved && <span className="text-xs text-mint-600 shrink-0">已保存</span>}
+        {saved && <span className="text-xs text-emerald-400 shrink-0 font-mono">已保存</span>}
       </div>
     </div>
   )
@@ -93,27 +93,30 @@ export default function ConnectionSettings() {
         onClick={() => setOpen(!open)}
         aria-label="连接设置"
         title={`连接设置${active ? `（当前：${active.name}${hasKey ? '，已配置 Key' : ''}）` : ''}`}
-        className={`w-8 h-8 rounded-lg flex items-center justify-center text-sm border transition ${
+        className={`btn-press w-8 h-8 rounded-lg flex items-center justify-center text-sm border transition shadow-sm ${
           open
-            ? 'bg-mint-100 border-mint-300 text-mint-700'
+            ? 'bg-emerald-500/20 border-emerald-500/40 text-emerald-300 shadow-[0_0_12px_rgba(16,185,129,0.3)]'
             : hasKey
-              ? 'bg-mint-50 border-mint-200 text-mint-600 hover:bg-mint-100'
-              : 'bg-white border-slate-200 text-slate-400 hover:text-slate-600 hover:border-mint-300'
+              ? 'bg-emerald-500/10 border-emerald-500/25 text-emerald-400 hover:bg-emerald-500/20'
+              : 'bg-zinc-900 border-white/[0.08] text-zinc-400 hover:text-zinc-200 hover:border-emerald-500/30'
         }`}
       >
         🔑
       </button>
       {open && (
-        <div className="absolute right-0 top-full mt-2 w-[26rem] bg-white rounded-xl shadow-mint-card border border-mint-100 p-3 z-50">
-          <div className="text-xs text-slate-500 mb-1">已保存连接（点击切换）</div>
-          <ul className="space-y-1 max-h-52 overflow-y-auto">
+        <div className="absolute right-0 top-full mt-2 w-[26rem] bg-zinc-950/95 backdrop-blur-2xl rounded-2xl shadow-2xl border border-white/[0.1] p-4 z-50 text-zinc-200">
+          <div className="text-xs text-zinc-400 mb-2 font-mono flex items-center justify-between">
+            <span>已保存连接（点击切换）</span>
+            <span className="text-[11px] text-zinc-500">{conns.length} 个配置</span>
+          </div>
+          <ul className="space-y-1.5 max-h-52 overflow-y-auto custom-scroll">
             {conns.map((c) => {
               const on = c.id === activeId
               return (
                 <li
                   key={c.id}
-                  className={`flex items-center gap-1 rounded-lg border px-2 py-1.5 transition ${
-                    on ? 'border-mint-300 bg-mint-50' : 'border-slate-200 bg-white'
+                  className={`flex items-center gap-1.5 rounded-xl border px-3 py-2 transition ${
+                    on ? 'border-emerald-500/30 bg-emerald-500/10' : 'border-white/[0.06] bg-zinc-900/60 hover:bg-zinc-900/90'
                   }`}
                 >
                   <button
@@ -122,17 +125,17 @@ export default function ConnectionSettings() {
                     title="切换到此连接"
                   >
                     <span className="flex items-center gap-1.5">
-                      <span className={`w-1.5 h-1.5 rounded-full ${on ? 'bg-mint-500' : 'bg-slate-300'}`} />
-                      <span className="text-sm font-medium text-slate-700 truncate">{c.name}</span>
-                      {c.apiKey && <span className="text-xs text-mint-500" title="已配置 Key">🔑</span>}
+                      <span className={`w-1.5 h-1.5 rounded-full ${on ? 'bg-emerald-400 animate-pulse' : 'bg-zinc-600'}`} />
+                      <span className="text-sm font-medium text-zinc-200 truncate">{c.name}</span>
+                      {c.apiKey && <span className="text-xs text-emerald-400" title="已配置 Key">🔑</span>}
                     </span>
-                    <span className="block text-xs text-slate-400 font-mono truncate">
+                    <span className="block text-xs text-zinc-400 font-mono truncate mt-0.5">
                       {c.baseUrl || '相对路径（本机/代理）'}
                     </span>
                   </button>
                   <button
                     onClick={() => startEdit(c, false)}
-                    className="px-2 py-1 text-xs text-slate-500 hover:text-mint-700 hover:bg-mint-50 rounded"
+                    className="btn-press px-2 py-1 text-xs text-zinc-400 hover:text-emerald-400 hover:bg-zinc-800 rounded font-mono transition"
                   >
                     编辑
                   </button>
@@ -140,7 +143,7 @@ export default function ConnectionSettings() {
                     onClick={() => {
                       if (window.confirm(`删除连接「${c.name}」？`)) deleteConnection(c.id)
                     }}
-                    className="px-1.5 py-1 text-xs text-slate-400 hover:text-rose-600 hover:bg-rose-50 rounded"
+                    className="btn-press px-1.5 py-1 text-xs text-zinc-500 hover:text-rose-400 hover:bg-rose-500/10 rounded transition"
                     aria-label={`删除 ${c.name}`}
                   >
                     ✕
@@ -153,7 +156,7 @@ export default function ConnectionSettings() {
           {!draft && (
             <button
               onClick={() => startEdit(createConnection('', '', ''), true)}
-              className="mt-2 w-full py-1.5 text-xs rounded-lg border border-dashed border-slate-300 text-slate-500 hover:border-mint-300 hover:text-mint-700 transition"
+              className="mt-2.5 w-full py-1.5 text-xs rounded-xl border border-dashed border-white/[0.1] text-zinc-400 hover:border-emerald-500/40 hover:text-emerald-400 transition font-mono"
             >
               ＋ 新增连接
             </button>
@@ -164,48 +167,48 @@ export default function ConnectionSettings() {
           <OperatorField />
 
           {draft && (
-            <div className="border-t border-slate-100 mt-2 pt-2 space-y-1.5">
+            <div className="border-t border-white/[0.07] mt-3 pt-3 space-y-2">
               <input
                 value={draft.name}
                 onChange={(e) => setDraft({ ...draft, name: e.target.value })}
                 placeholder="名称（如 本机-8000）"
-                className="w-full px-2 py-1 text-sm border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-mint-400"
+                className="w-full px-2.5 py-1.5 text-xs bg-zinc-900 border border-white/[0.08] text-zinc-200 placeholder-zinc-500 rounded-lg focus:outline-none focus:ring-1 focus:ring-emerald-500/50"
               />
               <input
                 value={draft.baseUrl}
                 onChange={(e) => setDraft({ ...draft, baseUrl: e.target.value })}
                 placeholder="地址（如 http://127.0.0.1:7001；留空 = 相对路径）"
-                className="w-full px-2 py-1 text-sm border border-slate-300 rounded-lg font-mono focus:outline-none focus:ring-2 focus:ring-mint-400"
+                className="w-full px-2.5 py-1.5 text-xs bg-zinc-900 border border-white/[0.08] text-zinc-200 placeholder-zinc-500 rounded-lg font-mono focus:outline-none focus:ring-1 focus:ring-emerald-500/50"
               />
               <input
                 type="password"
                 value={draft.apiKey}
                 onChange={(e) => setDraft({ ...draft, apiKey: e.target.value })}
                 placeholder="API Key（brain 的 ORCH_API_KEY；留空 = 无鉴权）"
-                className="w-full px-2 py-1 text-sm border border-slate-300 rounded-lg font-mono focus:outline-none focus:ring-2 focus:ring-mint-400"
+                className="w-full px-2.5 py-1.5 text-xs bg-zinc-900 border border-white/[0.08] text-zinc-200 placeholder-zinc-500 rounded-lg font-mono focus:outline-none focus:ring-1 focus:ring-emerald-500/50"
               />
-              <div className="flex items-center gap-2">
+              <div className="flex items-center gap-2 pt-1">
                 <button
                   onClick={saveDraft}
-                  className="px-3 py-1.5 text-xs rounded-lg bg-mint-600 text-white hover:bg-mint-500 font-semibold transition"
+                  className="btn-press px-3.5 py-1.5 text-xs rounded-lg bg-emerald-500 text-zinc-950 hover:bg-emerald-400 font-semibold transition"
                 >
                   {isNew ? '保存并切换' : '保存'}
                 </button>
                 <button
                   onClick={() => { setDraft(null); setIsNew(false); setTestMsg(null) }}
-                  className="px-3 py-1.5 text-xs rounded-lg border border-slate-200 text-slate-500 hover:bg-slate-50 transition"
+                  className="btn-press px-3 py-1.5 text-xs rounded-lg border border-white/[0.08] text-zinc-400 hover:bg-zinc-800 transition"
                 >
                   取消
                 </button>
                 <button
                   onClick={runTest}
                   disabled={testing}
-                  className="px-3 py-1.5 text-xs rounded-lg border border-sky-200 text-sky-600 hover:bg-sky-50 transition disabled:opacity-50"
+                  className="btn-press px-3 py-1.5 text-xs rounded-lg border border-sky-500/30 text-sky-400 hover:bg-sky-500/10 transition disabled:opacity-50"
                 >
                   {testing ? '测试中…' : '测试连接'}
                 </button>
                 {testMsg && (
-                  <span className={`text-xs ${testMsg.ok ? 'text-mint-700' : 'text-rose-600'}`}>
+                  <span className={`text-xs font-mono ml-auto ${testMsg.ok ? 'text-emerald-400' : 'text-rose-400'}`}>
                     {testMsg.text}
                   </span>
                 )}

@@ -24,15 +24,16 @@ export default function Memory() {
   return (
     <div>
       {/* 分段选择器 */}
-      <div className="inline-flex p-1 bg-mint-50/70 border border-mint-200/50 rounded-xl mb-5">
+      <div className="inline-flex p-1 bg-zinc-950/80 border border-white/[0.08] rounded-2xl mb-6 shadow-inner">
         {TABS.map((t) => (
           <button
             key={t.key}
+            type="button"
             onClick={() => setTab(t.key)}
-            className={`px-4 py-1.5 text-sm rounded-lg transition ${
+            className={`btn-press px-4 py-2 text-xs rounded-xl font-medium transition duration-150 ${
               tab === t.key
-                ? 'bg-white shadow-mint-sm border border-mint-200/60 font-semibold text-mint-700'
-                : 'font-medium text-slate-600 hover:text-mint-700'
+                ? 'bg-zinc-800 text-emerald-400 shadow-sm border border-white/[0.08] font-semibold'
+                : 'text-zinc-400 hover:text-zinc-200 hover:bg-zinc-900/50'
             }`}
           >
             {t.label}
@@ -102,86 +103,89 @@ function KnowledgeTab() {
 
   return (
     <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-      <section className="bg-white rounded-lg shadow p-4">
-        <h3 className="text-base font-semibold mb-1">上传文档</h3>
-        <p className="text-xs text-slate-400 mb-3">
+      <section className="bg-zinc-900/40 backdrop-blur-xl rounded-2xl border border-white/[0.07] shadow-[inset_0_1px_0_0_rgba(255,255,255,0.05)] p-5">
+        <h3 className="text-sm font-semibold text-zinc-100 mb-1">上传文档</h3>
+        <p className="text-xs text-zinc-400 mb-3">
           项目规范 / API 文档 / 运维手册等确定性资料。派发时自动检索相关片段注入任务上下文（空库零影响）。
         </p>
         <input
           value={title}
           onChange={(e) => setTitle(e.target.value)}
           placeholder="文档标题"
-          className="w-full px-2 py-1 text-sm border border-slate-300 rounded mb-2"
+          className="w-full px-3 py-2 text-xs border border-white/[0.08] rounded-xl bg-zinc-950 text-zinc-100 placeholder:text-zinc-600 focus:outline-none focus:border-emerald-500/40 mb-2.5 font-mono"
         />
         <textarea
           value={content}
           onChange={(e) => setContent(e.target.value)}
           rows={8}
           placeholder="粘贴文档正文（Markdown/纯文本均可，按段落自动切块）"
-          className="w-full px-2 py-1 text-sm border border-slate-300 rounded font-mono"
+          className="w-full px-3 py-2 text-xs border border-white/[0.08] rounded-xl bg-zinc-950 text-zinc-100 placeholder:text-zinc-600 focus:outline-none focus:border-emerald-500/40 font-mono resize-y"
         />
-        <div className="flex items-center gap-2 mt-2">
+        <div className="flex items-center gap-3 mt-3">
           <button
+            type="button"
             onClick={upload}
             disabled={busy || !content.trim()}
-            className="px-4 py-1.5 text-sm rounded-lg bg-mint-600 text-white hover:bg-mint-500 font-semibold disabled:opacity-40"
+            className="px-5 py-1.5 text-xs rounded-xl bg-emerald-500 hover:bg-emerald-400 text-zinc-950 font-semibold disabled:opacity-40 transition shadow-[0_0_15px_rgba(16,185,129,0.3)]"
           >
             {busy ? '上传中…' : '上传文档'}
           </button>
-          {msg && <span className="text-xs text-slate-500">{msg}</span>}
+          {msg && <span className="text-xs text-emerald-400 font-mono">{msg}</span>}
         </div>
       </section>
 
-      <section className="bg-white rounded-lg shadow p-4">
-        <h3 className="text-base font-semibold mb-3">文档（{docs.length}）与检索预览</h3>
-        <div className="flex items-center gap-1.5 mb-3">
+      <section className="bg-zinc-900/40 backdrop-blur-xl rounded-2xl border border-white/[0.07] shadow-[inset_0_1px_0_0_rgba(255,255,255,0.05)] p-5">
+        <h3 className="text-sm font-semibold text-zinc-100 mb-3">文档（{docs.length}）与检索预览</h3>
+        <div className="flex items-center gap-2 mb-3">
           <input
             value={query}
             onChange={(e) => setQuery(e.target.value)}
             placeholder="输入查询，预览将被注入的片段…"
-            className="flex-1 px-2 py-1 text-sm border border-slate-300 rounded"
+            className="flex-1 px-3 py-1.5 text-xs border border-white/[0.08] rounded-xl bg-zinc-950 text-zinc-100 placeholder:text-zinc-600 focus:outline-none focus:border-emerald-500/40"
           />
           <button
+            type="button"
             onClick={search}
             disabled={searching || !query.trim()}
-            className="px-3 py-1 text-xs rounded bg-sky-600 text-white hover:bg-sky-700 disabled:opacity-40"
+            className="px-4 py-1.5 text-xs rounded-xl bg-indigo-500/20 text-indigo-300 hover:bg-indigo-500/30 border border-indigo-500/30 font-medium disabled:opacity-40 transition"
           >
             {searching ? '检索中…' : '检索'}
           </button>
         </div>
         {results && (
-          <div className="space-y-1.5 mb-3 max-h-52 overflow-y-auto">
+          <div className="space-y-2 mb-3 max-h-52 overflow-y-auto">
             {results.length === 0 && (
-              <div className="text-xs text-slate-400">没有命中片段</div>
+              <div className="text-xs text-zinc-500">没有命中片段</div>
             )}
             {results.map((r, i) => (
-              <div key={`${r.doc_id}-${i}`} className="border border-mint-100 rounded-lg px-2 py-1.5 bg-mint-50/40">
-                <div className="text-xs font-medium text-mint-700">{r.title}</div>
-                <div className="text-xs text-slate-600 line-clamp-3">{r.snippet}</div>
+              <div key={`${r.doc_id}-${i}`} className="border border-white/[0.06] rounded-xl px-3 py-2 bg-zinc-950/80">
+                <div className="text-xs font-medium text-emerald-400 font-mono">{r.title}</div>
+                <div className="text-xs text-zinc-400 line-clamp-3 mt-1">{r.snippet}</div>
               </div>
             ))}
           </div>
         )}
         {error && (
-          <div className="text-xs text-rose-600 bg-rose-50 border border-rose-200 rounded p-2 mb-2">
+          <div className="text-xs text-rose-400 bg-rose-500/10 border border-rose-500/20 rounded-xl p-3 mb-2">
             加载失败：{error}
           </div>
         )}
         {docs.length === 0 && !error ? (
-          <div className="text-slate-400 text-sm">知识库为空——上传第一份文档</div>
+          <div className="text-zinc-500 text-sm py-8 text-center">知识库为空——上传第一份文档</div>
         ) : (
-          <div className="space-y-1.5">
+          <div className="space-y-2 max-h-72 overflow-y-auto">
             {docs.map((d) => (
-              <div key={d.doc_id} className="flex items-center gap-2 border border-slate-100 rounded p-2">
+              <div key={d.doc_id} className="flex items-center gap-3 border border-white/[0.06] bg-zinc-950/50 hover:bg-zinc-800/40 rounded-xl p-2.5 transition">
                 <div className="min-w-0 flex-1">
-                  <div className="text-sm text-slate-700 truncate">{d.title}</div>
-                  <div className="text-xs text-slate-400">
+                  <div className="text-xs font-medium text-zinc-200 truncate">{d.title}</div>
+                  <div className="text-[11px] text-zinc-500 font-mono">
                     {d.chunk_count} 块 · {d.content_chars} 字 · 更新于 {timeAgo(d.updated_at)}
                   </div>
                 </div>
                 <button
+                  type="button"
                   onClick={() => { if (window.confirm(`删除文档「${d.title}」？`)) remove(d.doc_id, d.title) }}
-                  className="px-2 py-1 text-xs text-slate-400 hover:text-rose-600"
+                  className="px-2.5 py-1 text-xs text-zinc-400 hover:text-rose-400 transition"
                 >
                   删除
                 </button>
@@ -244,74 +248,135 @@ function CoreMemTab() {
 
   return (
     <div className="grid grid-cols-1 lg:grid-cols-3 gap-5">
-      <div className="bg-white rounded-2xl border border-mint-100 shadow-mint-card p-3">
-        <div className="flex items-center justify-between px-1 mb-2">
-          <span className="text-xs font-bold text-slate-400 uppercase tracking-wider">记忆列表</span>
-          <button onClick={() => { setCreating(true); setEditing(null); setNewName('') }}
-            className="text-xs text-mint-700 hover:underline font-medium">+ 新建</button>
+      <div className="bg-zinc-900/40 backdrop-blur-xl rounded-2xl border border-white/[0.07] shadow-[inset_0_1px_0_0_rgba(255,255,255,0.05)] p-3.5">
+        <div className="flex items-center justify-between px-1 mb-2.5">
+          <span className="text-xs font-bold text-zinc-400 uppercase tracking-wider">记忆列表</span>
+          <button
+            type="button"
+            onClick={() => { setCreating(true); setEditing(null); setNewName('') }}
+            className="text-xs text-emerald-400 hover:text-emerald-300 hover:underline font-medium"
+          >
+            + 新建
+          </button>
         </div>
-        {error && <div className="text-xs text-rose-600 px-1">{error}</div>}
+        {error && <div className="text-xs text-rose-400 px-1">{error}</div>}
         <div className="space-y-1">
           {memories.map((m) => (
-            <button key={m.name} onClick={() => { setSelected(m.name); setEditing(null) }}
-              className={`w-full text-left px-3 py-2 rounded-lg transition ${
-                current?.name === m.name ? 'bg-mint-50 border border-mint-200' : 'hover:bg-mint-50/50 border border-transparent'
-              }`}>
-              <div className="text-sm font-mono font-semibold text-slate-700">{m.name}</div>
-              <div className="text-xs text-slate-400 truncate">{(m.content || '').slice(0, 60) || '（空）'}</div>
+            <button
+              key={m.name}
+              type="button"
+              onClick={() => { setSelected(m.name); setEditing(null) }}
+              className={`w-full text-left px-3 py-2 rounded-xl transition duration-150 ${
+                current?.name === m.name
+                  ? 'bg-emerald-500/15 border border-emerald-500/30'
+                  : 'hover:bg-zinc-800/40 border border-transparent'
+              }`}
+            >
+              <div className="text-sm font-mono font-semibold text-zinc-200">{m.name}</div>
+              <div className="text-xs text-zinc-400 truncate">{(m.content || '').slice(0, 60) || '（空）'}</div>
             </button>
           ))}
           {memories.length === 0 && !error && (
-            <div className="text-xs text-slate-400 px-1 py-4 text-center">核心记忆为空——共识通过后会出现在这里</div>
+            <div className="text-xs text-zinc-500 px-1 py-6 text-center">核心记忆为空——共识通过后会出现在这里</div>
           )}
         </div>
       </div>
 
-      <div className="lg:col-span-2 bg-white rounded-2xl border border-mint-100 shadow-mint-card p-5">
+      <div className="lg:col-span-2 bg-zinc-900/40 backdrop-blur-xl rounded-2xl border border-white/[0.07] shadow-[inset_0_1px_0_0_rgba(255,255,255,0.05)] p-5">
         {creating ? (
           <>
-            <div className="text-xs font-bold text-slate-400 uppercase tracking-wider mb-2">新建核心记忆</div>
-            <input value={newName} onChange={(e) => setNewName(e.target.value)} placeholder="记忆名（如 proj-pref）"
-              className="w-full px-2 py-1.5 text-sm border border-mint-200 rounded-lg font-mono focus:outline-none focus:ring-2 focus:ring-mint-400 mb-2" />
-            <textarea value={draft} onChange={(e) => setDraft(e.target.value)} rows={8} placeholder="内容（Markdown）"
-              className="w-full px-2 py-1.5 text-sm border border-mint-200 rounded-lg font-mono focus:outline-none focus:ring-2 focus:ring-mint-400" />
-            <div className="flex justify-end gap-2 mt-2">
-              <button onClick={() => setCreating(false)} className="px-3 py-1.5 text-xs rounded-lg bg-slate-100 text-slate-600 hover:bg-slate-200">取消</button>
-              <button disabled={busy || !newName.trim()} onClick={() => save(newName.trim(), draft)}
-                className="px-4 py-1.5 text-xs rounded-lg bg-mint-600 text-white hover:bg-mint-500 font-semibold disabled:opacity-40">保存</button>
+            <div className="text-xs font-bold text-zinc-400 uppercase tracking-wider mb-2.5">新建核心记忆</div>
+            <input
+              value={newName}
+              onChange={(e) => setNewName(e.target.value)}
+              placeholder="记忆名（如 proj-pref）"
+              className="w-full px-3 py-2 text-xs border border-white/[0.08] rounded-xl font-mono bg-zinc-950 text-zinc-100 placeholder:text-zinc-600 focus:outline-none focus:border-emerald-500/40 mb-2.5"
+            />
+            <textarea
+              value={draft}
+              onChange={(e) => setDraft(e.target.value)}
+              rows={8}
+              placeholder="内容（Markdown）"
+              className="w-full px-3 py-2 text-xs border border-white/[0.08] rounded-xl font-mono bg-zinc-950 text-zinc-100 placeholder:text-zinc-600 focus:outline-none focus:border-emerald-500/40 resize-y"
+            />
+            <div className="flex justify-end gap-2 mt-3">
+              <button
+                type="button"
+                onClick={() => setCreating(false)}
+                className="px-3 py-1.5 text-xs rounded-xl bg-zinc-800 text-zinc-400 hover:bg-zinc-700 transition"
+              >
+                取消
+              </button>
+              <button
+                type="button"
+                disabled={busy || !newName.trim()}
+                onClick={() => save(newName.trim(), draft)}
+                className="px-4 py-1.5 text-xs rounded-xl bg-emerald-500 hover:bg-emerald-400 text-zinc-950 font-semibold disabled:opacity-40 transition shadow-[0_0_15px_rgba(16,185,129,0.3)]"
+              >
+                保存
+              </button>
             </div>
           </>
         ) : current ? (
           <>
             <div className="flex items-center justify-between mb-3">
-              <span className="font-mono font-bold text-slate-800">{current.name}</span>
+              <span className="font-mono font-bold text-zinc-100 text-base">{current.name}</span>
               <div className="flex gap-2">
                 {editing === current.name ? (
                   <>
-                    <button onClick={() => setEditing(null)} className="px-3 py-1.5 text-xs rounded-lg bg-slate-100 text-slate-600 hover:bg-slate-200">取消</button>
-                    <button disabled={busy} onClick={() => save(current.name, draft)}
-                      className="px-4 py-1.5 text-xs rounded-lg bg-mint-600 text-white hover:bg-mint-500 font-semibold disabled:opacity-40">保存</button>
+                    <button
+                      type="button"
+                      onClick={() => setEditing(null)}
+                      className="px-3 py-1.5 text-xs rounded-xl bg-zinc-800 text-zinc-400 hover:bg-zinc-700 transition"
+                    >
+                      取消
+                    </button>
+                    <button
+                      type="button"
+                      disabled={busy}
+                      onClick={() => save(current.name, draft)}
+                      className="px-4 py-1.5 text-xs rounded-xl bg-emerald-500 hover:bg-emerald-400 text-zinc-950 font-semibold disabled:opacity-40 transition shadow-[0_0_15px_rgba(16,185,129,0.3)]"
+                    >
+                      保存
+                    </button>
                   </>
                 ) : (
                   <>
-                    <button onClick={() => { setEditing(current.name); setDraft(current.content || '') }}
-                      className="px-3 py-1.5 text-xs rounded-lg border border-mint-200 text-mint-700 hover:bg-mint-50 font-medium">编辑</button>
-                    <button disabled={busy} onClick={() => remove(current.name)}
-                      className="px-3 py-1.5 text-xs rounded-lg border border-rose-200 text-rose-600 hover:bg-rose-50 disabled:opacity-40">删除</button>
+                    <button
+                      type="button"
+                      onClick={() => { setEditing(current.name); setDraft(current.content || '') }}
+                      className="px-3 py-1.5 text-xs rounded-xl border border-white/[0.08] bg-zinc-950/70 text-zinc-300 hover:bg-zinc-800 font-medium transition"
+                    >
+                      编辑
+                    </button>
+                    <button
+                      type="button"
+                      disabled={busy}
+                      onClick={() => remove(current.name)}
+                      className="px-3 py-1.5 text-xs rounded-xl border border-rose-500/20 bg-rose-500/10 text-rose-400 hover:bg-rose-500/20 disabled:opacity-40 transition"
+                    >
+                      删除
+                    </button>
                   </>
                 )}
               </div>
             </div>
-            {msg && <div className="text-xs text-mint-700 mb-2">{msg}</div>}
+            {msg && <div className="text-xs text-emerald-400 mb-2 font-mono">{msg}</div>}
             {editing === current.name ? (
-              <textarea value={draft} onChange={(e) => setDraft(e.target.value)} rows={12}
-                className="w-full px-2.5 py-2 text-sm border border-mint-200 rounded-lg font-mono focus:outline-none focus:ring-2 focus:ring-mint-400" />
+              <textarea
+                value={draft}
+                onChange={(e) => setDraft(e.target.value)}
+                rows={12}
+                className="w-full px-3 py-2 text-xs border border-white/[0.08] rounded-xl font-mono bg-zinc-950 text-zinc-100 placeholder:text-zinc-600 focus:outline-none focus:border-emerald-500/40 resize-y"
+              />
             ) : (
-              <pre className="bg-mint-50/40 border border-mint-100 rounded-xl p-3 text-sm whitespace-pre-wrap min-h-32">{current.content || '（空）'}</pre>
+              <pre className="bg-[#050507] border border-white/[0.07] rounded-xl p-3.5 text-xs text-zinc-200 font-mono whitespace-pre-wrap min-h-32">
+                {current.content || '（空）'}
+              </pre>
             )}
           </>
         ) : (
-          <div className="text-sm text-slate-400 py-10 text-center">选择或新建一条核心记忆</div>
+          <div className="text-sm text-zinc-500 py-12 text-center">选择或新建一条核心记忆</div>
         )}
       </div>
     </div>
@@ -329,7 +394,6 @@ function ContextTab() {
   const [newKey, setNewKey] = useState('')
   const [msg, setMsg] = useState<string | null>(null)
 
-  // 派生列表仅随 tasks 变化重算，不随每次渲染（编辑态/加载态触发）重复排序
   const recent = useMemo(
     () => (tasks ?? [])
       .slice().sort((a, b) => Number(b.created_at) - Number(a.created_at)).slice(0, 30),
@@ -373,9 +437,12 @@ function ContextTab() {
 
   return (
     <div className="space-y-4">
-      <div className="bg-white rounded-2xl border border-mint-100 shadow-mint-sm p-3 flex flex-wrap items-center gap-2">
-        <select value={taskId} onChange={(e) => load(e.target.value)}
-          className="px-2.5 py-1.5 text-sm rounded-lg border border-mint-200/70 bg-white focus:outline-none focus:ring-2 focus:ring-mint-400">
+      <div className="bg-zinc-900/40 backdrop-blur-xl rounded-2xl border border-white/[0.07] shadow-[inset_0_1px_0_0_rgba(255,255,255,0.05)] p-3.5 flex flex-wrap items-center gap-2.5">
+        <select
+          value={taskId}
+          onChange={(e) => load(e.target.value)}
+          className="px-3 py-1.5 text-xs rounded-xl border border-white/[0.08] bg-zinc-950 text-zinc-200 focus:outline-none focus:border-emerald-500/40 font-mono"
+        >
           <option value="">选择任务…</option>
           {recent.map((t) => (
             <option key={t.task_id} value={t.task_id}>
@@ -384,53 +451,87 @@ function ContextTab() {
           ))}
         </select>
         {taskId && notes && Object.keys(notes).length > 0 && (
-          <button onClick={archive} className="ml-auto px-3 py-1.5 text-xs rounded-lg border border-rose-200 text-rose-600 hover:bg-rose-50">
+          <button
+            type="button"
+            onClick={archive}
+            className="ml-auto px-3 py-1.5 text-xs rounded-xl border border-rose-500/20 bg-rose-500/10 text-rose-400 hover:bg-rose-500/20 transition"
+          >
             归档清理全部笔记
           </button>
         )}
-        {msg && <span className="text-xs text-mint-700">{msg}</span>}
+        {msg && <span className="text-xs text-emerald-400 font-mono">{msg}</span>}
       </div>
 
       {!taskId && (
-        <div className="bg-white rounded-2xl border border-mint-100 shadow-mint-card p-10 text-center text-sm text-slate-400">
+        <div className="bg-zinc-900/40 backdrop-blur-xl rounded-2xl border border-white/[0.07] shadow-[inset_0_1px_0_0_rgba(255,255,255,0.05)] p-12 text-center text-sm text-zinc-500">
           选择一个任务查看其上下文记忆（含任务终态自动写入的 result 笔记）
         </div>
       )}
+
       {taskId && notes && (
         <div className="space-y-3">
           {Object.entries(notes).map(([k, v]) => (
-            <div key={k} className="bg-white rounded-2xl border border-mint-100 shadow-mint-card p-4">
+            <div key={k} className="bg-zinc-900/40 backdrop-blur-xl rounded-2xl border border-white/[0.07] shadow-[inset_0_1px_0_0_rgba(255,255,255,0.05)] p-4">
               <div className="flex items-center justify-between mb-2">
-                <span className="font-mono text-sm font-semibold text-slate-700">{k}</span>
+                <span className="font-mono text-xs font-semibold text-zinc-200">{k}</span>
                 {editingKey === k ? (
-                  <button disabled={!taskId} onClick={() => saveNote(k, draft)}
-                    className="px-3 py-1 text-xs rounded-lg bg-mint-600 text-white hover:bg-mint-500 font-semibold">保存</button>
+                  <button
+                    type="button"
+                    disabled={!taskId}
+                    onClick={() => saveNote(k, draft)}
+                    className="px-3 py-1 text-xs rounded-xl bg-emerald-500 hover:bg-emerald-400 text-zinc-950 font-semibold transition"
+                  >
+                    保存
+                  </button>
                 ) : (
-                  <button onClick={() => { setEditingKey(k); setDraft(v || '') }}
-                    className="px-3 py-1 text-xs rounded-lg border border-mint-200 text-mint-700 hover:bg-mint-50">编辑</button>
+                  <button
+                    type="button"
+                    onClick={() => { setEditingKey(k); setDraft(v || '') }}
+                    className="px-3 py-1 text-xs rounded-xl border border-white/[0.08] bg-zinc-950/70 text-zinc-300 hover:bg-zinc-800 transition"
+                  >
+                    编辑
+                  </button>
                 )}
               </div>
               {editingKey === k ? (
-                <textarea value={draft} onChange={(e) => setDraft(e.target.value)} rows={6}
-                  className="w-full px-2.5 py-2 text-sm border border-mint-200 rounded-lg font-mono focus:outline-none focus:ring-2 focus:ring-mint-400" />
+                <textarea
+                  value={draft}
+                  onChange={(e) => setDraft(e.target.value)}
+                  rows={6}
+                  className="w-full px-3 py-2 text-xs border border-white/[0.08] rounded-xl font-mono bg-zinc-950 text-zinc-100 placeholder:text-zinc-600 focus:outline-none focus:border-emerald-500/40 resize-y"
+                />
               ) : (
-                <pre className="bg-mint-50/40 border border-mint-100 rounded-xl p-3 text-xs whitespace-pre-wrap max-h-60 overflow-auto">{v || '（空）'}</pre>
+                <pre className="bg-[#050507] border border-white/[0.07] rounded-xl p-3 text-xs font-mono text-zinc-300 whitespace-pre-wrap max-h-60 overflow-auto">
+                  {v || '（空）'}
+                </pre>
               )}
             </div>
           ))}
+
           {Object.keys(notes).length === 0 && (
-            <div className="bg-white rounded-2xl border border-mint-100 shadow-mint-card p-8 text-center text-sm text-slate-400">
+            <div className="bg-zinc-900/40 backdrop-blur-xl rounded-2xl border border-white/[0.07] p-8 text-center text-sm text-zinc-500">
               该任务暂无上下文笔记
             </div>
           )}
+
           {/* 新增笔记 */}
-          <div className="bg-white rounded-2xl border border-mint-100 shadow-mint-card p-4">
-            <div className="text-xs font-bold text-slate-400 uppercase tracking-wider mb-2">新增笔记</div>
+          <div className="bg-zinc-900/40 backdrop-blur-xl rounded-2xl border border-white/[0.07] p-4">
+            <div className="text-xs font-bold text-zinc-400 uppercase tracking-wider mb-2">新增笔记</div>
             <div className="flex gap-2">
-              <input value={newKey} onChange={(e) => setNewKey(e.target.value)} placeholder="笔记名（如 decision）"
-                className="w-48 px-2 py-1.5 text-sm border border-mint-200 rounded-lg font-mono focus:outline-none focus:ring-2 focus:ring-mint-400" />
-              <button disabled={!newKey.trim()} onClick={() => { saveNote(newKey.trim(), ''); setNewKey('') }}
-                className="px-4 py-1.5 text-xs rounded-lg bg-mint-600 text-white hover:bg-mint-500 font-semibold disabled:opacity-40">创建</button>
+              <input
+                value={newKey}
+                onChange={(e) => setNewKey(e.target.value)}
+                placeholder="笔记名（如 decision）"
+                className="w-48 px-3 py-1.5 text-xs border border-white/[0.08] rounded-xl font-mono bg-zinc-950 text-zinc-100 placeholder:text-zinc-600 focus:outline-none focus:border-emerald-500/40"
+              />
+              <button
+                type="button"
+                disabled={!newKey.trim()}
+                onClick={() => { saveNote(newKey.trim(), ''); setNewKey('') }}
+                className="px-4 py-1.5 text-xs rounded-xl bg-emerald-500 hover:bg-emerald-400 text-zinc-950 font-semibold disabled:opacity-40 transition shadow-[0_0_15px_rgba(16,185,129,0.3)]"
+              >
+                创建
+              </button>
             </div>
           </div>
         </div>
@@ -485,58 +586,88 @@ function ExperienceTab() {
   const list = results ?? []
   return (
     <div className="space-y-4">
-      <div className="bg-white rounded-2xl border border-mint-100 shadow-mint-sm p-3 flex flex-wrap items-center gap-2">
-        <input value={q} onChange={(e) => setQ(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && search()}
+      <div className="bg-zinc-900/40 backdrop-blur-xl rounded-2xl border border-white/[0.07] shadow-[inset_0_1px_0_0_rgba(255,255,255,0.05)] p-3.5 flex flex-wrap items-center gap-2.5">
+        <input
+          value={q}
+          onChange={(e) => setQ(e.target.value)}
+          onKeyDown={(e) => e.key === 'Enter' && search()}
           placeholder="混合检索（关键词 + 语义）历史任务经验…"
-          className="flex-1 min-w-56 px-3 py-1.5 text-sm rounded-lg border border-mint-200/70 focus:outline-none focus:ring-2 focus:ring-mint-400" />
-        <label className="flex items-center gap-1.5 text-xs text-slate-600 cursor-pointer select-none">
-          <input type="checkbox" checked={successfulOnly} onChange={(e) => setSuccessfulOnly(e.target.checked)} className="accent-mint-600" />
+          className="flex-1 min-w-56 px-3 py-1.5 text-xs rounded-xl border border-white/[0.08] bg-zinc-950 text-zinc-100 placeholder:text-zinc-600 focus:outline-none focus:border-emerald-500/40 font-mono"
+        />
+        <label className="flex items-center gap-1.5 text-xs text-zinc-400 hover:text-zinc-200 cursor-pointer select-none">
+          <input
+            type="checkbox"
+            checked={successfulOnly}
+            onChange={(e) => setSuccessfulOnly(e.target.checked)}
+            className="accent-emerald-500"
+          />
           仅成功
         </label>
-        <button onClick={search} disabled={searching}
-          className="px-4 py-1.5 text-xs rounded-lg bg-mint-600 text-white hover:bg-mint-500 font-semibold disabled:opacity-40">
+        <button
+          type="button"
+          onClick={search}
+          disabled={searching}
+          className="px-4 py-1.5 text-xs rounded-xl bg-emerald-500 hover:bg-emerald-400 text-zinc-950 font-semibold disabled:opacity-40 transition shadow-[0_0_15px_rgba(16,185,129,0.3)]"
+        >
           {searching ? '检索中…' : '检索'}
         </button>
-        <button onClick={reindex} className="px-3 py-1.5 text-xs rounded-lg border border-mint-200 text-mint-700 hover:bg-mint-50 font-medium">
+        <button
+          type="button"
+          onClick={reindex}
+          className="px-3 py-1.5 text-xs rounded-xl border border-white/[0.08] bg-zinc-950/70 text-zinc-300 hover:bg-zinc-800 font-medium transition"
+        >
           重建向量索引
         </button>
-        {msg && <span className="text-xs text-mint-700 w-full">{msg}</span>}
+        {msg && <span className="text-xs text-emerald-400 w-full font-mono">{msg}</span>}
       </div>
 
       {results === null ? (
-        <div className="bg-white rounded-2xl border border-mint-100 shadow-mint-card p-10 text-center text-sm text-slate-400">
+        <div className="bg-zinc-900/40 backdrop-blur-xl rounded-2xl border border-white/[0.07] p-12 text-center text-sm text-zinc-500">
           输入关键词检索历史经验（每次派发时系统会自动注入最相关的 3 条成功经验）
         </div>
       ) : list.length === 0 ? (
-        <div className="bg-white rounded-2xl border border-mint-100 shadow-mint-card p-10 text-center text-sm text-slate-400">没有匹配的经验</div>
+        <div className="bg-zinc-900/40 backdrop-blur-xl rounded-2xl border border-white/[0.07] p-12 text-center text-sm text-zinc-500">
+          没有匹配的经验
+        </div>
       ) : (
-        <div className="space-y-2">
+        <div className="space-y-2.5">
           {list.map((r) => (
-            <div key={r.exp_id} className="bg-white rounded-2xl border border-mint-100 shadow-mint-card p-4">
-              <button onClick={() => setExpanded(expanded === r.exp_id ? null : r.exp_id)}
-                className="w-full text-left flex items-center gap-2.5">
-                <span className={`w-2 h-2 rounded-full shrink-0 ${r.success ? 'bg-mint-500' : 'bg-rose-500'}`} />
+            <div
+              key={r.exp_id}
+              className="bg-zinc-900/40 backdrop-blur-xl rounded-2xl border border-white/[0.07] shadow-[inset_0_1px_0_0_rgba(255,255,255,0.05)] p-4 hover:border-emerald-500/30 transition duration-150"
+            >
+              <button
+                type="button"
+                onClick={() => setExpanded(expanded === r.exp_id ? null : r.exp_id)}
+                className="w-full text-left flex items-center gap-2.5"
+              >
+                <span className={`w-2 h-2 rounded-full shrink-0 ${r.success ? 'bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.6)]' : 'bg-rose-500'}`} />
                 <StatusBadge status={r.success ? 'done' : 'failed'} />
-                <span className="font-mono text-xs text-slate-500 shrink-0">{r.exp_id}</span>
-                <span className="text-sm text-slate-700 truncate flex-1">{r.prompt}</span>
-                <span className="text-xs text-slate-400 shrink-0">命中 {r.hits ?? 0} 次</span>
-                <span className="text-xs text-slate-400 shrink-0">v{r.version ?? 1}</span>
+                <span className="font-mono text-xs text-zinc-400 shrink-0">{r.exp_id}</span>
+                <span className="text-sm text-zinc-200 truncate flex-1 font-sans">{r.prompt}</span>
+                <span className="text-xs text-zinc-500 shrink-0 font-mono">命中 {r.hits ?? 0} 次</span>
+                <span className="text-xs text-zinc-500 shrink-0 font-mono">v{r.version ?? 1}</span>
               </button>
               {expanded === r.exp_id && (
-                <div className="mt-3 border-t border-slate-50 pt-3 space-y-2">
-                  <div className="text-xs text-slate-500"><span className="font-bold">产出摘要：</span>{r.output_summary || '（无）'}</div>
+                <div className="mt-3 border-t border-white/[0.06] pt-3 space-y-2">
+                  <div className="text-xs text-zinc-300"><span className="text-zinc-500">产出摘要：</span>{r.output_summary || '（无）'}</div>
                   {r.verdict && (
-                    <div className="text-xs text-slate-500">
-                      <span className="font-bold">安全裁决：</span>{r.verdict.verdict} — {r.verdict.reason}
+                    <div className="text-xs text-zinc-400">
+                      <span className="text-zinc-500">安全裁决：</span>{r.verdict.verdict} — {r.verdict.reason}
                     </div>
                   )}
-                  <div className="text-xs text-slate-400 flex gap-4">
+                  <div className="text-xs text-zinc-500 flex gap-4 font-mono">
                     <span>role: {r.role}</span>
                     <span>记录于 {timeAgo(r.created_at)}</span>
                     {r.artifacts.length > 0 && <span>产物 {r.artifacts.length} 个</span>}
                   </div>
-                  <button onClick={() => remove(r.exp_id)}
-                    className="px-3 py-1 text-xs rounded-lg border border-rose-200 text-rose-600 hover:bg-rose-50">删除</button>
+                  <button
+                    type="button"
+                    onClick={() => remove(r.exp_id)}
+                    className="px-3 py-1 text-xs rounded-xl border border-rose-500/20 bg-rose-500/10 text-rose-400 hover:bg-rose-500/20 transition"
+                  >
+                    删除
+                  </button>
                 </div>
               )}
             </div>
@@ -589,10 +720,19 @@ function ProposalTab() {
   return (
     <div className="space-y-4">
       {/* 反思报告（证据面板） */}
-      <div className="bg-gradient-to-r from-mint-50/80 via-white to-white border border-mint-200/70 rounded-2xl p-5 shadow-mint-sm">
-        <div className="flex items-center justify-between mb-2">
-          <h3 className="text-sm font-bold text-slate-800">反思报告（近 {refl?.window ?? 50} 条经验）</h3>
-          <button onClick={() => reflection.refresh()} className="text-xs text-mint-700 hover:underline font-medium">刷新</button>
+      <div className="bg-zinc-900/40 backdrop-blur-xl border border-white/[0.07] rounded-2xl p-5 shadow-[inset_0_1px_0_0_rgba(255,255,255,0.05)]">
+        <div className="flex items-center justify-between mb-3">
+          <div className="flex items-center gap-2">
+            <span className="w-2 h-2 rounded-full bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.6)]" />
+            <h3 className="text-sm font-semibold text-zinc-100">反思报告（近 {refl?.window ?? 50} 条经验）</h3>
+          </div>
+          <button
+            type="button"
+            onClick={() => reflection.refresh()}
+            className="text-xs text-emerald-400 hover:text-emerald-300 hover:underline font-medium"
+          >
+            刷新
+          </button>
         </div>
         {refl ? (
           <div className="grid grid-cols-2 md:grid-cols-4 gap-3 text-xs">
@@ -602,38 +742,44 @@ function ProposalTab() {
             <Stat label="高频命中" value={String(refl.most_hit.length)} />
           </div>
         ) : (
-          <div className="text-xs text-slate-400">加载反思报告中…</div>
+          <div className="text-xs text-zinc-500">加载反思报告中…</div>
         )}
         {refl && refl.failed_recent.length > 0 && (
-          <div className="mt-3 text-xs text-slate-500">
-            <span className="font-bold text-rose-600">近期失败：</span>
+          <div className="mt-3 text-xs text-zinc-400 font-mono">
+            <span className="font-bold text-rose-400">近期失败：</span>
             {refl.failed_recent.slice(0, 3).map((f) => (
               <span key={f.exp_id} className="mr-3" title={f.prompt}>{f.exp_id} · {f.prompt.slice(0, 26)}…</span>
             ))}
           </div>
         )}
-        <div className="mt-2 text-[11px] text-slate-400">修改技能定义请走提案流程（证据 → 提案 → 三票共识 → 自动应用），不要直接改文件。</div>
+        <div className="mt-2 text-[11px] text-zinc-500">修改技能定义请走提案流程（证据 → 提案 → 三票共识 → 自动应用），不要直接改文件。</div>
       </div>
 
-      {msg && <div className="text-xs text-mint-700 bg-mint-50 border border-mint-200 rounded-xl px-3 py-2">{msg}</div>}
+      {msg && (
+        <div className="text-xs text-emerald-400 bg-emerald-500/10 border border-emerald-500/20 rounded-xl px-3 py-2 font-mono">
+          {msg}
+        </div>
+      )}
 
       {/* 提案列表 */}
       {list.length === 0 ? (
-        <div className="bg-white rounded-2xl border border-mint-100 shadow-mint-card p-10 text-center text-sm text-slate-400">
+        <div className="bg-zinc-900/40 backdrop-blur-xl rounded-2xl border border-white/[0.07] p-12 text-center text-sm text-zinc-500">
           暂无演化提案——由大脑在 G5 复盘时依据反思报告起草
         </div>
       ) : (
         <div className="space-y-3">
           {list.map((p) => (
             <ProposalCard
-              key={p.proposal_id} proposal={p}
+              key={p.proposal_id}
+              proposal={p}
               expanded={expanded === p.proposal_id}
               onToggle={() => setExpanded(expanded === p.proposal_id ? null : p.proposal_id)}
               voter={voter[p.proposal_id] ?? 'brain'}
               onVoterChange={(v) => setVoter((prev) => ({ ...prev, [p.proposal_id]: v }))}
               onVote={(verdict) => vote(p.proposal_id, verdict)}
               onDelete={() => remove(p.proposal_id)}
-              busy={busy} pendingCount={pending.length}
+              busy={busy}
+              pendingCount={pending.length}
             />
           ))}
         </div>
@@ -644,9 +790,9 @@ function ProposalTab() {
 
 function Stat({ label, value }: { label: string; value: string }) {
   return (
-    <div className="bg-white/80 border border-mint-100 rounded-xl p-2.5">
-      <div className="text-slate-400">{label}</div>
-      <div className="text-lg font-bold text-slate-800 mt-0.5">{value}</div>
+    <div className="bg-zinc-950/60 border border-white/[0.06] rounded-xl p-3">
+      <div className="text-zinc-500 text-xs">{label}</div>
+      <div className="text-xl font-bold font-mono tracking-tight text-zinc-100 mt-1">{value}</div>
     </div>
   )
 }
@@ -664,28 +810,28 @@ function ProposalCard({
   busy: boolean
   pendingCount: number
 }) {
-  const statusCls = p.status === 'applied' ? 'bg-mint-100 text-mint-700'
-    : p.status === 'rejected' ? 'bg-rose-100 text-rose-700'
-    : 'bg-amber-100 text-amber-700'
+  const statusCls = p.status === 'applied' ? 'bg-emerald-500/15 text-emerald-300 border border-emerald-500/30'
+    : p.status === 'rejected' ? 'bg-rose-500/15 text-rose-300 border border-rose-500/30'
+    : 'bg-amber-500/15 text-amber-300 border border-amber-500/30'
   return (
-    <div className="bg-white rounded-2xl border border-mint-100 shadow-mint-card p-4">
-      <button onClick={onToggle} className="w-full text-left">
-        <div className="flex items-center gap-2 flex-wrap">
-          <span className={`px-2 py-0.5 rounded text-xs font-bold ${statusCls}`}>{p.status}</span>
-          <span className="font-mono text-xs text-slate-500">{p.proposal_id}</span>
-          <span className="text-sm font-semibold text-slate-700 font-mono truncate flex-1" title={p.target_path}>{p.target_path}</span>
-          <span className="text-xs text-slate-400">{timeAgo(p.created_at)}</span>
+    <div className="bg-zinc-900/40 backdrop-blur-xl rounded-2xl border border-white/[0.07] shadow-[inset_0_1px_0_0_rgba(255,255,255,0.05)] p-4">
+      <button type="button" onClick={onToggle} className="w-full text-left">
+        <div className="flex items-center gap-2.5 flex-wrap">
+          <span className={`px-2 py-0.5 rounded text-xs font-bold font-mono ${statusCls}`}>{p.status}</span>
+          <span className="font-mono text-xs text-zinc-400">{p.proposal_id}</span>
+          <span className="text-sm font-semibold text-zinc-200 font-mono truncate flex-1" title={p.target_path}>{p.target_path}</span>
+          <span className="text-xs text-zinc-500 font-mono">{timeAgo(p.created_at)}</span>
         </div>
-        <p className="text-xs text-slate-500 mt-1.5 truncate">{p.reason}</p>
+        <p className="text-xs text-zinc-400 mt-1.5 truncate">{p.reason}</p>
       </button>
 
       {/* 投票进度 */}
-      <div className="mt-2 flex items-center gap-2 text-xs flex-wrap">
+      <div className="mt-2.5 flex items-center gap-2 text-xs flex-wrap font-mono">
         {(['security', 'brain', 'executor'] as const).map((v) => {
           const vote = p.votes[v]
-          const cls = !vote ? 'bg-slate-100 text-slate-400'
-            : vote.verdict === 'pass' ? 'bg-mint-50 text-mint-700 border border-mint-200'
-            : 'bg-rose-50 text-rose-700 border border-rose-200'
+          const cls = !vote ? 'bg-zinc-950 text-zinc-500 border border-white/[0.05]'
+            : vote.verdict === 'pass' ? 'bg-emerald-500/10 text-emerald-300 border border-emerald-500/20'
+            : 'bg-rose-500/10 text-rose-300 border border-rose-500/20'
           return (
             <span key={v} className={`px-2 py-0.5 rounded-full ${cls}`}>
               {v}: {vote ? (vote.verdict === 'pass' ? '✓ pass' : '✕ block') : '等待'}
@@ -693,41 +839,68 @@ function ProposalCard({
           )
         })}
         {p.status === 'rejected' && p.reject_reason && (
-          <span className="text-rose-600 truncate" title={p.reject_reason}>否决: {p.reject_reason}</span>
+          <span className="text-rose-400 truncate" title={p.reject_reason}>否决: {p.reject_reason}</span>
         )}
       </div>
 
       {expanded && (
-        <div className="mt-3 border-t border-slate-50 pt-3 space-y-3">
-          {/* Diff 并排：原内容微浅红 / 修订内容淡薄荷 */}
+        <div className="mt-3 border-t border-white/[0.06] pt-3 space-y-3">
+          {/* Diff 并排：原内容暗红 / 修订内容暗薄荷 */}
           <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
             <div>
-              <div className="text-[11px] font-bold text-rose-500 uppercase tracking-wider mb-1">原内容</div>
-              <pre className="bg-rose-50/70 border border-rose-100 rounded-xl p-2.5 text-xs whitespace-pre-wrap max-h-72 overflow-auto">{p.original_content || '（新文件）'}</pre>
+              <div className="text-[11px] font-bold text-rose-400 uppercase tracking-wider mb-1.5 font-mono">原内容</div>
+              <pre className="bg-rose-950/20 border border-rose-500/20 text-rose-300 rounded-xl p-3 text-xs font-mono whitespace-pre-wrap max-h-72 overflow-auto">
+                {p.original_content || '（新文件）'}
+              </pre>
             </div>
             <div>
-              <div className="text-[11px] font-bold text-mint-600 uppercase tracking-wider mb-1">修订内容</div>
-              <pre className="bg-mint-50/70 border border-mint-100 rounded-xl p-2.5 text-xs whitespace-pre-wrap max-h-72 overflow-auto">{p.content}</pre>
+              <div className="text-[11px] font-bold text-emerald-400 uppercase tracking-wider mb-1.5 font-mono">修订内容</div>
+              <pre className="bg-emerald-950/20 border border-emerald-500/20 text-emerald-300 rounded-xl p-3 text-xs font-mono whitespace-pre-wrap max-h-72 overflow-auto">
+                {p.content}
+              </pre>
             </div>
           </div>
           {p.evidence_exp_ids.length > 0 && (
-            <div className="text-xs text-slate-500">证据经验: {p.evidence_exp_ids.join(', ')}</div>
+            <div className="text-xs text-zinc-400 font-mono">证据经验: {p.evidence_exp_ids.join(', ')}</div>
           )}
           {p.status === 'pending' ? (
-            <div className="flex items-center gap-2 flex-wrap">
-              <select value={voter} onChange={(e) => onVoterChange(e.target.value)}
-                className="px-2 py-1 text-xs rounded-lg border border-mint-200/70">
+            <div className="flex items-center gap-2.5 flex-wrap pt-1">
+              <select
+                value={voter}
+                onChange={(e) => onVoterChange(e.target.value)}
+                className="px-2.5 py-1 text-xs rounded-xl border border-white/[0.08] bg-zinc-950 text-zinc-200"
+              >
                 <option value="brain">以 brain 视角</option>
                 <option value="executor">以 executor 视角</option>
               </select>
-              <button disabled={busy} onClick={() => onVote('pass')}
-                className="px-4 py-1.5 text-xs rounded-lg bg-mint-600 text-white hover:bg-mint-500 font-semibold disabled:opacity-40">投 Pass</button>
-              <button disabled={busy} onClick={() => onVote('block')}
-                className="px-4 py-1.5 text-xs rounded-lg bg-rose-600 text-white hover:bg-rose-500 font-semibold disabled:opacity-40">投 Block</button>
-              <span className="text-[11px] text-slate-400">三票全 pass 自动应用；security 已由规则引擎自动裁决（{pendingCount} 个提案待决）</span>
+              <button
+                type="button"
+                disabled={busy}
+                onClick={() => onVote('pass')}
+                className="px-4 py-1.5 text-xs rounded-xl bg-emerald-500 hover:bg-emerald-400 text-zinc-950 font-semibold disabled:opacity-40 transition shadow-[0_0_15px_rgba(16,185,129,0.3)]"
+              >
+                投 Pass
+              </button>
+              <button
+                type="button"
+                disabled={busy}
+                onClick={() => onVote('block')}
+                className="px-4 py-1.5 text-xs rounded-xl bg-rose-500 hover:bg-rose-400 text-white font-semibold disabled:opacity-40 transition shadow-[0_0_15px_rgba(244,63,94,0.3)]"
+              >
+                投 Block
+              </button>
+              <span className="text-[11px] text-zinc-500">
+                三票全 pass 自动应用；security 已由规则引擎自动裁决（{pendingCount} 个提案待决）
+              </span>
             </div>
           ) : (
-            <button onClick={onDelete} className="px-3 py-1 text-xs rounded-lg border border-slate-200 text-slate-500 hover:bg-slate-50">丢弃提案记录</button>
+            <button
+              type="button"
+              onClick={onDelete}
+              className="px-3 py-1.5 text-xs rounded-xl border border-white/[0.08] bg-zinc-950 text-zinc-400 hover:bg-zinc-800 transition"
+            >
+              丢弃提案记录
+            </button>
           )}
         </div>
       )}

@@ -57,50 +57,57 @@ export default function ApprovalBar({
   }
 
   return (
-    <div className="bg-amber-50/80 border border-amber-200/90 rounded-xl p-4">
-      <div className="flex items-center justify-between text-xs font-semibold text-amber-800 mb-2">
+    <div className="bg-amber-500/10 border border-amber-500/30 rounded-xl p-4 backdrop-blur-md shadow-[0_0_20px_rgba(245,158,11,0.08)]">
+      <div className="flex items-center justify-between text-xs font-semibold text-amber-300 mb-2">
         <span>⏸ 安全裁决待人工审批 {verdict?.matched_rules?.length
           ? `（命中: ${verdict.matched_rules.join(', ')}）`
           : ''}</span>
-        <span className="text-amber-600">security-guard</span>
+        <span className="font-mono text-[11px] bg-amber-500/15 text-amber-300 border border-amber-500/30 px-2 py-0.5 rounded">security-guard</span>
       </div>
       {verdict && (
-        <p className="text-xs text-slate-700 leading-relaxed">{verdict.reason}</p>
+        <p className="text-xs text-amber-200/90 leading-relaxed">{verdict.reason}</p>
       )}
       {verdict?.suggestion && (
-        <p className="text-xs text-slate-500 mt-1">建议: {verdict.suggestion}</p>
+        <p className="text-xs text-zinc-400 mt-1">建议: {verdict.suggestion}</p>
       )}
       <div className="mt-3">
-        <div className="text-[11px] font-bold text-slate-500 uppercase tracking-wider mb-1">原指令</div>
-        <pre className="bg-white/70 rounded-lg p-2.5 text-xs font-mono whitespace-pre-wrap max-h-28 overflow-auto border border-amber-200/60">{originalPrompt}</pre>
+        <div className="text-[11px] font-bold text-zinc-400 uppercase tracking-wider mb-1">原指令</div>
+        <pre className="bg-zinc-950/80 rounded-lg p-2.5 text-xs font-mono whitespace-pre-wrap max-h-28 overflow-auto border border-amber-500/20 text-amber-200">{originalPrompt}</pre>
       </div>
-      <div className="mt-2">
-        <label className="text-[11px] font-bold text-slate-500 uppercase tracking-wider block mb-1">
+      <div className="mt-2.5">
+        <label className="text-[11px] font-bold text-zinc-400 uppercase tracking-wider block mb-1">
           Prompt 修订（留空则按原指令放行；修订内容将重新过 security-guard）
         </label>
         <textarea
           rows={3}
           value={prompt}
           onChange={(e) => setPrompt(e.target.value)}
+          onKeyDown={(e) => {
+            if ((e.ctrlKey || e.metaKey) && e.key === 'Enter' && !busy) {
+              e.preventDefault()
+              void approve()
+            }
+          }}
           placeholder="可附加放行约束，例如：仅允许在当前目录构建，禁止访问外网…"
-          className="w-full text-xs font-mono p-2.5 rounded-lg border border-amber-200 focus:outline-none focus:ring-2 focus:ring-mint-500 bg-white"
+          className="w-full text-xs font-mono p-2.5 rounded-lg border border-amber-500/30 focus:outline-none focus:ring-2 focus:ring-emerald-500/30 bg-zinc-950/90 text-zinc-100 placeholder-zinc-500"
         />
       </div>
       <div className="mt-3 flex items-center justify-end gap-2">
         {msg && (
-          <span className={`text-xs mr-auto ${msg.ok ? 'text-mint-700' : 'text-rose-600'}`}>{msg.text}</span>
+          <span className={`text-xs mr-auto font-mono ${msg.ok ? 'text-emerald-400' : 'text-rose-400'}`}>{msg.text}</span>
         )}
+        <span className="text-[11px] text-amber-400/60 hidden sm:inline mr-1 font-mono">⌘/Ctrl+Enter 快捷放行</span>
         <button
           disabled={busy}
           onClick={reject}
-          className="px-3 py-1.5 bg-white border border-slate-200 hover:bg-rose-50 hover:text-rose-600 text-xs font-medium text-slate-600 rounded-lg transition disabled:opacity-40"
+          className="btn-press px-3 py-1.5 bg-zinc-900 border border-white/10 hover:border-rose-500/40 hover:bg-rose-500/10 hover:text-rose-400 text-xs font-medium text-zinc-400 rounded-lg transition disabled:opacity-40"
         >
           拒绝任务
         </button>
         <button
           disabled={busy}
           onClick={approve}
-          className="px-4 py-1.5 bg-mint-600 hover:bg-mint-500 text-white text-xs font-semibold rounded-lg shadow-sm transition disabled:opacity-40"
+          className="btn-press px-4 py-1.5 bg-emerald-500 hover:bg-emerald-400 text-zinc-950 text-xs font-semibold rounded-lg shadow-sm transition disabled:opacity-40 shadow-[0_0_15px_rgba(16,185,129,0.2)]"
         >
           {prompt.trim() ? '修订并放行' : '放行'}
         </button>
