@@ -8,7 +8,7 @@ from typing import Iterator
 from .models import SchemaVersionError
 
 
-SCHEMA_VERSION = 14
+SCHEMA_VERSION = 15
 
 _SCHEMA_STATEMENTS = (
     """
@@ -1011,6 +1011,39 @@ _INTEGRATION_ITEM_SCHEMA = (
 # out", which is the difference between a closed event and a lie about one.
 _OUTBOX_VOID_SCHEMA = ("ALTER TABLE outbox_events ADD COLUMN voided_at REAL",)
 
+_REAL_PLANNING_SCHEMA = (
+    """CREATE TABLE planning_proposals (
+        proposal_id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL,
+        requirement_id TEXT NOT NULL,
+        revision_id TEXT NOT NULL,
+        revision_hash TEXT NOT NULL,
+        context_hash TEXT NOT NULL,
+        context_json TEXT NOT NULL,
+        candidate_json TEXT,
+        report_json TEXT NOT NULL DEFAULT '{}',
+        status TEXT NOT NULL CHECK(status IN
+            ('running','pending','clarification','blocked','unknown','rejected','published')),
+        reserved_units INTEGER NOT NULL CHECK(reserved_units>0),
+        cost_units INTEGER,
+        plan_id TEXT,
+        version INTEGER NOT NULL DEFAULT 1,
+        created_at REAL NOT NULL,
+        updated_at REAL NOT NULL,
+        FOREIGN KEY(requirement_id,project_id) REFERENCES requirements(requirement_id,project_id)
+    )""",
+    """CREATE UNIQUE INDEX planning_proposals_active ON planning_proposals
+       (project_id,requirement_id,context_hash)
+       WHERE status IN ('running','pending','clarification','blocked','unknown')""",
+    """CREATE TRIGGER planning_proposals_identity_immutable BEFORE UPDATE ON planning_proposals
+        WHEN NEW.proposal_id<>OLD.proposal_id OR NEW.project_id<>OLD.project_id
+          OR NEW.requirement_id<>OLD.requirement_id OR NEW.revision_id<>OLD.revision_id
+          OR NEW.revision_hash<>OLD.revision_hash OR NEW.context_hash<>OLD.context_hash
+          OR NEW.context_json<>OLD.context_json OR NEW.reserved_units<>OLD.reserved_units
+          OR NEW.created_at<>OLD.created_at
+        BEGIN SELECT RAISE(ABORT, 'planning input identity is immutable'); END""",
+)
+
 
 def _check_schema_version(connection: sqlite3.Connection) -> None:
     version = connection.execute("PRAGMA user_version").fetchone()[0]
@@ -1132,6 +1165,11 @@ class Database:
                     for statement in _OUTBOX_VOID_SCHEMA:
                         connection.execute(statement)
                     version = 14
+                    migrated = True
+                if version == 14:
+                    for statement in _REAL_PLANNING_SCHEMA:
+                        connection.execute(statement)
+                    version = 15
                     migrated = True
                 if migrated:
                     connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")

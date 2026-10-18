@@ -3,7 +3,17 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>多 Agent 编排控制面板</title>
+    <style>html[data-agent-standby-boot] body{visibility:hidden}</style>
+<script>
+// Hide a previously covered/expired tab before application HTML can paint.
+try {
+  const savedTab = JSON.parse(sessionStorage.getItem('m-agent.standby.orchestration.tab'));
+  const savedSettings = JSON.parse(localStorage.getItem('m-agent.standby.orchestration.settings'));
+  const idleSeconds = [0,60,300,600,900].includes(savedSettings?.seconds) ? savedSettings.seconds : 300;
+  if (savedTab?.covered === true || (Number.isFinite(savedTab?.lastActivity) && idleSeconds > 0 && Date.now() - savedTab.lastActivity >= idleSeconds * 1000)) document.documentElement.dataset.agentStandbyBoot = 'true';
+} catch { /* No persisted tab state. */ }
+</script>
+<title>多 Agent 编排控制面板</title>
   </head>
   <body>
     <div id="root"></div>

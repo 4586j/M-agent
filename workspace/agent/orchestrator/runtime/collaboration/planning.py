@@ -165,6 +165,7 @@ class PlanService:
         self.budgets = budgets if budgets is not None else BudgetService(clock=clock)
         self.clock = clock
         self.planner = None
+        self.proposals = None
 
     @staticmethod
     def _member(access, project_id: str) -> None:
@@ -239,12 +240,14 @@ class PlanService:
                         for member in facts["members"].values()],
             "bindings": [{"binding_id": binding.binding_id, "agent_id": binding.agent_id,
                           "member_user_id": binding.member_user_id, "duty": binding.duty,
-                          "persona_version": binding.persona_version, "status": binding.status}
+                          "persona_version": binding.persona_version, "status": binding.status,
+                          "binding_version": binding.version, "allowed_tools": list(binding.allowed_tools),
+                          "workspace_ref": binding.workspace_ref, "provider_ref": binding.provider_ref}
                          for binding in facts["bindings"].values()],
         }
 
     def plan(self, *, project_id: str, requirement_id: str, actor_id: str | None,
-             require_approved_only: bool, expected_revision_id: str | None = None) -> Plan | None:
+             require_approved_only: bool, expected_revision_id: str | None = None) -> Plan | dict | None:
         with self.database.read() as conn:
             store = CollaborationStore(self.database, connection=conn)
             if not require_approved_only:
@@ -268,6 +271,8 @@ class PlanService:
             context = self._context(project_id, requirement, revision_id, revision_hash,
                                     content, facts)
         planner = self.planner
+        if self.proposals is not None:
+            return self.proposals.generate(context, actor_id=actor_id)
         if planner is None:
             raise Unavailable("Planner is not configured")
         try:

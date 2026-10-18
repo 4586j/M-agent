@@ -217,3 +217,12 @@ jobs:
       - name: 开发代理回归
         working-directory: web
         run: npm run test:e2e:proxy
+      - name: 团队候选计划确认与澄清
+        working-directory: web
+        run: npm run test:e2e:team
+      - name: 待机方案与遮挡恢复
+        working-directory: web
+        run: npm run test:e2e:standby
+      - name: 单 Agent 与编排待机接入
+        working-directory: web
+        run: npm run test:e2e:standby-hosts

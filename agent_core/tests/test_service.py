@@ -173,6 +173,18 @@ def _parse_sse(text: str) -> list[dict]:
 
 # ---- /health ----
 
+def test_panel_standby_assets_are_local_and_allowlisted(client):
+    panel = client.get('/panel')
+    assert panel.status_code == 200
+    assert 'standby-control' in panel.text
+    for name in ('standby.js', 'bloom.js'):
+        response = client.get('/agent/panel-assets/' + name)
+        assert response.status_code == 200
+        assert 'javascript' in response.headers['content-type']
+        assert response.headers['cache-control'] == 'no-cache'
+    assert client.get('/agent/panel-assets/service.py').status_code == 404
+    assert client.get('/agent/panel-assets/index.html').status_code == 404
+
 def test_health_includes_checks_summary(client, monkeypatch):
     monkeypatch.setattr(service, "run_checks", lambda cfg, default_persona="x": [
         CheckResult("sdk", "ok", "可导入"),

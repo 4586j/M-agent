@@ -14,6 +14,9 @@
     "test:e2e:layout": "playwright test --config=playwright.layout.config.js",
     "test:e2e:proxy": "playwright test --config=playwright.proxy.config.js",
     "test:e2e:personal": "playwright test --config=playwright.personal.config.js",
+    "test:e2e:team": "playwright test --config=playwright.team.config.js",
+    "test:e2e:standby": "playwright test --config=playwright.standby.config.js",
+    "test:e2e:standby-hosts": "playwright test --config=playwright.standby-hosts.config.js",
     "test:e2e:orchest": "playwright test --config=playwright.orchest.config.js"
   },
   "dependencies": {

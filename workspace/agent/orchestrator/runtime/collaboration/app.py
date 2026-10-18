@@ -29,6 +29,7 @@ from .inbox import InboxService
 from .instances import InstanceService
 from .models import Conflict, InvalidState, NotFound, Unavailable, ValidationError
 from .planning import PlanService, plan_document
+from .sdk_planning import configure_planner
 from .requirements import RequirementService
 from .reviews import ReviewService
 from .scheduler import QueueService, Scheduler
@@ -74,6 +75,7 @@ class AppConfig:
     session_ttl: int = 28800
     lease_ttl: int = 120
     auto_dispatch: bool = False
+    planner_config: Path | None = None
 
     def __post_init__(self):
         canonical, _, _ = _origin(self.public_origin)
@@ -124,6 +126,12 @@ class Invitation(Input):
 
 class ExpectedVersion(Input):
     expected_version: Version
+
+
+class ProposalDecision(ExpectedVersion):
+    decision: Literal["approve", "reject", "reconcile"]
+    reason: Annotated[str, Field(max_length=4096)] = ""
+    usage_units: Annotated[int | None, Field(strict=True, ge=0, le=10 ** 12)] = None
 
 
 class UserStatus(ExpectedVersion):
@@ -534,7 +542,8 @@ def create_app(config: AppConfig) -> FastAPI:
         app.state.instances = InstanceService(database)
         app.state.requirements = RequirementService()
         app.state.budgets = BudgetService()
-        app.state.planning = PlanService(database, budgets=app.state.budgets)
+        app.state.planning = configure_planner(
+            PlanService(database, budgets=app.state.budgets), config.planner_config)
         app.state.queue = QueueService(database,
                                        heartbeat_timeout=app.state.instances.heartbeat_timeout)
         # Wake-ups go to the exact worker URL that was registered with this service, direct, the
@@ -663,6 +672,13 @@ def create_app(config: AppConfig) -> FastAPI:
                                                 **body.model_dump())
                 _audit(request, access, "user.status_changed", uid, user.version)
             return asdict(user)
+
+    @router.get("/capabilities")
+    def capabilities(request: Request):
+        with _access(request):
+            return {"real_planner": app.state.planning.proposals is not None,
+                    "plan_confirmation_required": app.state.planning.proposals is not None,
+                    "sdk_cost_unit": "micro_usd", "auto_dispatch": config.auto_dispatch}
 
     @router.get("/projects")
     def list_projects(request: Request):
@@ -1107,11 +1123,31 @@ def create_app(config: AppConfig) -> FastAPI:
         actor_id = _authorized_actor(request, project_id=pid, roles=MANAGERS)
         plan = app.state.planning.plan(project_id=pid, requirement_id=rid, actor_id=actor_id,
                                        require_approved_only=False)
+        if isinstance(plan, dict):
+            return {"proposal": plan, "plan": None, "work_items": [], "dependencies": []}
         store = CollaborationStore(app.state.planning.database)
         return {"plan": plan_document(plan),
                 "work_items": [asdict(item) for item in store.list_work_items(pid, plan.plan_id)],
                 "dependencies": [asdict(dependency) for dependency in
                                  store.list_work_item_dependencies(pid, plan.plan_id)]}
+
+    @router.get("/projects/{pid}/requirements/{rid}/planning-proposals")
+    def list_proposals(pid: str, rid: str, request: Request):
+        with _access(request, project_id=pid) as access:
+            proposals = app.state.planning.proposals
+            if proposals is None:
+                access.store.get_requirement(pid, rid)
+                return []
+            return proposals.list(access.store, pid, rid)
+
+    @router.post("/projects/{pid}/requirements/{rid}/planning-proposals/{proposal_id}/decision")
+    def decide_proposal(pid: str, rid: str, proposal_id: str, body: ProposalDecision, request: Request):
+        with _access(request, project_id=pid, roles=MANAGERS, write=True) as access:
+            proposals = app.state.planning.proposals
+            if proposals is None:
+                raise Unavailable("Real planner is not configured")
+            return proposals.decide(access, project_id=pid, requirement_id=rid,
+                                    proposal_id=proposal_id, **body.model_dump())
 
     @router.get("/projects/{pid}/requirements/{rid}/plans")
     def list_plans(pid: str, rid: str, request: Request):

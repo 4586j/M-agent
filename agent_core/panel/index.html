@@ -3,6 +3,16 @@
 <head>
 <meta charset="UTF-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<style>html[data-agent-standby-boot] body{visibility:hidden}</style>
+<script>
+// Hide a previously covered/expired tab before application HTML can paint.
+try {
+  const savedTab = JSON.parse(sessionStorage.getItem('m-agent.standby.personal.tab'));
+  const savedSettings = JSON.parse(localStorage.getItem('m-agent.standby.personal.settings'));
+  const idleSeconds = [0,60,300,600,900].includes(savedSettings?.seconds) ? savedSettings.seconds : 300;
+  if (savedTab?.covered === true || (Number.isFinite(savedTab?.lastActivity) && idleSeconds > 0 && Date.now() - savedTab.lastActivity >= idleSeconds * 1000)) document.documentElement.dataset.agentStandbyBoot = 'true';
+} catch { /* No persisted tab state. */ }
+</script>
 <title>Agent 面板 · 单机 Agent 运行实况</title>
 <style>
   /* ================= 设计变量 (Vitality Mint & Crisp White 毛玻璃体系) ================= */
@@ -1339,6 +1349,7 @@
     <span>📁</span><span id="ws-name">—</span>
   </div>
   <div class="conn"><span class="dot" id="conn-dot"></span><span id="conn-text">就绪</span></div>
+  <span id="standby-control"></span>
   <div class="layout-menu">
     <button class="btn-ico" onclick="toggleMenu(event)" title="布局设置">▦</button>
     <div class="menu-pop" id="menu-pop">
@@ -2616,14 +2627,17 @@ function initMintParticles(){
 
   animId = requestAnimationFrame(frame);
 
-  document.addEventListener('visibilitychange', () => {
-    if(document.hidden){
+  function syncMintAnimation(){
+    if(document.hidden || document.documentElement.dataset.agentStandby === 'true'){
       if(animId) cancelAnimationFrame(animId);
       animId = null;
     } else if(!animId){
       animId = requestAnimationFrame(frame);
     }
-  });
+  }
+  document.addEventListener('visibilitychange', syncMintAnimation);
+  document.addEventListener('m-agent:standby', syncMintAnimation);
+  syncMintAnimation();
 }
 try { initMintParticles(); } catch(e){}
 // Only the personal service advertises this capability; worker/orchestration panels do not.
@@ -2632,6 +2646,10 @@ fetch(apiUrl('/agent/status')).then(r => r.ok ? r.json() : null).then(status => 
   const node=$('personal-learning');node.hidden=false;
   const script=document.createElement('script');script.src=apiUrl('/agent/understanding/panel.js');document.head.append(script);
 }).catch(() => {});
+</script>
+<script type="module">
+  import {mountStandby} from './agent/panel-assets/standby.js?v=garden-1';
+  mountStandby({target:document.getElementById('standby-control'),scope:'personal'});
 </script>
 </body>
 </html>

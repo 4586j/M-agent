@@ -1,5 +1,14 @@
 const API = "/collab/v1";
 const MANAGERS = ["owner", "manager"];
+const PROPOSAL_STATE = {
+  running: "规划调用中",
+  pending: "等待管理者确认",
+  clarification: "需要补充需求",
+  blocked: "校验未通过",
+  unknown: "调用结果或费用待核查",
+  rejected: "已退回或已对账",
+  published: "已确认发布",
+};
 // 与后端 PAUSABLE_STATUSES 同一条边界：只有还在派发的需求能被暂停，等签字的交付不由界面打断。
 const PAUSABLE = ["executing", "rework"];
 const DECISIONS = {
@@ -767,7 +776,7 @@ function renderCreate(projectId) {
 async function renderClarification(block, projectId, requirementId) {
   const path = `/projects/${projectId}/requirements/${requirementId}`;
   const messages = await get(`${path}/messages`);
-  add(block, "dt", null, "澄清对话（本服务未接模型，这里只存人写下的补充）");
+  add(block, "dt", null, "澄清对话（补充说明不自动改写已冻结原文）");
   if (!messages.length) {
     add(block, "dd", null, "还没有补充说明。把审核人可能要追问的边界先写在这里。");
   }
@@ -1012,6 +1021,7 @@ async function renderRequirement(projectId, requirementId) {
     add(block, "pre", "original", revision.content);
   }
   // 没有已发布计划时不请求交付视图：那份汇总本来就不存在，服务端只会回一个 409。
+  await renderPlanning(block, projectId, requirementId, requirement);
   if (await renderWorkItems(block, projectId, requirementId, requirement.status === "paused")) {
     try {
       const delivery = await get(`${path}/delivery`);
@@ -1050,6 +1060,98 @@ async function renderRequirement(projectId, requirementId) {
     }
   }
   renderActivity(block, await get(`${path}/activity?limit=${ACTIVITY_LIMIT}`));
+}
+
+async function renderPlanning(block, projectId, requirementId, requirement) {
+  const capabilities = await get("/capabilities");
+  if (!capabilities.real_planner) return;
+  const path = `/projects/${projectId}/requirements/${requirementId}`;
+  const proposals = await get(`${path}/planning-proposals`);
+  add(block, "dt", null, "AI 职责规划与预算确认");
+  add(block, "dd", "locator", "AI 产出候选计划，管理者确认后才派发；1 美元 = 1,000,000 SDK 估算单位。验收仍由人决定。");
+  const frozen = proposals.filter(proposal => proposal.revision_id === requirement.approved_revision_id).at(-1);
+  if (frozen && requirement.requester_id === me
+      && ["approved", "planning_blocked"].includes(requirement.status)) {
+    const editor = add(block, "details");
+    add(editor, "summary", null, "根据澄清补充需求，保存为待审核的新版本");
+    const revision = await get(`${path}/revisions/${requirement.current_revision_id}`);
+    const content = add(editor, "textarea", "draft");
+    content.rows = 8;
+    content.value = revision.content;
+    const acceptance = add(editor, "textarea", "draft");
+    acceptance.rows = 3;
+    acceptance.setAttribute("aria-label", "新版本验收标准，每行一条");
+    acceptance.value = frozen.acceptance_items.map(item => item.text).join("\n");
+    draftButton(editor, "另存新版本并重新审核", null, async () => {
+      const items = acceptance.value.split("\n").map(item => item.trim()).filter(Boolean);
+      if (!items.length) throw new Error("请保留或明确调整验收标准，不能在补充需求时静默丢失");
+      await post(`${path}/revisions`, {content: content.value, acceptance_items: items,
+                                      expected_version: requirement.version});
+      await report("新版本已保存为草稿，请点名审核人送审；旧候选不能批准这一版。");
+    });
+  }
+  if (MANAGERS.includes(role) && ["approved", "planning_blocked"].includes(requirement.status)) {
+    const form = add(block, "div", "form-row");
+    draftButton(form, "生成职责候选计划（消耗模型预算）", null, async () => {
+      await post(`${path}/plans`, {});
+      await report("规划结果已记录；查看职责、依赖、验收映射和预算后决定。");
+    });
+  }
+  for (const proposal of proposals) {
+    const row = add(block, "dd", "item");
+    add(row, "p", null, `候选 ${proposal.proposal_id.slice(0, 8)} · ${named(PROPOSAL_STATE, proposal.status)} · `
+        + `规划费用 ${proposal.cost_units === null ? "未知，保留预占" : proposal.cost_units}`);
+    if (proposal.candidate?.analysis) add(row, "p", null, String(proposal.candidate.analysis));
+    for (const question of (proposal.status === "clarification" ? proposal.candidate?.clarification_questions : []) || []) {
+      add(row, "p", null, `需要澄清：${question}`);
+    }
+    const planned = ["pending", "published"].includes(proposal.status) ? proposal.candidate?.items : [];
+    for (const item of planned || []) {
+      const task = add(row, "div", "item");
+      const member = roster.find(person => person.user_id === item.assignee_user_id);
+      add(task, "p", null, `${item.key} · ${item.title} · ${item.duty} · ${member?.display_name || item.assignee_user_id}`);
+      add(task, "p", null, `目标：${item.objective}；范围：${item.scope}；不包含：${item.non_goals}`);
+      add(task, "p", null, `依赖：${(item.depends_on || []).join("、") || "无"}；执行估值：${item.estimated_units}`);
+      for (const id of item.acceptance_ids || []) {
+        const acceptance = proposal.acceptance_items.find(entry => entry.item_id === id);
+        add(task, "p", null, `验收 ${id}：${acceptance?.text || "候选引用无效"}`);
+      }
+    }
+    if (proposal.report.problems?.length) add(row, "p", null, proposal.report.problems.join("、"));
+    if (!MANAGERS.includes(role)) continue;
+    const form = add(row, "div", "form-row");
+    const reason = add(form, "input");
+    reason.placeholder = "退回理由，或对账证据（先核实原进程已经停止）";
+    if (proposal.status === "pending" && proposal.revision_id === requirement.approved_revision_id
+        && ["approved", "planning_blocked"].includes(requirement.status)) {
+      draftButton(form, "确认职责与预算并发布", null, async () => {
+        await post(`${path}/planning-proposals/${proposal.proposal_id}/decision`,
+                   {decision: "approve", expected_version: proposal.version, reason: reason.value});
+        await report("计划已由你确认发布，可按依赖执行。");
+      });
+    }
+    if (["pending", "clarification", "blocked"].includes(proposal.status)) {
+      draftButton(form, "退回候选计划", "soft", async () => {
+        await post(`${path}/planning-proposals/${proposal.proposal_id}/decision`,
+                   {decision: "reject", expected_version: proposal.version, reason: reason.value});
+        await report("候选已退回。资料不足时请更新需求并重新审核，再生成计划。");
+      });
+    }
+    if (["unknown", "running"].includes(proposal.status)) {
+      const units = add(form, "input");
+      units.type = "number";
+      units.min = "0";
+      units.step = "1";
+      units.placeholder = "核实后的 SDK 估算单位";
+      draftButton(form, "确认进程已停止并记录费用对账", "soft", async () => {
+        if (!units.value.trim()) throw new Error("请填写核实后的费用，不能将未知自动记为零");
+        await post(`${path}/planning-proposals/${proposal.proposal_id}/decision`,
+                   {decision: "reconcile", expected_version: proposal.version,
+                    reason: reason.value, usage_units: Number(units.value)});
+        await report("对账已记录，后续生成是一次新的模型调用。");
+      });
+    }
+  }
 }
 
 async function renderWorkItems(block, projectId, requirementId, paused) {

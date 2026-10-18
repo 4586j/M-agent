@@ -14,6 +14,9 @@ workspace/agent/orchestrator/runtime/.tasks/
 workspace/agent/orchestrator/runtime/audit/
 worker/.worker_work/
 _e2e/
+# 可再生成的截图及视觉验收产物；不全局忽略业务图片资源
+/product-verdict-e2e.png
+/docs/architecture-overview.visual-check.*
 .agent_usage/
 # 经验库落盘产物（测试/运行散落到仓库根，正常应在 runtime/.experiences/）
 /exp-local-*.json
@@ -67,3 +70,5 @@ web/playwright-report/
 workspace/agent/orchestrator/runtime/.understanding-*/
 .codex/
 gemini-code-*.md
+/team-sdk.local.json
+/workspace/agent/orchestrator/runtime/collab-data/

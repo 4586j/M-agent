@@ -17,7 +17,7 @@ import time
 from .database import Database, SCHEMA_VERSION
 from .models import InvalidState
 
-_COUNTED = ("projects", "requirements", "requirement_revisions", "plans", "work_items",
+_COUNTED = ("projects", "requirements", "requirement_revisions", "planning_proposals", "plans", "work_items",
             "attempts", "attempt_artifacts", "collaboration_audit")
 
 

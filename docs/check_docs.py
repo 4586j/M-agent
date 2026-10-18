@@ -12,6 +12,8 @@ MAINTAINED = (
     "README.md", "AGENTS.md", "CHANGELOG.md", "docs/README.md",
     "docs/项目介绍.md", "docs/系统架构.md", "docs/开发计划.md",
     "docs/问题修复与解决方法.md", "docs/开发与文档维护规范.md",
+    "docs/团队真实规划与执行接通_2026-10-18.md",
+    "docs/待机动画方案与接入边界_2026-10-18.md",
     "docs/templates/修复记录模板.md", "docs/templates/架构决策模板.md",
     "docs/templates/开发任务模板.md", ".github/pull_request_template.md",
 )

@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>M-agent · 待机设计室</title>
+  <link rel="stylesheet" href="styles.css?v=bloom-perf-1">
+  <script src="lab.js?v=bloom-perf-1" defer></script>
+</head>
+<body>
+  <div id="labApp">
+    <header class="masthead">
+      <a href="#" class="brand" aria-label="M-agent 待机设计室"><span class="brand-symbol" aria-hidden="true">m<span>·</span></span><span>M-agent<span class="brand-section">待机设计室</span></span></a>
+      <span class="local-label"><i></i>独立预览，无业务数据</span>
+    </header>
+    <main>
+      <section class="introduction">
+        <div><p class="eyeline">给长时间工作的你，一点留白</p><h1>离开片刻，<br>让屏幕换个呼吸。</h1></div>
+        <div class="intro-aside"><p>内容退到幕后，光影来到眼前。<br>五种待机表情，找一种属于你的节奏。</p><button class="text-button" id="simulateButton"><span class="tiny-timer" aria-hidden="true"></span>模拟离开 5 秒</button></div>
+      </section>
+      <section class="studio" aria-label="待机效果比较">
+        <div class="main-preview">
+          <div class="stage" id="stage" data-theme="orbit">
+            <canvas id="stageCanvas" aria-hidden="true"></canvas>
+            <div class="stage-clock clock-block"><time class="time-display">00:00</time><div class="date-display"></div></div>
+            <div class="cover-label"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="5" y="10" width="14" height="10" rx="3"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/></svg>内容已遮挡</div>
+            <div class="stage-poem" id="stagePoem">让思绪，绕一小段远路。</div>
+            <div class="stage-tools"><button id="pauseButton" aria-pressed="false" title="暂停或继续动效"><span id="pauseGlyph" aria-hidden="true">Ⅱ</span><span id="pauseText">暂停动效</span></button><span class="stage-mode">实时动效</span></div>
+          </div>
+          <div class="stage-caption"><div><h2 id="sceneName">引力编队</h2><p id="sceneDescription">节点绕着同一个重心，安静地继续运转。</p><div id="bloomVariants" class="bloom-variants" role="group" aria-label="呼吸花园的表现方式" hidden><button type="button" data-bloom="lines" aria-pressed="true">流线花冠</button><button type="button" data-bloom="particles" aria-pressed="false">星尘花园</button></div><div id="bloomInteraction" class="bloom-interaction" hidden><span>移动轻拂，轻点泛起涟漪</span><button type="button" id="bloomRippleButton">唤起涟漪</button></div></div><button class="primary-button" id="experienceButton">全屏体验<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 4H4v4m12-4h4v4M4 16v4h4m12-4v4h-4"/></svg></button></div>
+        </div>
+        <aside class="scene-picker" aria-label="选择待机方案">
+          <div class="picker-heading"><h2>选一种氛围</h2><span>5 个动态方案</span></div>
+          <div class="scene-list" role="group" aria-label="动态方案" id="sceneList"></div>
+          <p class="picker-tip"><span aria-hidden="true">↔</span>全屏时也可用左右方向键切换</p>
+        </aside>
+      </section>
+      <section class="tuning" aria-label="体验设置">
+        <div class="tuning-heading"><h2>调到刚刚好</h2><span>设置只影响这间预览室</span></div>
+        <div class="settings-grid">
+          <label class="setting"><span class="setting-label">闲置后自动待机</span><select id="idleSelect"><option value="15">15 秒 · 快速体验</option><option value="60">1 分钟</option><option value="300" selected>5 分钟 · 建议</option><option value="0">不自动进入</option></select></label>
+          <label class="setting"><span class="setting-label">动效强度<output id="intensityValue">舒缓</output></span><input id="intensityRange" type="range" min="25" max="100" value="60" aria-label="动效强度"><span class="range-labels"><span>轻一些</span><span>生动些</span></span></label>
+          <label class="setting"><span class="setting-label">画面亮度<output id="brightnessValue">85%</output></span><input id="brightnessRange" type="range" min="35" max="100" value="85" aria-label="画面亮度"><span class="range-labels"><span>低亮陪伴</span><span>完整呈现</span></span></label>
+          <div class="display-settings"><label class="switch-row"><span>显示时钟</span><input type="checkbox" id="clockToggle" checked><span class="switch-track" aria-hidden="true"></span></label><label class="switch-row"><span>减少动态</span><input type="checkbox" id="reducedToggle"><span class="switch-track" aria-hidden="true"></span></label><span class="motion-note" id="motionNote">支持系统减少动态偏好</span></div>
+        </div>
+      </section>
+      <section class="design-notes" aria-label="交互原则">
+        <article><span class="note-icon" aria-hidden="true">◒</span><h3>把内容彻底藏好</h3><p>进入待机时使用不透明遮挡，任务、对话和用量都不出现在待机画面。</p></article>
+        <article><span class="note-icon" aria-hidden="true">↵</span><h3>回来，由你决定</h3><p>鼠标晃动不会露出内容。按住返回按钮，或按 Enter 明确确认后再恢复。</p></article>
+        <article><span class="note-icon" aria-hidden="true">≈</span><h3>热闹留给工作</h3><p>低亮、慢速、无声音。切到其他标签时暂停绘制，也可以停在喜欢的一帧。</p></article>
+      </section>
+      <section class="preference"><div><h2 id="preferenceTitle">喜欢这一种感觉？</h2><p>先选视觉方向，再接入正式界面的闲置与恢复流程。</p></div><button class="secondary-button" id="chooseButton">记下这个方案</button></section>
+    </main>
+    <footer><span>M-agent / 交互概念预览</span><span>画面遮挡用于防止旁观，不等同于身份验证锁屏。</span></footer>
+  </div>
+  <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
+  <div class="simulation" id="simulation" role="status" hidden><span id="simulationText">5 秒后进入待机</span><button id="cancelSimulation">取消</button></div>
+  <section class="standby-layer" id="standbyLayer" data-theme="orbit" role="dialog" aria-modal="true" aria-label="待机画面，业务内容已遮挡" hidden>
+    <canvas id="fullCanvas" aria-hidden="true"></canvas>
+    <div class="full-header"><span class="full-brand">m<span>·</span></span><span class="full-private"><span class="private-dot"></span>工作区画面已遮挡</span></div>
+    <div class="full-clock clock-block"><time class="time-display">00:00</time><div class="date-display"></div><p id="fullPoem">让思绪，绕一小段远路。</p></div>
+    <div class="full-footer"><div class="full-scheme"><button id="previousScene" aria-label="上一个待机方案">←</button><span id="fullSceneName">引力编队</span><button id="nextScene" aria-label="下一个待机方案">→</button></div><div class="return-area"><button id="returnButton" class="return-button" aria-label="按住返回设计室，或按 Enter 确认"><span class="hold-progress" id="holdProgress"></span><span>按住返回设计室<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 7H5v13h13v-3M13 4h7v7m0-7L10 14"/></svg></span></button><span class="return-help">或聚焦按钮后按 Enter 确认</span></div><span class="full-quiet">离开一会儿，也很好。</span></div>
+  </section>
+</body>
+</html>

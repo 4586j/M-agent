@@ -2957,6 +2957,7 @@ def test_every_word_the_schema_allows_has_a_chinese_label(tmp_path):
     assert labeled("ISOLATION_STATE") == allowed("execution_instances", "isolation_mode")
     assert labeled("VERDICT_STATE") == allowed("requirement_acceptance", "decision")
     assert labeled("ROLE_STATE") == allowed("project_members", "access_role")
+    assert labeled("PROPOSAL_STATE") == allowed("planning_proposals", "status")
     # 兜底必须还在：映射漏一个词时难看但不撒谎，删掉这句等于把「漏词」变成「漏事实」。
     assert "return map[value] || value" in source
     # 面板里任何一处直接把枚举词插进模板，都会绕过上面这几张表——这条守住那个「任何一处」。

@@ -14,6 +14,7 @@ import ConnectionSettings from './components/ConnectionSettings'
 import CommandPalette from './components/CommandPalette'
 import ParticleBackground from './components/ParticleBackground'
 import BrainScope from './components/BrainScope'
+import StandbyControl from './components/StandbyControl'
 
 interface NavGroup {
   domain: string
@@ -276,6 +277,7 @@ function AppShell() {
           </div>
 
           <div className="flex items-center gap-3">
+            <StandbyControl />
             {/* ⌘K 搜索胶囊 */}
             <button
               type="button"

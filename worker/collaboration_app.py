@@ -31,6 +31,7 @@ from collaboration_client import (CollaborationClient, Conflict, Fetched, Missin
                                   Unauthorized, WorkerError, digest_of, validate_base_url)
 from collaboration_journal import (PAUSED_GATE, RECONCILING, REFUSED, REPORTED, STARTED, STOPPED,
                                    ExecutionJournal, JournalError)
+from collaboration_contracts import Produced, RunRequest, RunOutcome
 
 PACKAGE_SCHEMA_VERSION = "collab-package-v1"
 MAX_ARTIFACT_BYTES = 8 * 1024 * 1024
@@ -78,35 +79,6 @@ def _loopback(host: str) -> bool:
         return ip_address(host).is_loopback
     except ValueError:
         return host == "localhost"
-
-
-@dataclass(frozen=True)
-class Produced:
-    """One output file the runner claims to have produced."""
-    name: str
-    media_type: str
-    content: bytes
-
-
-@dataclass(frozen=True)
-class RunRequest:
-    attempt_id: str
-    work_item_id: str
-    input_hash: str
-    requirement_hash: str
-    package: dict
-    requirement_text: str
-    work_dir: Path
-    allowed_tools: tuple
-    cancel: threading.Event
-
-
-@dataclass(frozen=True)
-class RunOutcome:
-    status: str
-    summary: str
-    produced: tuple = ()
-    usage_units: int = 0
 
 
 class FakeRunner:
@@ -217,8 +189,8 @@ class WorkerSettings:
             raise Rejected("Invalid lease interval")
         if not isinstance(self.poll_interval, (int, float)) or not 1 <= self.poll_interval <= 600:
             raise Rejected("Invalid poll interval")
-        if self.runner not in ("none", "fake"):
-            raise Rejected("Runner must be none or fake")
+        if self.runner not in ("none", "fake", "sdk"):
+            raise Rejected("Runner must be none, fake or sdk")
         self.state_dir.mkdir(parents=True, exist_ok=True)
 
     @property
@@ -477,8 +449,12 @@ class CollaborationWorker:
                 outcome = self.runner(request)
                 report = self._classify(outcome)
             except Exception as error:
-                report = {"status": "failed", "usage_units": 0, "produced": [],
-                          "summary": f"execution failed: {type(error).__name__}"}
+                held_units = package.get("policy", {}).get("budget_units", 0) \
+                    if self.settings.runner == "sdk" else 0
+                report = {"status": "failed", "usage_units": held_units, "produced": [],
+                          "summary": f"execution failed: {type(error).__name__}" +
+                          ("; SDK cost unknown, reservation retained for review"
+                           if self.settings.runner == "sdk" else "")}
         finally:
             stop.set()
             renewer.join(timeout=max(1.0, float(self.settings.lease_interval)))
@@ -832,7 +808,8 @@ def main(argv=None) -> int:
     serve.add_argument("--capacity", type=int, default=1)
     serve.add_argument("--lease-interval", default="30")
     serve.add_argument("--poll-interval", default="30")
-    serve.add_argument("--runner", choices=("none", "fake"), default="none")
+    serve.add_argument("--runner", choices=("none", "fake", "sdk"), default="none")
+    serve.add_argument("--sdk-config", type=Path)
     serve.add_argument("--allow-remote", action="store_true")
     args = parser.parse_args(argv)
 
@@ -877,8 +854,22 @@ def main(argv=None) -> int:
     except (Rejected, OSError):
         return report("Worker configuration was rejected")
 
-    runner = FakeRunner() if settings.runner == "fake" else None
     client = CollaborationClient(settings.base_url, instance_token=token)
+    runner = FakeRunner() if settings.runner == "fake" else None
+    if settings.runner == "sdk":
+        try:
+            if args.sdk_config is None:
+                raise ValueError("SDK configuration required")
+            from collaboration_runner import SdkRunner
+            from agent_core.team_sdk import TeamConfig
+            sdk_config = TeamConfig(args.sdk_config)
+            instance_policy = client.describe()
+            sdk_config.provider(instance_policy.get("provider_ref"))
+            runner = SdkRunner(sdk_config, artifact_loader=client.artifact,
+                               instance_policy=instance_policy)
+        except (ValueError, OSError, WorkerError):
+            client.close()
+            return report("Team SDK configuration or instance policy was rejected")
     journal = ExecutionJournal(settings.journal_path)
     worker = CollaborationWorker(client, journal, settings=settings, runner=runner)
     try:

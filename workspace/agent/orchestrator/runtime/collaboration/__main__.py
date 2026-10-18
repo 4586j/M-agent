@@ -19,6 +19,7 @@ from .host import SchedulerHost
 from .instances import InstanceService
 from .models import CollaborationError
 from .planning import PlanService
+from .sdk_planning import configure_planner
 from .recovery import fence_after_restore
 from .reviews import ReviewService
 from .scheduler import QueueService, Scheduler
@@ -42,6 +43,8 @@ def main(argv=None) -> int:
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=7400)
     serve.add_argument("--origin", default="http://127.0.0.1:7400")
+    serve.add_argument("--planner-config", type=Path)
+    serve.add_argument("--auto-dispatch", action="store_true")
     enroll = commands.add_parser("node-enroll", help="Register an execution node; prints its token once")
     enroll.add_argument("--data-dir", type=Path, required=True)
     enroll.add_argument("--name", required=True)
@@ -62,6 +65,7 @@ def main(argv=None) -> int:
     scheduler.add_argument("--iterations", type=int, default=None)
     scheduler.add_argument("--project", default=None)
     scheduler.add_argument("--auto-dispatch", action="store_true")
+    scheduler.add_argument("--planner-config", type=Path)
     args = parser.parse_args(argv)
 
     if args.command == "bootstrap":
@@ -139,7 +143,8 @@ def main(argv=None) -> int:
             instances = InstanceService(database)
             budgets = BudgetService()
             host = SchedulerHost(
-                Scheduler(database, planning=PlanService(database, budgets=budgets),
+                Scheduler(database, planning=configure_planner(
+                              PlanService(database, budgets=budgets), args.planner_config),
                           queue=QueueService(database,
                                              heartbeat_timeout=instances.heartbeat_timeout),
                           dispatch=DispatchService(database, instances=instances,
@@ -162,7 +167,8 @@ def main(argv=None) -> int:
     if not 1 <= args.port <= 65535:
         parser.error("Port must be between 1 and 65535")
     try:
-        config = AppConfig(args.data_dir, public_origin=args.origin)
+        config = AppConfig(args.data_dir, public_origin=args.origin,
+                           planner_config=args.planner_config, auto_dispatch=args.auto_dispatch)
     except ValueError:
         parser.error("Invalid public origin")
     if config.public_origin.startswith("http://"):

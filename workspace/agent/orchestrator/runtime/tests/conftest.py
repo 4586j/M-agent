@@ -8,6 +8,10 @@ from pathlib import Path
 import pytest
 
 
+def pytest_configure(config):
+    config.addinivalue_line("markers", "sdk_smoke: opt-in real SDK calls with an explicit budget")
+
+
 @pytest.fixture(autouse=True)
 def _isolate_audit_log(tmp_path, monkeypatch):
     """所有 runtime 测试的审计写入都落到独立临时路径（ORCH_AUDIT_LOG）。"""

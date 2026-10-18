@@ -1653,6 +1653,15 @@ def create_artifact_router() -> APIRouter:
             return {"path": path, "content": base64.b64encode(data).decode("ascii"),
                     "encoding": "base64", "size": size}
 
+    @router.get("/agent/panel-assets/{filename}")
+    def serve_panel_asset(filename: str):
+        """Explicit local module allowlist; never serve arbitrary workspace files."""
+        from fastapi.responses import FileResponse
+        if filename not in {"standby.js", "bloom.js"}:
+            raise HTTPException(status_code=404, detail="panel asset not found")
+        asset = Path(__file__).resolve().parent / "panel" / filename
+        return FileResponse(asset, media_type="text/javascript", headers={"Cache-Control": "no-cache"})
+
     @router.get("/panel")
     def serve_panel():
         """Agent 面板（单文件深色 UI，由本服务直接托管）。"""

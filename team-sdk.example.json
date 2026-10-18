@@ -1,0 +1,29 @@
+{
+  "version": 1,
+  "providers": {
+    "team-ark": {
+      "model": "ark-code-latest",
+      "base_url": "https://ark.cn-beijing.volces.com/api/plan",
+      "auth_token_env": "TEAM_ARK_AUTH_TOKEN"
+    }
+  },
+  "workspaces": {
+    "team-project": {"root": "D:/agent/team-workspaces/project-a"}
+  },
+  "personas": {
+    "analyst-v1": {
+      "system_prompt": "负责需求分析，列明实现边界、风险、验收映射和交接说明。不能代替人决定目标或验收。",
+      "allowed_tools": ["Read", "Glob", "Grep", "Write"]
+    },
+    "developer-v1": {
+      "system_prompt": "负责按冻结任务实现代码，使用依赖交付物，在 outputs 中交付源码及实际验证说明。不能伪造测试或人工验收。",
+      "allowed_tools": ["Read", "Glob", "Grep", "Write", "Edit"]
+    },
+    "reviewer-v1": {
+      "system_prompt": "负责技术评审，检查需求覆盖、代码原理、边界和缺陷，生成评审报告。人工确认和最终验收由人决定。",
+      "allowed_tools": ["Read", "Glob", "Grep", "Write"]
+    }
+  },
+  "planner": {"provider_ref": "team-ark", "max_cost_usd": 0.10, "max_turns": 2, "timeout_seconds": 180},
+  "execution": {"max_cost_usd": 0.10, "max_turns": 16, "timeout_seconds": 180}
+}

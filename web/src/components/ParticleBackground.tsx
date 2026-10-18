@@ -77,10 +77,10 @@ export const ParticleBackground: React.FC = () => {
 
     // 页面隐藏时暂停帧循环以节省性能
     const onVisibilityChange = () => {
-      if (document.hidden) {
+      if (document.hidden || document.documentElement.dataset.agentStandby === 'true') {
         isPaused = true
         cancelAnimationFrame(animationFrameId)
-      } else {
+      } else if (isPaused) {
         isPaused = false
         animationFrameId = requestAnimationFrame(render)
       }
@@ -90,6 +90,7 @@ export const ParticleBackground: React.FC = () => {
     window.addEventListener('mousemove', onMouseMove, { passive: true })
     window.addEventListener('mouseleave', onMouseLeave)
     document.addEventListener('visibilitychange', onVisibilityChange)
+    document.addEventListener('m-agent:standby', onVisibilityChange)
 
     const getColor = (type: Particle['colorType'], alpha: number): string => {
       switch (type) {
@@ -176,6 +177,7 @@ export const ParticleBackground: React.FC = () => {
     }
 
     animationFrameId = requestAnimationFrame(render)
+    onVisibilityChange()
 
     return () => {
       cancelAnimationFrame(animationFrameId)
@@ -183,6 +185,7 @@ export const ParticleBackground: React.FC = () => {
       window.removeEventListener('mousemove', onMouseMove)
       window.removeEventListener('mouseleave', onMouseLeave)
       document.removeEventListener('visibilitychange', onVisibilityChange)
+      document.removeEventListener('m-agent:standby', onVisibilityChange)
     }
   }, [])
 
