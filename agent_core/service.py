@@ -43,6 +43,7 @@ import base64
 import heapq
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -54,7 +55,7 @@ from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any, AsyncIterator
 
-from fastapi import (APIRouter, FastAPI, HTTPException, WebSocket,
+from fastapi import (APIRouter, FastAPI, HTTPException, Request, WebSocket,
                      WebSocketDisconnect)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -84,6 +85,9 @@ _DEFAULT_PERSONA = "executor"
 _ASYNC_RUNS: dict[str, dict] = {}
 # oneshot 用量模块级累加器（与 session 用量分开统计）
 _ONESHOT_TOTALS: dict = {"runs": 0, "errors": 0, "total_cost_usd": 0.0, "total_turns": 0}
+_TITLE_USAGE_LOCK = threading.Lock()
+_TITLE_USAGE: dict = {"calls": 0, "errors": 0, "unknown_cost_calls": 0,
+                     "total_cost_usd": 0.0, "total_turns": 0, "usage": {}}
 # doctor 自检结果缓存（main() 启动时填充；/health 惰性兜底）
 _HEALTH_CHECKS: list | None = None
 # 指标采集：最近 N 次执行的延迟分布（用于 /agent/metrics）
@@ -132,6 +136,7 @@ class RunReq(BaseModel):
     cwd: str | None = Field(None, description="任务工作目录（绝对路径）；缺省在 work_dir 下自动创建")
     model: str | None = Field(None, description="模型覆盖（如 qwen3.8-flash）；缺省用 persona/配置默认")
     planning_enabled: bool | None = Field(None, description="true 时用 Plan-Execute 引擎（异步路径）；计划步骤实时产出 plan_update 事件")
+    understanding_check_id: str | None = None
     session_id: str | None = Field(
         None, description="持久会话 id（POST /agent/session/persist 创建）："
                           "历史轮次注入上下文延续对话，本轮结果落盘会话文件")
@@ -151,6 +156,12 @@ class SessionMessageReq(BaseModel):
     """会话消息请求。"""
     prompt: str = Field(..., description="本轮消息内容（必填）")
     timeout: float | None = Field(None, description="本轮墙钟超时（秒）；缺省不限。超时转 error 事件结束本轮")
+    understanding_check_id: str | None = None
+
+
+class SessionUpdateReq(BaseModel):
+    """持久会话属性更新请求（如重命名标题）。"""
+    title: str = Field(..., description="新会话标题", max_length=100)
 
 
 class MemoryWriteReq(BaseModel):
@@ -325,11 +336,34 @@ _POLICY_DEFAULT: dict = {
 }
 
 
+def _validate_workspace_policy(user: Any) -> dict:
+    """Validate all recognized fields before applying any override."""
+    if not isinstance(user, dict):
+        raise ValueError("策略根节点必须是对象")
+    wb = user.get("workspace_boundary", {})
+    if not isinstance(wb, dict):
+        raise ValueError("workspace_boundary 必须是对象")
+    for name in ("enforce", "scan_command_paths"):
+        if name in wb and type(wb[name]) is not bool:
+            raise ValueError(f"workspace_boundary.{name} 必须是布尔值")
+    if ("confirm_granularity" in wb
+            and wb["confirm_granularity"] not in ("per_action", "per_session")):
+        raise ValueError("confirm_granularity 必须是 per_action 或 per_session")
+    if "extra_allowed_dirs" in wb:
+        dirs = wb["extra_allowed_dirs"]
+        if not isinstance(dirs, list) or any(
+            not isinstance(d, str) or not d.strip() or not Path(d).is_absolute()
+            for d in dirs
+        ):
+            raise ValueError("extra_allowed_dirs 必须是非空绝对目录路径的数组")
+    return {k: v for k, v in wb.items() if k in _POLICY_DEFAULT["workspace_boundary"]}
+
+
 def _load_policy() -> dict:
     """加载工作区边界策略：<project_root>/.agent_policy.json（缺省用内置默认）。
 
     文件缺失/字段缺失回退默认——策略是增强，不是依赖；
-    但 JSON 损坏必须告警（策略从未生效却无感知是最危险的静默失败）。
+    JSON 损坏、结构或字段类型错误均告警，并整体回退默认策略。
     """
     global _POLICY
     if _POLICY is not None:
@@ -339,10 +373,8 @@ def _load_policy() -> dict:
     if pf.exists():
         try:
             user = json.loads(pf.read_text(encoding="utf-8"))
-            wb = user.get("workspace_boundary", {})
-            merged["workspace_boundary"].update(
-                {k: v for k, v in wb.items() if k in merged["workspace_boundary"]})
-        except (json.JSONDecodeError, UnicodeDecodeError, OSError) as e:
+            merged["workspace_boundary"].update(_validate_workspace_policy(user))
+        except (ValueError, UnicodeDecodeError, OSError) as e:
             logger.warning("策略文件 %s 解析失败（%s），已回退内置默认策略——"
                            "请修复该文件后重启服务", pf, e)
     _POLICY = merged
@@ -480,7 +512,7 @@ def _make_event_sink(run_id: str):
 # 注入（复用内核既有通道），刷新/重启后对话不丢。
 
 _SESSIONS_DIR_LOCK = threading.Lock()
-_SESSION_WRITE_LOCK = threading.Lock()
+_SESSION_WRITE_LOCK = threading.RLock()
 _SID_RE = re.compile(r"[0-9a-f]{12}")
 # 注入上下文的历史轮次预算：最近 8 轮，每轮输出截 1500 字符，总块 6000 字符
 _SESSION_HISTORY_TURNS = 8
@@ -525,6 +557,62 @@ def _save_session(rec: dict, *, require_existing: bool = False) -> None:
         os.replace(tmp, p)
 
 
+def _append_session_turn(sid: str, turn: dict) -> dict:
+    """Merge a completed turn into the latest record, preserving concurrent title edits."""
+    with _SESSION_WRITE_LOCK:
+        rec = _load_session(sid)
+        rec.setdefault("turns", []).append(turn)
+        rec["updated_at"] = round(time.time(), 3)
+        if not rec.get("title"):
+            rec["title"] = _extract_initial_title(turn.get("prompt", ""))
+        _save_session(rec, require_existing=True)
+        return rec
+
+
+def _update_session_title(sid: str, title: str, *, snapshot: dict | None = None,
+                          manual: bool = False, automatic: bool = False) -> tuple[dict, bool]:
+    """Update only the title under the same lock as append/delete, with stale-result checks."""
+    with _SESSION_WRITE_LOCK:
+        rec = _load_session(sid)
+        if snapshot is not None and (
+            rec.get("title_revision", 0) != snapshot.get("title_revision", 0)
+            or rec.get("title", "") != snapshot.get("title", "")
+        ):
+            return rec, False
+        if automatic and rec.get("title_source") == "manual":
+            return rec, False
+        rec["title"] = title[:60]
+        rec["title_source"] = "manual" if manual else "ai"
+        rec["title_revision"] = rec.get("title_revision", 0) + 1
+        rec["updated_at"] = round(time.time(), 3)
+        _save_session(rec, require_existing=True)
+        return rec, True
+
+
+def _record_title_usage(result: Any = None) -> None:
+    cost = getattr(result, "cost_usd", None)
+    valid_cost = (isinstance(cost, (int, float)) and not isinstance(cost, bool)
+                  and math.isfinite(cost) and cost >= 0)
+    with _TITLE_USAGE_LOCK:
+        _TITLE_USAGE["calls"] += 1
+        _TITLE_USAGE["errors"] += int(result is None or bool(getattr(result, "is_error", False)))
+        if valid_cost:
+            _TITLE_USAGE["total_cost_usd"] += cost
+        else:
+            _TITLE_USAGE["unknown_cost_calls"] += 1
+        _TITLE_USAGE["total_turns"] += getattr(result, "turns", 0) or 0
+        for key, value in (getattr(result, "usage", None) or {}).items():
+            if (key in {"input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"}
+                    and isinstance(value, int) and not isinstance(value, bool) and value >= 0):
+                _TITLE_USAGE["usage"][key] = _TITLE_USAGE["usage"].get(key, 0) + value
+
+
+def _title_usage_snapshot() -> dict:
+    with _TITLE_USAGE_LOCK:
+        return {**_TITLE_USAGE, "total_cost_usd": round(_TITLE_USAGE["total_cost_usd"], 6),
+                "usage": dict(_TITLE_USAGE["usage"])}
+
+
 def _session_history_block(rec: dict) -> str:
     """把会话历史轮次收敛为注入上下文的文本块（最近 N 轮，逐轮截断）。"""
     turns = rec.get("turns") or []
@@ -541,6 +629,115 @@ def _session_history_block(rec: dict) -> str:
     if len(block) > _SESSION_HISTORY_CHARS:
         block = block[-_SESSION_HISTORY_CHARS:]
     return "【会话历史（此前轮次摘要，供延续对话用）】\n" + block
+
+
+_TITLE_PREFIX_RE = re.compile(
+    r"^((?:/(?:plan|model|new|usage|cost|help)\b|//)\s*)*"
+    r"((?:你好[，,！!\s]*|您好[，,！!\s]*|请问[，,！!\s]*|请帮我|帮我|我想让你|我想问一下|我想问下|麻烦你|是否可以|能不能|实现一个|写一个|生成一个|创建一个|查找一下|分析一下|关于)\s*)+",
+    re.IGNORECASE,
+)
+
+
+def _extract_initial_title(prompt: str) -> str:
+    """即时规则提取精炼标题：过滤前缀、口语问候、指令及 Markdown。"""
+    raw = (prompt or "").strip()
+    if not raw:
+        return "新会话"
+    if len(raw) <= 8:
+        return raw
+
+    text = _TITLE_PREFIX_RE.sub("", raw).strip()
+    first_line = re.split(r"[\r\n。！？!?；;]", text)[0].strip()
+    cleaned = re.sub(r"[`#*_\-\[\]()]", "", first_line).strip()
+    if len(cleaned) >= 2:
+        return cleaned[:28].strip()
+    return raw[:40].strip()
+
+
+def _summarize_session_title_with_llm(rec: dict, kernel: Any) -> str:
+    """使用 LLM 为会话生成 4~10 字的高质量语义标题。"""
+    turns = rec.get("turns") or []
+    if not turns:
+        return ""
+    first_turn = turns[0]
+    prompt_sample = str(first_turn.get("prompt") or "")[:300]
+    output_sample = str(first_turn.get("output") or "")[:500]
+
+    if len(prompt_sample.strip()) <= 8:
+        return prompt_sample.strip()
+
+    system_instruction = (
+        "你是一个精准的会话标题提炼专家。请阅读用户问题与助手回复，"
+        "提炼出4到10个字的主题标题，便于用户查找历史会话。\n"
+        "【硬性要求】\n"
+        "1. 只输出提炼后的标题本身，严禁输出任何解释、标点符号、书名号、引号或前缀。\n"
+        "2. 紧扣核心动宾短语或领域实体（如：'批量转换PDF工具'、'排查内存泄漏'）。"
+    )
+
+    user_content = f"用户指令：\n{prompt_sample}\n\n助手回答摘要：\n{output_sample}"
+
+    persona = Persona(
+        name="title_summarizer",
+        description="会话标题提炼器",
+        system_prompt=system_instruction,
+        tools=[],
+    )
+
+    tmp_cwd = _runs_dir().parent / "tmp_summary" / f"sum-{uuid.uuid4().hex[:8]}"
+    try:
+        tmp_cwd.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+
+    try:
+        try:
+            res = kernel.run_oneshot(
+                prompt=user_content,
+                persona=persona,
+                cwd=str(tmp_cwd),
+                context_memory="",
+                record_experience=False,
+            )
+        except Exception:
+            _record_title_usage()
+            raise
+        _record_title_usage(res)
+        if getattr(res, "is_error", False):
+            return ""
+        out = str(getattr(res, "output", "") or "").strip()
+        cleaned = re.sub(r'["\'“”《》`#\n\r。！？!?]', '', out).strip()
+        cleaned = re.sub(r'^(?:会话标题|主题标题|标题|主题)[：:\s]*', '', cleaned).strip()
+        if 2 <= len(cleaned) <= 24 and cleaned not in ("完成", "成功", "ok", "OK"):
+            return cleaned
+    except Exception as e:
+        logger.debug("LLM 总结会话标题跳过/失败: %s", e)
+    finally:
+        try:
+            shutil.rmtree(tmp_cwd, ignore_errors=True)
+        except Exception:
+            pass
+
+    return ""
+
+
+async def _trigger_async_title_summary(session_id: str, prompt: str, output: str) -> None:
+    """后台异步触发会话标题的 LLM 提炼与更新。"""
+    if len(prompt.strip()) <= 8:
+        return
+    try:
+        await asyncio.sleep(0.1)
+        rec = _load_session(session_id)
+        if rec.get("title_source") == "manual":
+            return
+        current_title = rec.get("title") or ""
+        kernel = get_kernel()
+        new_title = await asyncio.to_thread(_summarize_session_title_with_llm, rec, kernel)
+        if new_title and new_title != current_title:
+            _, updated = _update_session_title(session_id, new_title, snapshot=rec, automatic=True)
+            if updated:
+                logger.info("会话 %s 标题已自动更新为: %s", session_id, new_title)
+    except Exception as e:
+        logger.debug("异步会话标题总结异常 (已忽略): %s", e)
 
 
 # ---- 图片附件（多模态 v1）：data URL → 任务目录 attachments/ 落盘 ----
@@ -745,7 +942,7 @@ class _RateLimitMiddleware:
 
 # ---- 应用工厂 ----
 
-def create_app(default_persona: str = "executor") -> FastAPI:
+def create_app(default_persona: str = "executor", *, understanding_generator=None) -> FastAPI:
     """装配 FastAPI 应用。default_persona 为未显式指定人设时的默认值。
 
     路由端点按资源分组在模块级 router 工厂（create_runs_router /
@@ -810,6 +1007,9 @@ def create_app(default_persona: str = "executor") -> FastAPI:
         create_history_router,
     ):
         app.include_router(make_router())
+
+    from agent_core.understanding_app import install_personal_understanding
+    install_personal_understanding(app, RunReq, get_config, _workspace_path, understanding_generator)
 
     return app
 
@@ -918,6 +1118,8 @@ def create_system_router() -> APIRouter:
                 "total_cost_usd": round(_ONESHOT_TOTALS["total_cost_usd"], 6),
                 "total_turns": _ONESHOT_TOTALS["total_turns"],
             },
+            "title_usage": _title_usage_snapshot(),
+            "personal_understanding": config.understanding_enabled,
             "default_persona": _DEFAULT_PERSONA,
             "model": config.model,
             "memory_backend": config.memory_backend,
@@ -952,31 +1154,41 @@ def create_runs_router() -> APIRouter:
     router = APIRouter()
 
     @router.post("/agent/run")
-    async def agent_run(req: RunReq) -> dict:
+    async def agent_run(req: RunReq, request: Request) -> dict:
         """单发执行：临时工作目录跑一轮，返回 KernelResult JSON。"""
+        from agent_core.understanding_app import authorize_personal_run
+        await asyncio.to_thread(authorize_personal_run, request, req)
         persona = resolve_persona(req.persona or _DEFAULT_PERSONA)
         cwd = _prepare_cwd(req.cwd, tag="run")
         kernel = get_kernel()
         # 图片附件：落盘任务目录并在 prompt 中告知路径（多模态 v1）
         prompt_text = _augment_prompt_with_images(
             req.prompt, _save_run_attachments(cwd, req.images))
+        learning_run_id = "run-" + uuid.uuid4().hex[:12] if req.understanding_check_id else None
+        if learning_run_id:
+            from agent_core.understanding_app import link_personal_run
+            link_personal_run(request, req.understanding_check_id, learning_run_id)
         # run_oneshot 是同步阻塞（内部自起事件循环），放线程池避免卡住服务 loop
         result = await asyncio.to_thread(
             kernel.run_oneshot, prompt_text, persona, cwd, req.context_memory or ""
         )
         d = asdict(result)
-        _accumulate_oneshot(d, prompt=req.prompt, persona=persona.name)
+        _accumulate_oneshot(d, prompt=req.prompt, persona=persona.name, run_id=learning_run_id)
+        if learning_run_id:
+            d["run_id"] = learning_run_id
         d["usage_summary"] = _format_usage_summary(d)
         return d
 
     @router.post("/agent/run/stream")
-    async def agent_run_stream(req: RunReq):
+    async def agent_run_stream(req: RunReq, request: Request):
         """单发流式执行（SSE）。事件名：thinking/thinking_delta/text_delta/
         tool_use/tool_result/plan_update/budget_warning/result/error；
         data 为 JSON，payload 超长截断（2000 字符）。
         全量事件落 <work_dir>/runs/<run_id>.jsonl 供面板回放；结束后写历史。
         带 session_id 时：历史轮次注入 context_memory（连续对话），本轮
         prompt/output 落盘会话文件（重启后可回看续聊）。"""
+        from agent_core.understanding_app import authorize_personal_run
+        await asyncio.to_thread(authorize_personal_run, request, req)
         persona = resolve_persona(req.persona or _DEFAULT_PERSONA)
         if req.model:
             persona = replace(persona, model=req.model)
@@ -992,6 +1204,8 @@ def create_runs_router() -> APIRouter:
         image_paths = _save_run_attachments(cwd, req.images)
         prompt_text = _augment_prompt_with_images(req.prompt, image_paths)
         run_id = f"run-{uuid.uuid4().hex[:12]}"
+        from agent_core.understanding_app import link_personal_run
+        link_personal_run(request, req.understanding_check_id, run_id)
         _write_run_meta(run_id, cwd=cwd,
                         prompt=req.prompt[:2000], persona=persona.name,
                         model=req.model or "", status="running",
@@ -1038,30 +1252,31 @@ def create_runs_router() -> APIRouter:
                     output = str(final.get("result")) if final else ""
                     status = "completed" if final and not final.get("is_error") \
                         else ("failed" if final else "interrupted")
-                    session_rec.setdefault("turns", []).append({
+                    turn = {
                         "at": round(time.time(), 3),
                         "prompt": req.prompt,
                         "output": output,
                         "status": status,
                         "run_id": run_id,
-                    })
-                    session_rec["updated_at"] = round(time.time(), 3)
-                    if not session_rec.get("title"):
-                        session_rec["title"] = req.prompt[:40]
+                    }
                     try:
-                        _save_session(session_rec, require_existing=True)
+                        _append_session_turn(req.session_id, turn)
                     except HTTPException:
                         pass  # sid 合法性已在入口校验；落盘失败不影响本轮结果
+                    if req.session_id and status == "completed":
+                        asyncio.create_task(_trigger_async_title_summary(req.session_id, req.prompt, output))
 
         return _streaming_response(_events_with_bookkeeping())
 
     @router.post("/agent/run/async", status_code=202)
-    async def agent_run_async(req: RunReq):
+    async def agent_run_async(req: RunReq, request: Request):
         """异步单发：立即返回 202 + {run_id}，后台任务执行 run_oneshot。
 
         用 GET /agent/run/{run_id} 查询状态与结果；DELETE 触发协作式取消
         （cancel_event 在消息边界生效，非强杀）。
         """
+        from agent_core.understanding_app import authorize_personal_run
+        await asyncio.to_thread(authorize_personal_run, request, req)
         session_rec = _load_session(req.session_id) if req.session_id else None
         history_ctx = _session_history_block(session_rec) if session_rec else ""
         context = "\n\n".join(x for x in (history_ctx, req.context_memory or "") if x)
@@ -1077,6 +1292,8 @@ def create_runs_router() -> APIRouter:
         else:
             kernel = get_kernel()
         run_id = uuid.uuid4().hex[:12]
+        from agent_core.understanding_app import link_personal_run
+        link_personal_run(request, req.understanding_check_id, run_id)
         # 图片附件：落盘任务目录并在 prompt 中告知路径（多模态 v1）
         image_paths = _save_run_attachments(cwd, req.images)
         prompt_text = _augment_prompt_with_images(req.prompt, image_paths)
@@ -1117,16 +1334,13 @@ def create_runs_router() -> APIRouter:
             finally:
                 if session_rec is not None:
                     try:
-                        rec = _load_session(req.session_id)
-                        rec.setdefault("turns", []).append({
+                        rec = _append_session_turn(req.session_id, {
                             "at": round(time.time(), 3), "prompt": req.prompt,
                             "output": str((entry.get("result") or {}).get("output") or ""),
                             "status": entry["status"], "run_id": run_id,
                         })
-                        rec["updated_at"] = round(time.time(), 3)
-                        if not rec.get("title"):
-                            rec["title"] = req.prompt[:40]
-                        _save_session(rec, require_existing=True)
+                        if req.session_id and entry.get("status") == "completed":
+                            asyncio.create_task(_trigger_async_title_summary(req.session_id, req.prompt, rec["turns"][-1].get("output", "")))
                     except HTTPException as exc:
                         if exc.status_code != 404:
                             logger.exception("保存计划任务会话失败: %s", req.session_id)
@@ -1477,25 +1691,45 @@ def create_sessions_router() -> APIRouter:
         return {"session_id": sid, "persona": persona_name, "cwd": cwd}
 
     @router.post("/agent/session/{session_id}/message")
-    async def agent_session_message(session_id: str, req: SessionMessageReq) -> dict:
+    async def agent_session_message(session_id: str, req: SessionMessageReq, request: Request) -> dict:
         """向已存在会话发一轮消息，聚合完整响应后返回。"""
         entry = _SESSIONS.get(session_id)
         if entry is None:
             raise HTTPException(status_code=404, detail="session not found")
-        return await _run_session_turn(entry["session"], req.prompt, req.timeout)
+        from agent_core.understanding_app import authorize_personal_run
+        await asyncio.to_thread(authorize_personal_run, request, RunReq(prompt=req.prompt,
+            persona=entry["persona"], cwd=entry["cwd"], session_id=session_id,
+            understanding_check_id=req.understanding_check_id))
+        turn_id = f"session-{session_id}-{uuid.uuid4().hex[:8]}"
+        from agent_core.understanding_app import link_personal_run
+        link_personal_run(request, req.understanding_check_id, turn_id)
+        result = await _run_session_turn(entry["session"], req.prompt, req.timeout)
+        if req.understanding_check_id:
+            result["understanding_turn_id"] = turn_id
+        return result
 
     @router.post("/agent/session/{session_id}/message/stream")
-    async def agent_session_message_stream(session_id: str, req: SessionMessageReq):
+    async def agent_session_message_stream(session_id: str, req: SessionMessageReq, request: Request):
         """向已存在会话发一轮消息（SSE 流式转发 AgentSession 事件）。"""
         entry = _SESSIONS.get(session_id)
         if entry is None:
             return _error(404, "not_found", "session not found", session_id)
+        from agent_core.understanding_app import authorize_personal_run
+        await asyncio.to_thread(authorize_personal_run, request, RunReq(prompt=req.prompt,
+            persona=entry["persona"], cwd=entry["cwd"], session_id=session_id,
+            understanding_check_id=req.understanding_check_id))
+        turn_id = f"session-{session_id}-{uuid.uuid4().hex[:8]}"
+        from agent_core.understanding_app import link_personal_run
+        link_personal_run(request, req.understanding_check_id, turn_id)
         session = entry["session"]
         if req.timeout is not None:
             events = session.send(req.prompt, req.timeout)
         else:
             events = session.send(req.prompt)
-        return _streaming_response(events)
+        response = _streaming_response(events)
+        if req.understanding_check_id:
+            response.headers["X-Understanding-Turn"] = turn_id
+        return response
 
     @router.post("/agent/session/{session_id}/interrupt")
     async def agent_session_interrupt(session_id: str):
@@ -1573,6 +1807,33 @@ def create_sessions_router() -> APIRouter:
     def agent_persisted_session_get(session_id: str) -> dict:
         """读取持久会话全量轮次（面板刷新/重启后回放）。"""
         return _load_session(session_id)
+
+    @router.patch("/agent/persisted-sessions/{session_id}")
+    def agent_persisted_session_update(session_id: str, req: SessionUpdateReq) -> dict:
+        """更新持久会话属性（如重命名标题）。"""
+        new_title = (req.title or "").strip()
+        if not new_title:
+            raise HTTPException(status_code=400, detail="title 不能为空")
+        rec, _ = _update_session_title(session_id, new_title, manual=True)
+        return {"session_id": session_id, "title": rec["title"], "updated_at": rec["updated_at"]}
+
+    @router.post("/agent/persisted-sessions/{session_id}/summarize-title")
+    async def agent_persisted_session_summarize_title(session_id: str) -> dict:
+        """使用 LLM 重新提炼并更新会话标题。"""
+        rec = _load_session(session_id)
+        kernel = get_kernel()
+        new_title = await asyncio.to_thread(_summarize_session_title_with_llm, rec, kernel)
+        if new_title:
+            latest, updated = _update_session_title(session_id, new_title, snapshot=rec)
+            return {"session_id": session_id, "title": latest["title"], "updated": updated}
+        # 降级：若 LLM 未提炼出，但有 prompt，尝试本地规则提取
+        turns = rec.get("turns") or []
+        if turns:
+            local_title = _extract_initial_title(turns[0].get("prompt", ""))
+            if local_title:
+                latest, updated = _update_session_title(session_id, local_title, snapshot=rec)
+                return {"session_id": session_id, "title": latest["title"], "updated": updated}
+        return {"session_id": session_id, "title": rec.get("title") or "", "updated": False}
 
     @router.delete("/agent/persisted-sessions/{session_id}")
     def agent_persisted_session_delete(session_id: str) -> dict:

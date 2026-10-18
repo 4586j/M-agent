@@ -64,5 +64,6 @@ workspace/agent/orchestrator/runtime/.knowledge/
 web/test-results/
 web/playwright-report/
 .tmp/
+workspace/agent/orchestrator/runtime/.understanding-*/
 .codex/
 gemini-code-*.md

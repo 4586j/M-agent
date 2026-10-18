@@ -1,7 +1,7 @@
 import type { Stats } from '../types'
 import { fmtUsd } from '../utils'
 
-/** 统计条：四张 mint 白卡（顶部嫩绿渐变边条），对齐原型规格 */
+/** 统计条：四张 Bento 指标卡（带鼠标跟随聚光灯与层叠淡入） */
 export default function StatBar({ stats, cacheHit }: {
   stats: Stats | null
   cacheHit: number | null
@@ -12,6 +12,7 @@ export default function StatBar({ stats, cacheHit }: {
   return (
     <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
       <Card
+        staggerIndex={0}
         label="活跃 / 总节点"
         badge="健康"
         badgeCls="text-emerald-400 bg-emerald-500/10 border border-emerald-500/20"
@@ -24,6 +25,7 @@ export default function StatBar({ stats, cacheHit }: {
         }
       />
       <Card
+        staggerIndex={1}
         label="任务全量"
         badge="实时"
         badgeCls="text-sky-400 bg-sky-500/10 border border-sky-500/20"
@@ -42,6 +44,7 @@ export default function StatBar({ stats, cacheHit }: {
         }
       />
       <Card
+        staggerIndex={2}
         label="累计消耗"
         badge="Cost"
         badgeCls="text-emerald-400 bg-emerald-500/10 border border-emerald-500/20"
@@ -54,6 +57,7 @@ export default function StatBar({ stats, cacheHit }: {
         }
       />
       <Card
+        staggerIndex={3}
         label="提示词缓存命中率"
         badge="Cache"
         badgeCls="text-indigo-400 bg-indigo-500/10 border border-indigo-500/20"
@@ -69,16 +73,20 @@ export default function StatBar({ stats, cacheHit }: {
   )
 }
 
-function Card({ label, badge, badgeCls, value, hint, icon }: {
+function Card({ label, badge, badgeCls, value, hint, icon, staggerIndex = 0 }: {
   label: string
   badge?: string
   badgeCls?: string
   value: string
   hint?: React.ReactNode
   icon?: React.ReactNode
+  staggerIndex?: number
 }) {
   return (
-    <div className="spotlight-card bg-zinc-900/60 backdrop-blur-xl p-5 rounded-2xl border border-white/[0.07] hover:border-emerald-500/30 transition-all duration-200 shadow-[inset_0_1px_0_0_rgba(255,255,255,0.05)] relative overflow-hidden group">
+    <div
+      style={{ '--stagger': staggerIndex } as React.CSSProperties}
+      className="spotlight-card stagger-item bg-zinc-900/60 backdrop-blur-xl p-5 rounded-2xl border border-white/[0.07] hover:border-emerald-500/30 transition-all duration-200 shadow-[inset_0_1px_0_0_rgba(255,255,255,0.05)] relative overflow-hidden group"
+    >
       <div className="absolute top-0 left-0 right-0 h-[1px] bg-gradient-to-r from-transparent via-emerald-500/30 to-transparent opacity-0 group-hover:opacity-100 transition-opacity duration-300" />
       <div className="flex items-center justify-between text-zinc-400 text-xs font-medium">
         <span>{label}</span>

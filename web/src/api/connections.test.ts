@@ -14,6 +14,22 @@ beforeEach(() => {
 })
 
 describe('connections', () => {
+  it('配置范围随地址与密钥变更失效，不包含密钥且不受名称影响', async () => {
+    const api = await loadApi()
+    const original = api.getActiveConnection()
+    const start = api.getActiveConnectionScope()
+    api.saveConnection({...original, name:'新的名称'})
+    expect(api.getActiveConnectionScope()).toBe(start)
+    api.saveConnection({...api.getActiveConnection(), baseUrl:'http://other.test'})
+    const moved = api.getActiveConnectionScope()
+    expect(moved).not.toBe(start)
+    api.saveConnection({...api.getActiveConnection(), apiKey:'must-stay-secret'})
+    expect(api.getActiveConnectionScope()).not.toBe(moved)
+    expect(api.getActiveConnectionScope()).not.toContain('must-stay-secret')
+    api.saveConnection(original)
+    expect(api.getActiveConnectionScope()).not.toBe(start)
+  })
+
   it('首启从遗留 orch_api_key 播种默认连接（baseUrl 为空 = 相对路径）', async () => {
     localStorage.setItem('orch_api_key', 'legacy-key')
     const { getActiveConnection, getConnections } = await loadApi()

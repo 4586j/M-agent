@@ -37,7 +37,7 @@ export default function Audit() {
   return (
     <div className="space-y-4">
       {/* 头部筛选栏 */}
-      <div className="bg-zinc-900/40 backdrop-blur-xl rounded-2xl border border-white/[0.07] shadow-[inset_0_1px_0_0_rgba(255,255,255,0.05)] p-3.5 flex flex-wrap items-center gap-2.5 text-xs">
+      <div className="spotlight-card bg-zinc-900/40 backdrop-blur-xl rounded-2xl border border-white/[0.07] shadow-[inset_0_1px_0_0_rgba(255,255,255,0.05)] p-3.5 flex flex-wrap items-center gap-2.5 text-xs">
         <div className="flex items-center gap-2">
           <span className="w-2 h-2 rounded-full bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.6)]" />
           <span className="text-zinc-200 font-bold uppercase tracking-wider">安全裁决流水</span>
@@ -81,7 +81,7 @@ export default function Audit() {
       )}
 
       {/* 流水记录卡片 */}
-      <div className="bg-zinc-900/40 backdrop-blur-xl rounded-2xl border border-white/[0.07] shadow-[inset_0_1px_0_0_rgba(255,255,255,0.05)] p-2">
+      <div className="spotlight-card bg-zinc-900/40 backdrop-blur-xl rounded-2xl border border-white/[0.07] shadow-[inset_0_1px_0_0_rgba(255,255,255,0.05)] p-2">
         {entries.length === 0 && !error ? (
           <div className="text-sm text-zinc-500 text-center py-12">
             暂无审计记录——安全裁决（关卡①②/审批）发生时会自动落盘于此

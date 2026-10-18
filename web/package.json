@@ -11,6 +11,9 @@
     "test:watch": "vitest",
     "test:e2e": "playwright test",
     "test:e2e:panel": "playwright test",
+    "test:e2e:layout": "playwright test --config=playwright.layout.config.js",
+    "test:e2e:proxy": "playwright test --config=playwright.proxy.config.js",
+    "test:e2e:personal": "playwright test --config=playwright.personal.config.js",
     "test:e2e:orchest": "playwright test --config=playwright.orchest.config.js"
   },
   "dependencies": {

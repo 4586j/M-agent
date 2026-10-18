@@ -26,6 +26,9 @@ const LS_ACTIVE = 'orch_active_connection'
 
 const listeners = new Set<() => void>()
 let state: ConnectionsState = loadInitial()
+// Runtime revisions invalidate requests/forms after endpoint or credential edits.
+// Credentials themselves must never appear in React keys, URLs or diagnostics.
+const revisions = new Map<string, number>()
 
 function normalizeBaseUrl(raw: string): string {
   const t = (raw || '').trim()
@@ -92,6 +95,15 @@ export function getActiveConnectionId(): string {
   return getActiveConnection().id
 }
 
+export function getActiveConnectionScope(): string {
+  const c = getActiveConnection()
+  return JSON.stringify([c.id, normalizeBaseUrl(c.baseUrl), revisions.get(c.id) ?? 0])
+}
+
+export function useActiveConnectionScope(): string {
+  return useSyncExternalStore(subscribe, getActiveConnectionScope)
+}
+
 export function createConnection(
   name: string,
   baseUrl: string,
@@ -103,7 +115,10 @@ export function createConnection(
 export function saveConnection(conn: Connection): void {
   // baseUrl 规范化下沉到保存入口：表单编辑产生的 draft 可能带尾部斜杠/空白
   const norm = { ...conn, baseUrl: normalizeBaseUrl(conn.baseUrl) }
-  const existing = state.connections.some((c) => c.id === norm.id)
+  const existing = state.connections.find((c) => c.id === norm.id)
+  if (existing && (existing.baseUrl !== norm.baseUrl || existing.apiKey !== norm.apiKey)) {
+    revisions.set(norm.id, (revisions.get(norm.id) ?? 0) + 1)
+  }
   const conns = existing
     ? state.connections.map((c) => (c.id === norm.id ? norm : c))
     : [...state.connections, norm]

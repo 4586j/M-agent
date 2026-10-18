@@ -1,4 +1,5 @@
 import { useEffect, useState, type ReactNode } from 'react'
+import { createPortal } from 'react-dom'
 import type { TaskRecord } from '../types'
 import { api } from '../api/client'
 import { timeAgo } from '../utils'
@@ -72,7 +73,7 @@ export default function TaskDetailDrawer({
     }
   }
 
-  return (
+  return createPortal(
     <>
       {/* 半透明毛玻璃背景遮罩，点击丝滑关闭 */}
       <div
@@ -190,7 +191,8 @@ export default function TaskDetailDrawer({
         {msg && <span className="text-xs text-zinc-400 font-mono ml-auto">{msg}</span>}
       </div>
     </aside>
-    </>
+    </>,
+    document.body,
   )
 }
 

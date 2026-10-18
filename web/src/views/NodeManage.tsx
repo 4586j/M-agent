@@ -1,6 +1,8 @@
 import { useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { api } from '../api/client'
+import { getActiveConnection } from '../api/connections'
+import { sessionSelectionKey } from '../api/brainSessions'
 import { usePolling } from '../hooks/usePolling'
 import { POLL } from '../polling'
 import TaskList from '../components/TaskList'
@@ -118,7 +120,7 @@ export default function NodeManage() {
   return (
     <div className="space-y-6">
       {/* 注册新 worker */}
-      <section className="bg-zinc-900/40 backdrop-blur-xl rounded-2xl border border-white/[0.07] p-5 shadow-[inset_0_1px_0_0_rgba(255,255,255,0.05)]">
+      <section className="spotlight-card bg-zinc-900/40 backdrop-blur-xl rounded-2xl border border-white/[0.07] p-5 shadow-[inset_0_1px_0_0_rgba(255,255,255,0.05)]">
         <div className="flex items-center gap-2 mb-3">
           <span className="w-2 h-2 rounded-full bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.6)]" />
           <h2 className="text-sm font-semibold text-zinc-100 tracking-tight">注册新 worker</h2>
@@ -152,14 +154,15 @@ export default function NodeManage() {
         </div>
 
         <div className="space-y-2.5">
-          {(workers.data || []).map((w) => {
+          {(workers.data || []).map((w, idx) => {
             const st = statuses[w.worker_id]
             const err = statusErrors[w.worker_id]
             const isOpen = expanded === w.worker_id
             return (
               <div
                 key={w.worker_id}
-                className="bg-zinc-900/40 backdrop-blur-xl rounded-xl border border-white/[0.07] shadow-[inset_0_1px_0_0_rgba(255,255,255,0.05)] overflow-hidden hover:border-emerald-500/30 transition duration-150"
+                style={{ '--stagger': idx } as React.CSSProperties}
+                className="spotlight-card stagger-item bg-zinc-900/40 backdrop-blur-xl rounded-xl border border-white/[0.07] shadow-[inset_0_1px_0_0_rgba(255,255,255,0.05)] overflow-hidden hover:border-emerald-500/30 transition duration-150"
               >
                 <div
                   onClick={() => window.open(panelUrl(w), '_blank', 'noopener')}
@@ -211,7 +214,7 @@ export default function NodeManage() {
                     </button>
                     <button
                       type="button"
-                      onClick={(e) => { e.stopPropagation(); navigate('/command', { state: { workerId: w.worker_id } }) }}
+                      onClick={(e) => { e.stopPropagation(); navigate('/command', { state: { workerId: w.worker_id, brainKey: sessionSelectionKey(getActiveConnection()) } }) }}
                       className="btn-press px-2.5 py-1 text-xs rounded-lg bg-emerald-500/20 text-emerald-300 hover:bg-emerald-500/30 border border-emerald-500/30 font-medium transition"
                       title={`定点派发到此节点（role=${w.role}）`}
                     >

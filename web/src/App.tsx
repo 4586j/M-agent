@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useState, useRef } from 'react'
 import { Routes, Route, NavLink, useLocation, Link } from 'react-router-dom'
 import { StatsProvider, useSharedStats } from './hooks/useSharedStats'
 import { useActiveConnection } from './api/connections'
@@ -12,6 +12,8 @@ import Audit from './views/Audit'
 import Providers from './views/Providers'
 import ConnectionSettings from './components/ConnectionSettings'
 import CommandPalette from './components/CommandPalette'
+import ParticleBackground from './components/ParticleBackground'
+import BrainScope from './components/BrainScope'
 
 interface NavGroup {
   domain: string
@@ -128,6 +130,36 @@ function AppShell() {
   const stats = useSharedStats()
   const activeConn = useActiveConnection()
   const connected = !stats.error
+  const navRef = useRef<HTMLElement>(null)
+  const [pillStyle, setPillStyle] = useState<{ top: number; height: number } | null>(null)
+
+  // 实时动态计算滑动毛玻璃高亮指示器位置
+  useEffect(() => {
+    const updatePill = () => {
+      if (!navRef.current) return
+      const activeLink = navRef.current.querySelector('a[aria-current="page"]') as HTMLElement | null
+      if (activeLink) {
+        const navRect = navRef.current.getBoundingClientRect()
+        const linkRect = activeLink.getBoundingClientRect()
+        setPillStyle({
+          top: linkRect.top - navRect.top + navRef.current.scrollTop - navRef.current.clientTop,
+          height: linkRect.height,
+        })
+      } else {
+        setPillStyle(null)
+      }
+    }
+    updatePill()
+    const timer = setTimeout(updatePill, 50)
+    const observer = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(updatePill)
+    if (navRef.current) observer?.observe(navRef.current)
+    window.addEventListener('resize', updatePill)
+    return () => {
+      clearTimeout(timer)
+      observer?.disconnect()
+      window.removeEventListener('resize', updatePill)
+    }
+  }, [location.pathname])
 
   // ⌘K / Ctrl+K 全局快捷键
   useEffect(() => {
@@ -142,14 +174,17 @@ function AppShell() {
   }, [])
 
   return (
-    <div className="flex h-screen w-screen overflow-hidden bg-[#09090b] text-zinc-100 antialiased selection:bg-emerald-500/20 selection:text-emerald-400">
+    <div className="flex h-screen w-screen overflow-hidden bg-[#09090b] text-zinc-100 antialiased selection:bg-emerald-500/20 selection:text-emerald-400 relative">
+      {/* 全局轻量级神经网络粒子场 Canvas（位于最底层，鼠标交互感知） */}
+      <ParticleBackground />
+
       <CommandPalette open={cmdOpen} onClose={() => setCmdOpen(false)} />
 
       {/* 左侧固定导航栏（w-64） */}
-      <aside className="w-64 bg-zinc-950/80 backdrop-blur-xl border-r border-white/[0.07] flex flex-col shrink-0 h-screen select-none z-20">
+      <aside className="w-64 bg-zinc-950/80 backdrop-blur-2xl border-r border-white/[0.07] flex flex-col shrink-0 h-screen select-none z-20 relative">
         {/* 顶部 Logo 与集群状态 */}
         <Link to="/" className="p-4 flex items-center gap-3 border-b border-white/[0.07] group">
-          <div className="w-9 h-9 rounded-xl bg-gradient-to-tr from-emerald-600 via-emerald-500 to-teal-400 flex items-center justify-center text-zinc-950 shadow-[0_0_20px_rgba(16,185,129,0.3)] group-hover:scale-105 transition">
+          <div className="w-9 h-9 rounded-xl bg-gradient-to-tr from-emerald-600 via-emerald-500 to-teal-400 flex items-center justify-center text-zinc-950 shadow-[0_0_20px_rgba(16,185,129,0.3)] group-hover:scale-105 transition duration-200">
             <svg className="w-5 h-5 font-bold" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.2} d="M13 10V3L4 14h7v7l9-11h-7z" />
             </svg>
@@ -160,16 +195,34 @@ function AppShell() {
               <span className="text-[10px] font-mono font-medium px-1.5 py-0.2 rounded bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">v2.0</span>
             </div>
             <div className="text-[11px] text-zinc-500 font-mono flex items-center gap-1.5 mt-0.5">
-              <span className={`w-1.5 h-1.5 rounded-full ${connected ? 'bg-emerald-400 animate-pulse shadow-[0_0_6px_rgba(52,211,153,0.8)]' : 'bg-rose-500'}`} />
+              <span className={`w-1.5 h-1.5 rounded-full ${connected ? 'bg-emerald-400 pulse-ring' : 'bg-rose-500'}`} />
               <span>{connected ? 'Cluster Active' : 'Offline'}</span>
             </div>
           </div>
         </Link>
 
-        {/* 业务域分组导航项 */}
-        <nav className="flex-1 overflow-y-auto px-3 py-4 space-y-6 custom-scroll">
+        {/* 业务域分组导航项（带毛玻璃滑动胶囊指示器） */}
+        <nav ref={navRef} className="flex-1 overflow-y-auto px-3 py-4 space-y-6 custom-scroll relative">
+          {/* 实时物理滑动毛玻璃滑块 (Sliding Frosted-Glass Pill Indicator) */}
+          {pillStyle && (
+            <div
+              data-testid="nav-indicator"
+              className="absolute left-3 right-3 rounded-xl pointer-events-none backdrop-blur-md bg-emerald-500/15 border border-emerald-400/30 shadow-[0_0_20px_rgba(16,185,129,0.15)] transition-all duration-300 ease-[cubic-bezier(0.22,1,0.36,1)] z-0"
+              style={{
+                top: `${pillStyle.top}px`,
+                height: `${pillStyle.height}px`,
+              }}
+            >
+              {/* 左侧发光导轨指示灯条 */}
+              <span
+                className="absolute left-0 top-1/2 -translate-y-1/2 w-1 h-5 rounded-full bg-emerald-400 shadow-[0_0_8px_#34d399]"
+                aria-hidden="true"
+              />
+            </div>
+          )}
+
           {NAV_GROUPS.map((grp) => (
-            <div key={grp.domain} className="space-y-1">
+            <div key={grp.domain} className="space-y-1 relative z-10">
               <div className="text-[11px] font-semibold text-zinc-500 uppercase tracking-wider px-3 mb-1.5 font-mono">
                 {grp.domain}
               </div>
@@ -179,15 +232,15 @@ function AppShell() {
                   to={item.to}
                   end={item.end}
                   className={({ isActive }) =>
-                    `flex items-center gap-2.5 px-3 py-2 rounded-xl text-xs font-medium transition duration-150 border ${
+                    `flex items-center gap-2.5 px-3 py-2 rounded-xl text-xs font-medium transition duration-200 group relative ${
                       isActive
-                        ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20 font-semibold shadow-[0_0_15px_rgba(16,185,129,0.08)]'
-                        : 'text-zinc-400 hover:text-zinc-200 hover:bg-zinc-900/60 border-transparent'
+                        ? 'text-emerald-300 font-semibold'
+                        : 'text-zinc-400 hover:text-zinc-200 hover:bg-zinc-900/40 border border-transparent'
                     }`
                   }
                 >
-                  {item.icon}
-                  <span>{item.label}</span>
+                  <span className="text-sm opacity-80 group-hover:opacity-100 transition">{item.icon}</span>
+                  <span className="flex-1">{item.label}</span>
                 </NavLink>
               ))}
             </div>
@@ -197,7 +250,7 @@ function AppShell() {
         {/* 底部内嵌浓缩版 ConnectionSettings 状态栏 */}
         <div className="p-3.5 border-t border-white/[0.07] bg-zinc-950/60 flex items-center justify-between gap-2">
           <div className="flex items-center gap-2 min-w-0 flex-1">
-            <span className={`w-2 h-2 rounded-full shrink-0 ${connected ? 'bg-emerald-400' : 'bg-rose-500'}`} />
+            <span className={`w-2 h-2 rounded-full shrink-0 ${connected ? 'bg-emerald-400 pulse-ring' : 'bg-rose-500'}`} />
             <div className="min-w-0 flex-1">
               <div className="text-xs font-medium text-zinc-200 truncate">{activeConn.name || '默认'}</div>
               <div className="text-[10px] text-zinc-500 font-mono truncate">{activeConn.baseUrl || '相对路径'}</div>
@@ -208,7 +261,7 @@ function AppShell() {
       </aside>
 
       {/* 右侧全屏自适应工作区 */}
-      <div className="flex-1 flex flex-col h-screen overflow-hidden min-w-0">
+      <div className="flex-1 flex flex-col h-screen overflow-hidden min-w-0 relative z-10">
         {/* 顶部 h-16 毛玻璃 Header（满足 E2E 包含「编排控制面板」选择器） */}
         <header className="h-16 bg-zinc-950/80 backdrop-blur-xl border-b border-white/[0.07] px-6 flex items-center justify-between shrink-0 z-30">
           <div className="flex items-center gap-3 min-w-0">
@@ -250,10 +303,10 @@ function AppShell() {
           </div>
         </header>
 
-        {/* 主视口区域 */}
+        {/* 主视口区域（带即时单挂载 Spring 转场容器，确保测试零延迟、零重复 DOM） */}
         <main className="flex-1 overflow-y-auto p-6 custom-scroll bg-dot-grid">
-          <div className="max-w-7xl mx-auto">
-            <Routes>
+          <div key={location.pathname} className="max-w-7xl mx-auto animate-view-enter animate-view-in">
+            <BrainScope><Routes location={location}>
               <Route path="/" element={<Dashboard />} />
               <Route path="/tasks" element={<Tasks />} />
               <Route path="/nodes" element={<NodeManage />} />
@@ -262,7 +315,7 @@ function AppShell() {
               <Route path="/schedules" element={<Schedules />} />
               <Route path="/providers" element={<Providers />} />
               <Route path="/audit" element={<Audit />} />
-            </Routes>
+            </Routes></BrainScope>
           </div>
         </main>
       </div>

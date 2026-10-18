@@ -1,14 +1,14 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useLocation } from 'react-router-dom'
 import { api } from '../api/client'
-import type { ApprovalMeta, DispatchAsyncResponse, DispatchResult, ExperienceRecord, ProviderList, TaskRecord, RecommendResponse, TranslateResponse, WorkerInfo, BrainSession } from '../types'
+import { getActiveConnection, useActiveConnection } from '../api/connections'
+import { migrateSessionSelection, readSessionSelection, saveSessionSelection, sessionSelectionKey } from '../api/brainSessions'
+import type { ApprovalMeta, DispatchBody, DispatchAsyncResponse, DispatchResult, ExperienceRecord, ProviderList, TaskRecord, RecommendResponse, TranslateResponse, WorkerInfo, BrainSession } from '../types'
 import { TERMINAL_STATUSES } from '../types'
 import { usePolling } from '../hooks/usePolling'
 import { POLL } from '../polling'
 import { fmtUsd, formatTime, timeAgo } from '../utils'
 import StatusBadge from '../components/StatusBadge'
-
-const SESSION_LS_KEY = 'orch_dispatch_session_id'
 
 const QUICK_PROMPTS = [
   '分析工作区文件结构并报告概览',
@@ -18,6 +18,12 @@ const QUICK_PROMPTS = [
 ]
 
 export default function Command() {
+  const connection = useActiveConnection()
+  const sessionKey = sessionSelectionKey(connection)
+  return <BrainCommand key={sessionKey} sessionKey={sessionKey} />
+}
+
+function BrainCommand({ sessionKey }: { sessionKey: string }) {
   const [prompt, setPrompt] = useState('')
   const [role, setRole] = useState('executor')
   const [model, setModel] = useState('')
@@ -28,7 +34,10 @@ export default function Command() {
 
   // 定点派发：从 NodeManage「派发到此节点」跳转带 workerId，或本页下拉选择
   const location = useLocation()
-  const [workerId, setWorkerId] = useState<string>(() => (location.state as { workerId?: string } | null)?.workerId ?? '')
+  const [workerId, setWorkerId] = useState<string>(() => {
+    const target = location.state as { workerId?: string; brainKey?: string } | null
+    return target?.brainKey === sessionKey ? target.workerId ?? '' : ''
+  })
   const { data: workers } = usePolling<WorkerInfo[]>(() => api.workers(), POLL.workers)
 
   // 从 NodeManage 跳转带 workerId 时，工人列表异步返回后回填其真实 role（role 输入已随定点禁用）
@@ -68,21 +77,40 @@ export default function Command() {
 
   // 持久会话（连续对话）：历史轮次自动注入上下文；id 存 localStorage 跨刷新续聊
   const [sessionId, setSessionId] = useState<string>(
-    () => localStorage.getItem(SESSION_LS_KEY) || '')
+    () => readSessionSelection(sessionKey))
+  const sessionChoice = useRef(sessionId)
+  const pendingSession = useRef('')
+  const mounted = useRef(true)
+  useEffect(() => {
+    mounted.current = true
+    return () => { mounted.current = false }
+  }, [])
   const { data: sessionList, refresh: refreshSessions } = usePolling<{ sessions: BrainSession[] }>(
     () => api.sessions(), POLL.services)
 
   const pickSession = (id: string) => {
+    sessionChoice.current = id
     setSessionId(id)
-    try {
-      if (id) localStorage.setItem(SESSION_LS_KEY, id)
-      else localStorage.removeItem(SESSION_LS_KEY)
-    } catch { /* 隐私模式等存储不可用：仅内存态 */ }
+    saveSessionSelection(sessionKey, id)
   }
+
+  useEffect(() => {
+    if (!sessionList) return
+    const ids = sessionList.sessions.map(s => s.session_id)
+    const selected = sessionChoice.current
+    if (pendingSession.current && selected === pendingSession.current && !ids.includes(selected)) return
+    pendingSession.current = ''
+    const valid = ids.includes(selected) ? selected : migrateSessionSelection(sessionKey, ids)
+    if (selected && !valid) saveSessionSelection(sessionKey, '')
+    sessionChoice.current = valid
+    setSessionId(valid)
+  }, [sessionList, sessionKey])
 
   const newSession = async () => {
     try {
       const r = await api.createSession()
+      if (!mounted.current || sessionSelectionKey(getActiveConnection()) !== sessionKey) return
+      pendingSession.current = r.session_id
       pickSession(r.session_id)
       refreshSessions()
     } catch { /* 创建失败保持当前会话不变 */ }
@@ -90,25 +118,21 @@ export default function Command() {
 
   // 历史命令从后端 /tasks 取（持久化，含发布时间/节点/结果）；5s 轮询
   const { data: tasks, refresh } = usePolling<TaskRecord[]>(() => api.tasks(), POLL.tasks)
+  const dispatchBody = useMemo<DispatchBody>(() => ({
+    prompt, role, context_memory: ctx || null, model: model || null, provider: provider || null,
+    enable_subagents: enableSubagents, context_task_ids: ctxTaskIds,
+    worker_id: workerId || null, session_id: sessionId || null,
+  }), [prompt,role,ctx,model,provider,enableSubagents,ctxTaskIds,workerId,sessionId])
 
   const send = async (force = false) => {
+    if (sessionSelectionKey(getActiveConnection()) !== sessionKey) return
     if (!prompt.trim()) return
     setBusy(true)
     setResult(null)
     setTranslation(null)
     setAsyncRes(null)
     try {
-      const body = {
-        prompt, role,
-        context_memory: ctx || null,
-        model: model || null,
-        provider: provider || null,
-        force,
-        enable_subagents: enableSubagents,
-        context_task_ids: ctxTaskIds.length > 0 ? ctxTaskIds : undefined,
-        worker_id: workerId || null,
-        session_id: sessionId || null,
-      }
+      const body = {...dispatchBody, force}
       if (mode === 'async') {
         const res = await api.dispatchAsync(body)
         setAsyncRes(res)
@@ -240,7 +264,7 @@ export default function Command() {
   return (
     <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
       {/* 派发卡片 */}
-      <section className="bg-zinc-900/40 backdrop-blur-xl rounded-2xl border border-white/[0.07] p-5 shadow-[inset_0_1px_0_0_rgba(255,255,255,0.05)]">
+      <section className="spotlight-card stagger-item bg-zinc-900/40 backdrop-blur-xl rounded-2xl border border-white/[0.07] p-5 shadow-[inset_0_1px_0_0_rgba(255,255,255,0.05)]">
         <div className="flex items-center justify-between mb-3">
           <div className="flex items-center gap-2">
             <span className="w-2 h-2 rounded-full bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.6)]" />
@@ -265,7 +289,7 @@ export default function Command() {
           ))}
         </div>
 
-        <div className="focus-within:border-emerald-500/50 focus-within:ring-2 focus-within:ring-emerald-500/10 rounded-xl transition duration-200">
+        <div className={`rounded-xl transition duration-300 ${busy ? 'animate-pulse-glow border border-emerald-500/50 shadow-[0_0_30px_-5px_rgba(16,185,129,0.35)]' : 'focus-within:border-emerald-500/50 focus-within:ring-2 focus-within:ring-emerald-500/20 focus-within:shadow-[0_0_30px_-5px_rgba(16,185,129,0.25)] border border-transparent'}`}>
           <textarea
             value={prompt}
             onChange={(e) => setPrompt(e.target.value)}
@@ -443,7 +467,6 @@ export default function Command() {
             {(tasks ?? []).length === 0 && <span className="text-xs text-zinc-500">暂无历史任务</span>}
           </div>
         </div>
-
         {/* 派发操作条 */}
         <div className="mt-4 flex items-center gap-3">
           <div className="inline-flex p-0.5 bg-zinc-950 rounded-lg border border-white/[0.08] text-xs" role="group" aria-label="派发模式">
@@ -673,7 +696,10 @@ export default function Command() {
       </section>
 
       {/* 历史命令列表 */}
-      <section className="bg-zinc-900/40 backdrop-blur-xl rounded-2xl border border-white/[0.07] p-5 shadow-[inset_0_1px_0_0_rgba(255,255,255,0.05)] flex flex-col">
+      <section
+        style={{ '--stagger': 1 } as React.CSSProperties}
+        className="spotlight-card stagger-item bg-zinc-900/40 backdrop-blur-xl rounded-2xl border border-white/[0.07] p-5 shadow-[inset_0_1px_0_0_rgba(255,255,255,0.05)] flex flex-col"
+      >
         <div className="flex items-center justify-between mb-3">
           <h2 className="text-sm font-semibold text-zinc-100 tracking-tight">历史命令</h2>
           <span className="text-xs text-zinc-500 font-mono tabular-nums">{history.length} 条</span>
@@ -715,7 +741,10 @@ export default function Command() {
 
       {/* 待审批任务卡片 */}
       {pendingApprovals.length > 0 && (
-        <section className="bg-zinc-900/40 backdrop-blur-xl rounded-2xl border border-amber-500/20 p-5 shadow-[inset_0_1px_0_0_rgba(245,158,11,0.05)] lg:col-span-2">
+        <section
+          style={{ '--stagger': 2 } as React.CSSProperties}
+          className="spotlight-card stagger-item bg-zinc-900/40 backdrop-blur-xl rounded-2xl border border-amber-500/20 p-5 shadow-[inset_0_1px_0_0_rgba(245,158,11,0.05)] lg:col-span-2"
+        >
           <div className="flex items-center gap-2 mb-3">
             <span className="w-2.5 h-2.5 rounded-full bg-amber-400 animate-pulse" />
             <h2 className="text-sm font-semibold text-amber-300 tracking-tight">待审批任务（安全拦截挂起）</h2>

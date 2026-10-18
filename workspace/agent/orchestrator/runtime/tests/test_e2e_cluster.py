@@ -50,6 +50,8 @@ class Cluster:
     def start(self):
         env = dict(os.environ,
                    ORCH_MODE="remote",
+                   ORCH_SECURITY_LLM="0",
+                   AGENT_ENV_FILE=str(self.tmp / "missing.env"),
                    ORCH_TASK_STORE_DIR=str(self.tmp / "tasks"),
                    ORCH_EXPERIENCE_STORE_DIR=str(self.tmp / "exp"),
                    ORCH_SCHEDULE_STORE_DIR=str(self.tmp / "sched"),

@@ -104,7 +104,7 @@ export default function ConnectionSettings() {
         🔑
       </button>
       {open && (
-        <div className="absolute right-0 top-full mt-2 w-[26rem] bg-zinc-950/95 backdrop-blur-2xl rounded-2xl shadow-2xl border border-white/[0.1] p-4 z-50 text-zinc-200">
+        <div className="absolute right-0 top-full mt-2 w-[26rem] bg-zinc-950/95 backdrop-blur-2xl rounded-2xl shadow-2xl border border-white/[0.1] p-4 z-50 text-zinc-200 animate-view-enter">
           <div className="text-xs text-zinc-400 mb-2 font-mono flex items-center justify-between">
             <span>已保存连接（点击切换）</span>
             <span className="text-[11px] text-zinc-500">{conns.length} 个配置</span>

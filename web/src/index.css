@@ -56,14 +56,136 @@
   transform: scale(0.97);
 }
 
-/* Linear 风格微对比度聚光灯卡片 */
+/* ================= 聚光灯卡片 (Mouse-Tracking Spotlight) ================= */
 .spotlight-card {
   position: relative;
-  transition: transform 0.2s cubic-bezier(0.16, 1, 0.3, 1), box-shadow 0.2s cubic-bezier(0.16, 1, 0.3, 1), border-color 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+  overflow: hidden;
+  transition: transform 0.25s cubic-bezier(0.16, 1, 0.3, 1), box-shadow 0.25s ease, border-color 0.25s ease;
 }
+
 .spotlight-card:hover {
+  transform: translateY(-2px);
   border-color: rgba(16, 185, 129, 0.35);
-  box-shadow: 0 12px 30px -10px rgba(0, 0, 0, 0.5), 0 0 20px -5px rgba(16, 185, 129, 0.15);
+  box-shadow: 0 12px 30px -10px rgba(0, 0, 0, 0.5), 0 0 20px -5px rgba(16, 185, 129, 0.12);
+}
+
+.spotlight-card::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  pointer-events: none;
+  background: radial-gradient(
+    380px circle at var(--mouse-x, 50%) var(--mouse-y, 50%),
+    rgba(16, 185, 129, 0.09),
+    transparent 60%
+  );
+  opacity: 0;
+  transition: opacity 0.3s ease;
+  z-index: 1;
+}
+
+.spotlight-card:hover::before {
+  opacity: 1;
+}
+
+/* ================= 丝滑视图转场 (Spring View Transition) ================= */
+@keyframes viewEnter {
+  0% {
+    opacity: 0;
+    transform: translate3d(0, 10px, 0) scale(0.992);
+    filter: blur(4px);
+  }
+  100% {
+    opacity: 1;
+    transform: translate3d(0, 0, 0) scale(1);
+    filter: blur(0px);
+  }
+}
+
+.animate-view-enter,
+.animate-view-in {
+  animation: viewEnter 0.38s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+  will-change: transform, opacity, filter;
+}
+
+/* ================= 瀑布流序列与卡片升起 (Staggered Children Reveal) ================= */
+@keyframes cardRise {
+  0% {
+    opacity: 0;
+    transform: translate3d(0, 14px, 0);
+  }
+  100% {
+    opacity: 1;
+    transform: translate3d(0, 0, 0);
+  }
+}
+
+.animate-card-stagger,
+.stagger-item {
+  animation: cardRise 0.42s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+  animation-delay: calc(var(--stagger, 0) * 45ms);
+  will-change: transform, opacity;
+}
+
+/* ================= 动态进度条流光 (Shimmer Bar) ================= */
+@keyframes shimmerMove {
+  0% {
+    transform: translateX(-100%);
+  }
+  100% {
+    transform: translateX(100%);
+  }
+}
+
+.animate-shimmer {
+  position: relative;
+  overflow: hidden;
+}
+
+.animate-shimmer::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  transform: translateX(-100%);
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    rgba(255, 255, 255, 0.28) 50%,
+    transparent 100%
+  );
+  animation: shimmerMove 1.8s cubic-bezier(0.4, 0, 0.2, 1) infinite;
+  pointer-events: none;
+}
+
+/* ================= 指令台呼吸光环与状态脉冲 ================= */
+@keyframes pulseGlow {
+  0%, 100% {
+    box-shadow: 0 0 16px -3px rgba(16, 185, 129, 0.3);
+  }
+  50% {
+    box-shadow: 0 0 30px -5px rgba(16, 185, 129, 0.45), 0 0 18px -2px rgba(6, 182, 212, 0.35);
+  }
+}
+
+.animate-pulse-glow {
+  animation: pulseGlow 2.4s ease-in-out infinite;
+}
+
+@keyframes livePulseRing {
+  0% {
+    box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.7);
+  }
+  70% {
+    box-shadow: 0 0 0 7px rgba(16, 185, 129, 0);
+  }
+  100% {
+    box-shadow: 0 0 0 0 rgba(16, 185, 129, 0);
+  }
+}
+
+.pulse-ring {
+  animation: livePulseRing 2.2s cubic-bezier(0.16, 1, 0.3, 1) infinite;
 }
 
 /* 状态徽章暗黑适配（保留原类名契约，视觉渲染为半透明光晕胶囊） */
@@ -103,3 +225,24 @@
   border-color: rgba(113, 113, 122, 0.2) !important;
 }
 
+/* ================= 减弱动效回退（测试环境与无障碍零延迟通过） ================= */
+@media (prefers-reduced-motion: reduce) {
+  .animate-view-enter,
+  .animate-view-in,
+  .animate-card-stagger,
+  .stagger-item,
+  .pulse-ring,
+  .animate-pulse-glow {
+    animation: none !important;
+    transition: none !important;
+    transform: none !important;
+    opacity: 1 !important;
+    filter: none !important;
+  }
+  .animate-shimmer::after {
+    display: none !important;
+  }
+  .spotlight-card::before {
+    display: none !important;
+  }
+}

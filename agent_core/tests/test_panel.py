@@ -6,6 +6,7 @@ import shutil
 import sys
 import threading
 import time
+from dataclasses import replace
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -45,6 +46,8 @@ def client(monkeypatch, tmp_path, project_root):
     monkeypatch.setattr(service, "_ONESHOT_TOTALS",
                         {"runs": 0, "errors": 0, "total_cost_usd": 0.0,
                          "total_turns": 0})
+    monkeypatch.setattr(service, "_TITLE_USAGE", {"calls": 0, "errors": 0,
+        "unknown_cost_calls": 0, "total_cost_usd": 0.0, "total_turns": 0, "usage": {}})
     monkeypatch.setattr(service, "_HEALTH_CHECKS", None)
     # 限流表是模块级全局：重置避免本文件请求量污染后续测试文件（429）
     monkeypatch.setattr(service, "_RATE_LIMIT_STORE", {})
@@ -379,25 +382,22 @@ def test_prepare_cwd_rejects_outside():
 # ---- 策略配置化（.agent_policy.json） ----
 
 @pytest.fixture()
-def restore_policy_file(project_root):
-    """策略文件读写守卫：测试改完自动还原原内容（否则会把损坏/测试态
-    内容永久写回仓库文件——历史上真实的损坏源头）。"""
-    policy_file = Path(project_root) / ".agent_policy.json"
-    original = policy_file.read_text(encoding="utf-8") if policy_file.exists() else None
-    yield policy_file
-    if original is None:
-        if policy_file.exists():
-            policy_file.unlink()
-    else:
-        policy_file.write_text(original, encoding="utf-8")
+def isolated_policy_file(client, monkeypatch, tmp_path):
+    """在独立项目根测试策略；即使进程中断，也不会污染开发配置。"""
+    policy_root = tmp_path / "policy-project"
+    policy_root.mkdir()
+    cfg = replace(service.get_config(), project_root=str(policy_root))
+    monkeypatch.setattr(service, "get_config", lambda: cfg)
+    monkeypatch.setattr(service, "_POLICY", None)
+    return policy_root / ".agent_policy.json"
 
 
 def test_policy_enforce_false_disables_boundary(client, monkeypatch, tmp_path,
-                                                restore_policy_file):
+                                                isolated_policy_file):
     """enforce=false 时终端越界直接放行（总开关生效）。"""
     monkeypatch.setenv("AGENT_API_KEY", "k1")
     monkeypatch.setattr(service, "_POLICY", None)  # 重置缓存
-    restore_policy_file.write_text(json.dumps(
+    isolated_policy_file.write_text(json.dumps(
         {"workspace_boundary": {"enforce": False}}), encoding="utf-8")
     outside = tmp_path / "pol_outside"
     outside.mkdir(exist_ok=True)
@@ -415,13 +415,13 @@ def test_policy_enforce_false_disables_boundary(client, monkeypatch, tmp_path,
 
 
 def test_policy_extra_allowed_dirs_passthrough(client, monkeypatch, tmp_path,
-                                               restore_policy_file):
+                                               isolated_policy_file):
     """extra_allowed_dirs 预授权目录：命令涉及该目录不再逐次确认。"""
     monkeypatch.setenv("AGENT_API_KEY", "k1")
     monkeypatch.setattr(service, "_POLICY", None)
     outside_parent = tmp_path / "pol_parent"
     outside_parent.mkdir(exist_ok=True)
-    restore_policy_file.write_text(json.dumps(
+    isolated_policy_file.write_text(json.dumps(
         {"workspace_boundary": {"extra_allowed_dirs": [str(outside_parent)]}}),
         encoding="utf-8")
     with client.websocket_connect("/agent/terminal?api_key=k1") as ws:
@@ -436,7 +436,7 @@ def test_policy_extra_allowed_dirs_passthrough(client, monkeypatch, tmp_path,
         assert not any(m["type"] == "confirm" for m in msgs)
 
 
-def test_policy_granularity_in_confirm_frame(client, monkeypatch):
+def test_policy_granularity_in_confirm_frame(client, monkeypatch, isolated_policy_file):
     """confirm 帧携带策略 granularity（per_action 默认）。"""
     monkeypatch.setenv("AGENT_API_KEY", "k1")
     with client.websocket_connect("/agent/terminal?api_key=k1") as ws:
@@ -453,11 +453,10 @@ def test_policy_granularity_in_confirm_frame(client, monkeypatch):
 
 
 def test_policy_file_corruption_warns_and_falls_back(client, monkeypatch,
-                                                     restore_policy_file, caplog):
+                                                     isolated_policy_file, caplog):
     """策略文件损坏 → 回退默认（边界保持 enforce），并发出 warning（不再静默）。"""
     monkeypatch.setattr(service, "_POLICY", None)
-    restore_policy_file.parent.mkdir(parents=True, exist_ok=True)
-    restore_policy_file.write_text("{ 不是 JSON", encoding="utf-8")
+    isolated_policy_file.write_text("{ 不是 JSON", encoding="utf-8")
     import logging as _logging
     with caplog.at_level(_logging.WARNING, logger="agent_core.service"):
         policy = service._load_policy()
@@ -466,6 +465,44 @@ def test_policy_file_corruption_warns_and_falls_back(client, monkeypatch,
 
 
 # ---- 持久会话（连续对话：落盘 + 历史注入） ----
+
+
+@pytest.mark.parametrize("policy", [
+    None, [], "policy", 1,
+    {"workspace_boundary": None}, {"workspace_boundary": []},
+    {"workspace_boundary": {"enforce": "false"}},
+    {"workspace_boundary": {"enforce": 0}},
+    {"workspace_boundary": {"scan_command_paths": 1}},
+    {"workspace_boundary": {"confirm_granularity": "never"}},
+    {"workspace_boundary": {"confirm_granularity": None}},
+    {"workspace_boundary": {"extra_allowed_dirs": "C:/trusted"}},
+    {"workspace_boundary": {"extra_allowed_dirs": None}},
+    {"workspace_boundary": {"extra_allowed_dirs": [1]}},
+    {"workspace_boundary": {"extra_allowed_dirs": [""]}},
+    {"workspace_boundary": {"extra_allowed_dirs": ["relative/path"]}},
+    {"workspace_boundary": {"enforce": False, "scan_command_paths": "false"}},
+])
+def test_policy_invalid_structure_falls_back(policy, isolated_policy_file, caplog):
+    """合法 JSON 的结构/类型错误也整体回退，不留下部分放宽的策略。"""
+    isolated_policy_file.write_text(json.dumps(policy), encoding="utf-8")
+    with caplog.at_level("WARNING", logger="agent_core.service"):
+        loaded = service._load_policy()
+    assert loaded == service._POLICY_DEFAULT
+    assert any("解析失败" in record.message for record in caplog.records)
+
+
+def test_policy_valid_partial_settings_preserve_defaults(isolated_policy_file, tmp_path, caplog):
+    """合法的 false、确认粒度和绝对目录不被类型校验误拒。"""
+    settings = {"enforce": False, "confirm_granularity": "per_session",
+                "extra_allowed_dirs": [str(tmp_path.resolve())], "unknown": "ignored"}
+    isolated_policy_file.write_text(json.dumps({"workspace_boundary": settings}), encoding="utf-8")
+    loaded = service._load_policy()["workspace_boundary"]
+    assert loaded["enforce"] is False
+    assert loaded["scan_command_paths"] is True
+    assert loaded["confirm_granularity"] == "per_session"
+    assert loaded["extra_allowed_dirs"] == [str(tmp_path.resolve())]
+    assert "unknown" not in loaded
+    assert not any("解析失败" in record.message for record in caplog.records)
 
 def test_persisted_session_endpoints(client):
     """创建 → 列表 → 详情（空轮次）→ 删除 → 404。"""
@@ -732,3 +769,108 @@ def test_run_stream_with_images_saves_and_mentions(client, monkeypatch):
     assert seen["cwd"]
     saved = list((Path(seen["cwd"]) / "attachments").glob("attach-*.png"))
     assert len(saved) == 1
+
+
+def test_extract_initial_title():
+    from agent_core.service import _extract_initial_title
+    assert _extract_initial_title("第一问") == "第一问"
+    assert _extract_initial_title("你好，请帮我写一个 Python 批量转 PDF 的脚本") == "Python 批量转 PDF 的脚本"
+    assert _extract_initial_title("/plan 请问能不能分析一下内存泄漏？详情见...") == "内存泄漏"
+    assert _extract_initial_title("") == "新会话"
+
+
+def test_persisted_session_title_patch_and_summarize(client):
+    r = client.post("/agent/session/persist")
+    sid = r.json()["session_id"]
+
+    # 初始为空
+    detail = client.get(f"/agent/persisted-sessions/{sid}").json()
+    assert detail["title"] == ""
+
+    # PATCH 更新标题
+    resp = client.patch(f"/agent/persisted-sessions/{sid}", json={"title": "自定义任务标题"})
+    assert resp.status_code == 200
+    assert resp.json()["title"] == "自定义任务标题"
+
+    detail = client.get(f"/agent/persisted-sessions/{sid}").json()
+    assert detail["title"] == "自定义任务标题"
+
+    # 空标题拒绝
+    bad = client.patch(f"/agent/persisted-sessions/{sid}", json={"title": "  "})
+    assert bad.status_code == 400
+
+    # 派发一轮对话后触发 summarize-title
+    with client.stream("POST", "/agent/run/stream",
+                       json={"prompt": "请帮我重构用户认证模块", "session_id": sid}) as s:
+        "".join(s.iter_text())
+
+    # 触发提炼
+    sum_resp = client.post(f"/agent/persisted-sessions/{sid}/summarize-title")
+    assert sum_resp.status_code == 200
+    assert sum_resp.json()["session_id"] == sid
+    assert sum_resp.json()["title"] != ""
+
+
+@pytest.mark.parametrize("manual", [False, True])
+def test_auto_title_merges_latest_turn_and_preserves_manual_edit(client, monkeypatch, manual):
+    import asyncio
+    sid = client.post("/agent/session/persist").json()["session_id"]
+    service._append_session_turn(sid, {"prompt": "需要详细讨论的第一轮需求", "output": "第一轮"})
+
+    def summary(rec, kernel):
+        service._append_session_turn(sid, {"prompt": "第二轮", "output": "继续讨论"})
+        if manual:
+            service._update_session_title(sid, "人工标题", manual=True)
+        return "自动提炼标题"
+
+    monkeypatch.setattr(service, "_summarize_session_title_with_llm", summary)
+    asyncio.run(service._trigger_async_title_summary(sid, "需要详细讨论的第一轮需求", "第一轮"))
+    rec = service._load_session(sid)
+    assert len(rec["turns"]) == 2
+    assert rec["title"] == ("人工标题" if manual else "自动提炼标题")
+
+
+def test_explicit_summary_does_not_overwrite_concurrent_rename(client, monkeypatch):
+    sid = client.post("/agent/session/persist").json()["session_id"]
+    service._append_session_turn(sid, {"prompt": "需要详细讨论的第一轮需求", "output": "第一轮"})
+
+    def summary(rec, kernel):
+        service._append_session_turn(sid, {"prompt": "第二轮", "output": "继续讨论"})
+        service._update_session_title(sid, "手动命名", manual=True)
+        return "过时的模型标题"
+
+    monkeypatch.setattr(service, "_summarize_session_title_with_llm", summary)
+    response = client.post(f"/agent/persisted-sessions/{sid}/summarize-title")
+    assert response.status_code == 200
+    assert response.json()["updated"] is False
+    assert response.json()["title"] == "手动命名"
+    assert len(service._load_session(sid)["turns"]) == 2
+
+
+def test_title_edit_survives_late_turn_and_automatic_summaries(client, monkeypatch):
+    import asyncio
+    sid = client.post("/agent/session/persist").json()["session_id"]
+    client.patch(f"/agent/persisted-sessions/{sid}", json={"title": "自选标题"})
+    service._append_session_turn(sid, {"prompt": "后来的任务执行结果", "output": "完成"})
+    calls = []
+    monkeypatch.setattr(service, "_summarize_session_title_with_llm", lambda *args: calls.append(args))
+    asyncio.run(service._trigger_async_title_summary(sid, "后来的任务执行结果", "完成"))
+    assert not calls
+    assert service._load_session(sid)["title"] == "自选标题"
+
+
+@pytest.mark.parametrize("cost,error", [(0.123, False), (0.05, True), (None, False)])
+def test_title_summary_reports_cost_tokens_and_unknown_cost(client, monkeypatch, cost, error):
+    from agent_core.kernel import KernelResult
+    monkeypatch.setattr(client.kernel, "run_oneshot", lambda **kwargs: KernelResult(
+        output="会话提炼标题", cost_usd=cost, is_error=error, turns=1,
+        usage={"input_tokens": 25, "output_tokens": 5, "cache_read_input_tokens": 3}))
+    title = service._summarize_session_title_with_llm({"turns":[
+        {"prompt":"需要详细讨论的第一轮需求","output":"第一轮"}]}, client.kernel)
+    assert bool(title) is not error
+    usage = client.get("/agent/status").json()["title_usage"]
+    assert usage["calls"] == 1 and usage["errors"] == int(error)
+    assert usage["total_cost_usd"] == (cost or 0)
+    assert usage["unknown_cost_calls"] == int(cost is None)
+    assert usage["total_turns"] == 1
+    assert usage["usage"] == {"input_tokens":25,"output_tokens":5,"cache_read_input_tokens":3}

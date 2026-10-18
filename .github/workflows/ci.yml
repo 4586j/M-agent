@@ -13,6 +13,17 @@ on:
         type: boolean
 
 jobs:
+  documentation:
+    name: 文档结构与本地链接
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: 检查当前主文档
+        run: python docs/check_docs.py
+
   python-tests:
     name: Python 测试（3.11+ 矩阵）
     runs-on: ubuntu-latest
@@ -197,3 +208,12 @@ jobs:
       - name: 编排面板 E2E
         working-directory: web
         run: npx playwright test --config=playwright.orchest.config.js
+      - name: 多 Brain 隔离与布局回归
+        working-directory: web
+        run: npm run test:e2e:layout
+      - name: 个人 Agent 理解沟通与编排边界
+        working-directory: web
+        run: npm run test:e2e:personal
+      - name: 开发代理回归
+        working-directory: web
+        run: npm run test:e2e:proxy

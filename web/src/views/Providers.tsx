@@ -65,7 +65,7 @@ export default function Providers() {
         />
       )}
 
-      <div className="bg-zinc-900/40 backdrop-blur-xl rounded-2xl border border-white/[0.07] shadow-[inset_0_1px_0_0_rgba(255,255,255,0.05)] p-2">
+      <div className="spotlight-card bg-zinc-900/40 backdrop-blur-xl rounded-2xl border border-white/[0.07] shadow-[inset_0_1px_0_0_rgba(255,255,255,0.05)] p-2">
         {Object.keys(providers).length === 0 && !error ? (
           <div className="text-sm text-zinc-500 text-center py-12">
             暂无 Provider——「新增 Provider」登记一个网络网关（名称/模型/端点/密钥）
@@ -164,7 +164,7 @@ function ProviderForm({ onSaved }: { onSaved: () => void }) {
   }
 
   return (
-    <div className="bg-zinc-900/40 backdrop-blur-xl rounded-2xl border border-white/[0.08] shadow-[inset_0_1px_0_0_rgba(255,255,255,0.05)] p-5 space-y-3.5">
+    <div className="spotlight-card bg-zinc-900/40 backdrop-blur-xl rounded-2xl border border-white/[0.08] shadow-[inset_0_1px_0_0_rgba(255,255,255,0.05)] p-5 space-y-3.5">
       <div className="text-xs font-bold text-zinc-400 uppercase tracking-wider flex items-center gap-2">
         <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" />
         新增 Provider

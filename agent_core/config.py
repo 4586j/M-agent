@@ -179,6 +179,10 @@ class AgentConfig:
     # translate_work_dir：翻译的隔离工作目录（空=派生 <work_dir>/.translate_work）。
     # 每次翻译在 <translate_work_dir>/tr-<uuid8> 下运行，绝不复用任务 cwd。
     translate_work_dir: str = ""
+    # Personal HTTP/UI only; never consulted by AgentKernel or orchestration workers.
+    understanding_enabled: bool = True
+    understanding_max_cost_usd: float = 0.1
+    understanding_budget_usd: float | None = None
 
 
 def _to_bool(raw: str, default: bool) -> bool:
@@ -436,6 +440,9 @@ def load_agent_config(**overrides) -> AgentConfig:
             "zh", "AGENT_TRANSLATE_TARGET_LANG", "ORCH_TRANSLATE_TARGET_LANG"),
         translate_work_dir=_env(
             "", "AGENT_TRANSLATE_WORK_DIR", "ORCH_TRANSLATE_WORK_DIR"),
+        understanding_enabled=_to_bool(_env("1", "AGENT_UNDERSTANDING_ENABLED"), True),
+        understanding_max_cost_usd=float(_env("0.1", "AGENT_UNDERSTANDING_MAX_COST_USD")),
+        understanding_budget_usd=float(_env("0", "AGENT_UNDERSTANDING_BUDGET_USD")) or None,
     )
     # 显式 overrides 覆盖环境变量结果（None 值也尊重调用方意图，直接赋值）
     for key, value in overrides.items():

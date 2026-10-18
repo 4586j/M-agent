@@ -3,7 +3,7 @@ import type { TaskRecord, TaskStatus } from '../types'
 import { TERMINAL_STATUSES } from '../types'
 import { POLL } from '../polling'
 import { api, sseUrl } from '../api/client'
-import { useActiveConnectionId } from '../api/connections'
+import { getActiveConnectionScope, useActiveConnectionScope } from '../api/connections'
 
 /** SSE 事件时间线行 */
 export interface TaskEventLine {
@@ -27,43 +27,73 @@ export function useTaskEvents(
   const [live, setLive] = useState<TaskRecord | null>(null)
   const [timeline, setTimeline] = useState<TaskEventLine[]>([])
   const [channel, setChannel] = useState<EventChannel>('off')
-  const esRef = useRef<EventSource | null>(null)
-  const pollRef = useRef<number | null>(null)
   const onChangeRef = useRef(onChange)
-  const connId = useActiveConnectionId()
+  const scope = useActiveConnectionScope()
+  const identity = JSON.stringify([scope, task.task_id])
+  const stateIdentity = useRef(identity)
   onChangeRef.current = onChange
 
   useEffect(() => {
+    stateIdentity.current = identity
     setLive(null)
     setTimeline([])
     setChannel('off')
     if (!task.task_id || TERMINAL_STATUSES.includes(task.status)) return // 终态/空任务无事件可等
 
-    const refresh = async () => {
+    let disposed = false
+    let streamEnded = false
+    let notified = false
+    let request = 0
+    let settled = 0
+    let responseFloor = 0
+    let poll: number | null = null
+    const controller = new AbortController()
+    const valid = () => !disposed && getActiveConnectionScope() === scope
+    const es = new EventSource(sseUrl(task.task_id))
+    const finish = () => {
+      streamEnded = true
+      es.close()
+      if (poll !== null) { clearInterval(poll); poll = null }
+      setChannel('off')
+    }
+    const notify = () => {
+      if (!notified) { notified = true; onChangeRef.current?.() }
+    }
+    const refresh = async (terminal = false) => {
+      if (!valid()) return
+      const sequence = ++request
       try {
-        setLive(await api.task(task.task_id))
+        const next = await api.task(task.task_id, controller.signal)
+        if (!valid() || sequence < settled || sequence < responseFloor) return
+        settled = sequence
+        setLive(next)
+        if (terminal || TERMINAL_STATUSES.includes(next.status)) {
+          finish()
+          notify()
+        }
       } catch {
         /* 静默失败，保留现有展示 */
       }
     }
 
-    const es = new EventSource(sseUrl(task.task_id))
-    esRef.current = es
     setChannel('sse')
     const handle = (kind: TaskEventLine['kind']) => (e: MessageEvent) => {
+      if (!valid() || streamEnded) return
       let data: Record<string, unknown> = {}
       try {
         data = JSON.parse(e.data)
       } catch {
-        /* 忽略坏帧 */
+        return // 忽略坏帧，不触发详情请求
       }
-      // 订阅时任务已终态：服务端发完快照即关流，直接结束
+      // 终态快照关闭事件流，并拉取最终输出。
       // （data.state 来自 JSON 边界，cast 到 TaskStatus 后做终态判定）
       if (data.snapshot === true && typeof data.state === 'string'
         && TERMINAL_STATUSES.includes(data.state as TaskStatus)) {
-        es.close()
-        esRef.current = null
-        setChannel('off')
+        responseFloor = request + 1
+        finish()
+        const status = data.state as TaskStatus
+        setLive(prev => ({ ...(prev ?? task), status }))
+        void refresh(true)
         return
       }
       setTimeline((prev) => [
@@ -77,37 +107,36 @@ export function useTaskEvents(
         },
       ])
       if (kind === 'done') {
-        es.close()
-        esRef.current = null
-        setChannel('off')
-        refresh()
-        onChangeRef.current?.()
+        responseFloor = request + 1
+        finish()
+        void refresh(true)
       } else if (data.snapshot !== true) {
-        refresh() // 状态/回调实质变化 → 拉最新记录（output/meta）
+        void refresh() // 状态/回调实质变化 → 拉最新记录（output/meta）
       }
     }
     es.addEventListener('status', handle('status'))
     es.addEventListener('callback', handle('callback'))
     es.addEventListener('done', handle('done'))
     es.onerror = () => {
+      if (!valid() || streamEnded) return
       // SSE 不可用（代理/网络限制）→ 降级为 5s 轮询
       es.close()
-      esRef.current = null
+      streamEnded = true
       setChannel('poll')
-      pollRef.current = window.setInterval(refresh, POLL.tasks)
+      poll = window.setInterval(() => { void refresh() }, POLL.tasks)
     }
     return () => {
+      disposed = true
+      controller.abort()
       es.close()
-      if (pollRef.current !== null) {
-        clearInterval(pollRef.current)
-        pollRef.current = null
-      }
-      esRef.current = null
+      if (poll !== null) clearInterval(poll)
     }
     // 任务或连接变化时重建订阅（task.status 取打开时刻快照）。
-    // connId：切换多 brain 连接时旧 EventSource 指向旧脑，必须关掉重订。
+    // scope：连接、地址或密钥变化后必须关闭旧订阅并丢弃迟到响应。
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [task.task_id, connId])
+  }, [task.task_id, scope])
 
-  return { current: live ?? task, timeline, channel }
+  const current = stateIdentity.current === identity
+  return { current: current ? live ?? task : task,
+    timeline: current ? timeline : [], channel: current ? channel : 'off' }
 }

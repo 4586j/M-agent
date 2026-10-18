@@ -1,5 +1,9 @@
 # 单Agent功能综合分析报告
 
+<!-- current-document-navigation -->
+> 历史专题导航（2026-10-18）：本文保留原分析上下文；个人 Agent 的当前入口和已知限制见 [项目介绍](项目介绍.md)，新增理解沟通见 [个人机制说明](需求理解核验设计与使用说明_2026-10-18.md)。
+<!-- current-document-navigation -->
+
 ## 一、项目概述
 
 本项目（数据专家Agent）实现了一个以 LLM 为核心的单Agent执行系统，核心代码集中在 `agent_core/` 模块，包含执行内核（kernel.py）、工具管理（tools.py）、规划引擎（planning.py）、上下文构建（context.py）、人设管理（persona.py）、输出质量守卫（output_guard.py）、HTTP 服务（service.py）等子模块。

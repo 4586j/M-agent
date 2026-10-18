@@ -68,7 +68,7 @@ export const api = {
   workers: () => request<WorkerInfo[]>('/workers'),
   tasks: (workerId?: string) =>
     request<TaskRecord[]>(`/tasks${workerId ? `?worker_id=${encodeURIComponent(workerId)}` : ''}`),
-  task: (id: string) => request<TaskRecord>(`/tasks/${encodeURIComponent(id)}`),
+  task: (id: string, signal?: AbortSignal) => request<TaskRecord>(`/tasks/${encodeURIComponent(id)}`, { signal }),
 
   register: (body: RegisterBody) =>
     request<{ status: string; worker_id: string }>('/register', {

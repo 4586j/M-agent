@@ -1,8 +1,8 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useState, useRef } from 'react'
 import type { TaskRecord, TaskStatus, BudgetSnapshot } from '../types'
 import { usePolling } from '../hooks/usePolling'
 import { POLL } from '../polling'
-import { useActiveConnectionId } from '../api/connections'
+import { useActiveConnectionScope } from '../api/connections'
 import { api } from '../api/client'
 import { fmtUsd, timeAgo } from '../utils'
 import { statusDot } from '../types'
@@ -25,11 +25,11 @@ export default function Tasks() {
   const [q, setQ] = useState('')
   const [runningOnly, setRunningOnly] = useState(false)
   const [selected, setSelected] = useState<TaskRecord | null>(null)
-  const connId = useActiveConnectionId()
+  const connectionScope = useActiveConnectionScope()
 
   useEffect(() => {
     setSelected(null)
-  }, [connId])
+  }, [connectionScope])
 
   const roles = useMemo(
     () => [...new Set((tasks || []).map((t) => t.role))].sort(),
@@ -61,23 +61,66 @@ export default function Tasks() {
     return c
   }, [tasks])
 
+  const statusRef = useRef<HTMLDivElement>(null)
+  const [statusPill, setStatusPill] = useState<{ left: number; top: number; width: number; height: number } | null>(null)
+
+  useEffect(() => {
+    const updatePill = () => {
+      if (!statusRef.current) return
+      const activeBtn = statusRef.current.querySelector('[data-active="true"]') as HTMLElement | null
+      if (activeBtn) {
+        setStatusPill({
+          left: activeBtn.offsetLeft,
+          top: activeBtn.offsetTop,
+          width: activeBtn.offsetWidth,
+          height: activeBtn.offsetHeight,
+        })
+      }
+    }
+    updatePill()
+    const t = setTimeout(updatePill, 30)
+    const observer = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(updatePill)
+    if (statusRef.current) observer?.observe(statusRef.current)
+    const active = statusRef.current?.querySelector('[data-active="true"]')
+    if (active) observer?.observe(active)
+    window.addEventListener('resize', updatePill)
+    return () => {
+      clearTimeout(t)
+      observer?.disconnect()
+      window.removeEventListener('resize', updatePill)
+    }
+  }, [status, counts])
+
   return (
     <div className="space-y-5">
       {/* 预算总闸：全局/当日已用 + 热调上限 */}
       <BudgetBar budget={budget} onChange={refreshBudget} />
 
       {/* 筛选栏 */}
-      <div className="bg-zinc-900/40 backdrop-blur-xl rounded-2xl border border-white/[0.07] p-4 shadow-[inset_0_1px_0_0_rgba(255,255,255,0.05)] flex flex-wrap items-center gap-2.5 text-xs">
-        <div className="flex flex-wrap gap-1">
+      <div className="spotlight-card bg-zinc-900/40 backdrop-blur-xl rounded-2xl border border-white/[0.07] p-4 shadow-[inset_0_1px_0_0_rgba(255,255,255,0.05)] flex flex-wrap items-center gap-2.5 text-xs">
+        <div ref={statusRef} className="flex flex-wrap gap-1 relative p-0.5 rounded-full bg-zinc-950/60 border border-white/[0.06]">
+          {statusPill && (
+            <div
+              data-testid="task-status-indicator"
+              className="absolute rounded-full pointer-events-none backdrop-blur-md bg-emerald-500/20 border border-emerald-500/40 shadow-sm transition-all duration-300 ease-[cubic-bezier(0.22,1,0.36,1)] z-0"
+              style={{
+                left: `${statusPill.left}px`,
+                top: `${statusPill.top}px`,
+                width: `${statusPill.width}px`,
+                height: `${statusPill.height}px`,
+              }}
+            />
+          )}
           {STATUSES.map((s) => (
             <button
               key={s}
               type="button"
+              data-active={status === s}
               onClick={() => setStatus(s)}
-              className={`px-3 py-1 rounded-full font-medium transition duration-150 ${
+              className={`btn-press px-3 py-1 rounded-full font-medium transition duration-150 relative z-10 ${
                 status === s
-                  ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 shadow-sm'
-                  : 'bg-zinc-950/60 text-zinc-400 border border-white/[0.06] hover:bg-zinc-800 hover:text-zinc-200'
+                  ? 'text-emerald-300 font-semibold'
+                  : 'text-zinc-400 hover:text-zinc-200'
               }`}
             >
               {s === 'all' ? '全部' : s}
@@ -122,7 +165,7 @@ export default function Tasks() {
       )}
 
       {/* 列表容器 */}
-      <div className="bg-zinc-900/40 backdrop-blur-xl rounded-2xl border border-white/[0.07] shadow-[inset_0_1px_0_0_rgba(255,255,255,0.05)] p-2">
+      <div className="spotlight-card bg-zinc-900/40 backdrop-blur-xl rounded-2xl border border-white/[0.07] shadow-[inset_0_1px_0_0_rgba(255,255,255,0.05)] p-2">
         {filtered.length === 0 && !error && (
           <div className="text-sm text-zinc-500 text-center py-12">没有匹配的任务</div>
         )}

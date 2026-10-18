@@ -17,7 +17,7 @@ function BudgetRow({ label, spent, limit }: {
       <div className="flex-1 h-1.5 rounded-full bg-zinc-800/90 overflow-hidden border border-white/[0.04]">
         {limit != null && (
           <div
-            className={`h-full rounded-full transition-all duration-300 ${over ? 'bg-rose-500 shadow-[0_0_8px_rgba(244,63,94,0.5)]' : pct > 80 ? 'bg-amber-400 shadow-[0_0_8px_rgba(251,191,36,0.5)]' : 'bg-emerald-400 shadow-[0_0_8px_rgba(52,211,153,0.4)]'}`}
+            className={`h-full rounded-full transition-all duration-300 ${over ? 'bg-rose-500 shadow-[0_0_8px_rgba(244,63,94,0.5)]' : pct > 80 ? 'bg-amber-400 shadow-[0_0_8px_rgba(251,191,36,0.5)]' : 'bg-emerald-400 shadow-[0_0_8px_rgba(52,211,153,0.4)]'} ${pct > 0 ? 'animate-shimmer' : ''}`}
             style={{ width: `${pct}%` }}
           />
         )}

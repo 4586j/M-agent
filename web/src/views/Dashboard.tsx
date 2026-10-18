@@ -78,7 +78,7 @@ export default function Dashboard() {
       <StatBar stats={stats.data} cacheHit={cacheHit} />
 
       {stats.error && (
-        <div className="text-rose-400 text-xs bg-rose-500/10 border border-rose-500/25 rounded-2xl p-3 font-mono flex items-center gap-2">
+        <div className="text-rose-400 text-xs bg-rose-500/10 border border-rose-500/25 rounded-2xl p-3.5 font-mono flex items-center gap-2.5 animate-in fade-in">
           <span className="w-2 h-2 rounded-full bg-rose-500" />
           <span>大脑连接失败：{stats.error}（请确认 brain_api 已启动，带鉴权部署点右上角 🔑 配置 Key）</span>
         </div>
@@ -86,10 +86,10 @@ export default function Dashboard() {
 
       {/* 待办中心：审批 + 失败重派，高光琥珀微光拦截条 */}
       {hasAction && (
-        <div className="bg-zinc-900/60 backdrop-blur-xl border border-amber-500/30 rounded-2xl p-5 shadow-[inset_0_1px_0_0_rgba(255,255,255,0.05),0_0_20px_rgba(245,158,11,0.06)]">
+        <div className="spotlight-card bg-zinc-900/60 backdrop-blur-xl border border-amber-500/30 rounded-2xl p-5 shadow-[inset_0_1px_0_0_rgba(255,255,255,0.05),0_0_20px_rgba(245,158,11,0.06)] animate-in fade-in duration-300">
           <div className="flex items-center justify-between mb-3.5">
             <div className="flex items-center gap-2.5">
-              <span className="w-2.5 h-2.5 rounded-full bg-amber-400 shadow-[0_0_8px_rgba(251,191,36,0.5)]" />
+              <span className="w-2.5 h-2.5 rounded-full bg-amber-400 shadow-[0_0_8px_rgba(251,191,36,0.6)] animate-pulse" />
               <h3 className="text-sm font-bold text-zinc-100 tracking-tight">待办中心</h3>
               <span className="text-xs bg-amber-500/15 text-amber-300 border border-amber-500/25 px-2.5 py-0.5 rounded-full font-mono font-semibold">
                 {approvals.length + failures.length} 项待处置
@@ -98,8 +98,12 @@ export default function Dashboard() {
             {msg && <span className="text-xs text-emerald-400 font-mono">{msg}</span>}
           </div>
           <div className="space-y-2.5">
-            {approvals.map((t) => (
-              <div key={t.task_id} className="bg-zinc-950/80 border border-amber-500/20 rounded-xl p-3.5 flex flex-col md:flex-row md:items-center justify-between gap-3 shadow-sm hover:border-amber-500/40 transition">
+            {approvals.map((t, idx) => (
+              <div
+                key={t.task_id}
+                style={{ '--stagger': idx } as React.CSSProperties}
+                className="stagger-item bg-zinc-950/80 border border-amber-500/20 rounded-xl p-3.5 flex flex-col md:flex-row md:items-center justify-between gap-3 shadow-sm hover:border-amber-500/40 transition duration-150"
+              >
                 <div className="min-w-0">
                   <div className="flex items-center gap-2 flex-wrap">
                     <span className="font-bold text-zinc-100 text-sm font-mono">{t.task_id}</span>
@@ -132,8 +136,12 @@ export default function Dashboard() {
                 </div>
               </div>
             ))}
-            {failures.map((t) => (
-              <div key={t.task_id} className="bg-zinc-950/80 border border-rose-500/20 rounded-xl p-3.5 flex flex-col md:flex-row md:items-center justify-between gap-3 shadow-sm hover:border-rose-500/40 transition">
+            {failures.map((t, idx) => (
+              <div
+                key={t.task_id}
+                style={{ '--stagger': idx + approvals.length } as React.CSSProperties}
+                className="stagger-item bg-zinc-950/80 border border-rose-500/20 rounded-xl p-3.5 flex flex-col md:flex-row md:items-center justify-between gap-3 shadow-sm hover:border-rose-500/40 transition duration-150"
+              >
                 <div className="min-w-0">
                   <div className="flex items-center gap-2 flex-wrap">
                     <span className="font-bold text-zinc-100 text-sm font-mono">{t.task_id}</span>
@@ -175,8 +183,14 @@ export default function Dashboard() {
           </div>
 
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-            {(workers.data || []).map((w) => (
-              <WorkerCard key={w.worker_id} worker={w} heartbeatTimeout={timeout} />
+            {(workers.data || []).map((w, idx) => (
+              <div
+                key={w.worker_id}
+                style={{ '--stagger': idx } as React.CSSProperties}
+                className="stagger-item"
+              >
+                <WorkerCard worker={w} heartbeatTimeout={timeout} />
+              </div>
             ))}
             {workers.data && workers.data.length === 0 && !workers.error && (
               <div className="text-zinc-500 text-xs font-mono col-span-2 bg-zinc-900/40 border border-white/[0.06] rounded-2xl p-8 text-center">
@@ -188,9 +202,14 @@ export default function Dashboard() {
 
         {/* 右侧 1/3：成本看板与状态分布 */}
         <div className="space-y-6">
-          <CostPanel cost={stats.data?.cost} />
+          <div className="stagger-item" style={{ '--stagger': 2 } as React.CSSProperties}>
+            <CostPanel cost={stats.data?.cost} />
+          </div>
 
-          <div className="bg-zinc-900/60 backdrop-blur-xl rounded-2xl p-5 border border-white/[0.07] shadow-[inset_0_1px_0_0_rgba(255,255,255,0.05)]">
+          <div
+            style={{ '--stagger': 3 } as React.CSSProperties}
+            className="spotlight-card stagger-item bg-zinc-900/60 backdrop-blur-xl rounded-2xl p-5 border border-white/[0.07] shadow-[inset_0_1px_0_0_rgba(255,255,255,0.05)]"
+          >
             <div className="flex items-center justify-between mb-4">
               <h3 className="text-sm font-bold text-zinc-100 tracking-tight flex items-center gap-2">
                 <span className="w-1.5 h-1.5 rounded-full bg-indigo-400" />
@@ -238,7 +257,7 @@ function DistributionBars({ stats }: { stats?: Record<string, number> }) {
               <span className="text-zinc-400 font-semibold">{pct}%</span>
             </div>
             <div className="w-full bg-zinc-950 rounded-full h-2 overflow-hidden border border-white/[0.04]">
-              <div className={`${statusDot(k)} h-2 rounded-full transition-all duration-500`} style={{ width: `${pct}%` }} />
+              <div className={`${statusDot(k)} h-2 rounded-full transition-all duration-700 ease-out`} style={{ width: `${pct}%` }} />
             </div>
           </div>
         )

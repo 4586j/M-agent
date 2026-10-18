@@ -293,3 +293,29 @@ test.describe('会话删除', () => {
     await expect(page.locator('#session-new')).toBeDisabled();
   });
 });
+
+test('会话重命名保留引号并发送 JSON，用量包括标题提炼', async ({ page, request }) => {
+  const sid = (await (await request.post('/agent/session/persist')).json()).session_id;
+  const quotedTitle = '审查 "登录" 问题';
+  await request.patch(`/agent/persisted-sessions/${sid}`, {data:{title:quotedTitle}});
+  await page.evaluate(() => loadSessions());
+  await page.locator('#session-sel').selectOption(sid);
+  await expect(page.locator('#session-rename')).toBeEnabled();
+  await page.locator('#session-rename').click();
+  await expect(page.locator('#rename-title-in')).toHaveValue(quotedTitle);
+  await page.locator('#rename-title-in').fill('已修复 "登录" 问题');
+  const response = page.waitForResponse(r=>r.url().includes(`/agent/persisted-sessions/${sid}`) && r.request().method()==='PATCH');
+  await page.getByRole('button',{name:'保存',exact:true}).click();
+  const saved = await response;
+  expect(saved.status()).toBe(200);
+  expect(saved.request().postDataJSON()).toEqual({title:'已修复 "登录" 问题'});
+  await expect(page.locator('#session-sel')).toContainText('已修复 "登录" 问题');
+  await page.route('**/agent/status', route=>route.fulfill({json:{title_usage:{calls:1,
+    errors:0,total_cost_usd:0.123,unknown_cost_calls:0,usage:{input_tokens:25,output_tokens:5}}}}));
+  await page.locator('#prompt').fill('/usage');
+  await page.locator('#prompt').press('Control+Enter');
+  await expect(page.locator('.modal-body')).toContainText('标题提炼：1 次');
+  await expect(page.locator('.modal-body')).toContainText('$0.123000');
+  await expect(page.locator('.modal-body')).toContainText('输入 25，输出 5');
+  await request.delete(`/agent/persisted-sessions/${sid}`);
+});

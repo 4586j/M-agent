@@ -8,6 +8,7 @@ import {
   deleteConnection,
   getActiveConnectionId,
   getConnections,
+  getActiveConnection,
 } from '../api/connections'
 
 /**
@@ -28,6 +29,48 @@ function deferred() {
 }
 
 describe('usePolling · 多 brain 连接切换', () => {
+  it.each(['baseUrl', 'apiKey'] as const)('修改同一连接的 %s 立即重拉并丢弃旧响应', async field => {
+    const {resolvers, fn} = deferred()
+    const {result} = renderHook(() => usePolling(fn, 100000))
+    expect(resolvers).toHaveLength(1)
+    act(() => saveConnection({...getActiveConnection(), [field]: field === 'baseUrl' ? 'http://changed.test' : 'rotated-key'}))
+    expect(resolvers).toHaveLength(2)
+    expect(result.current.data).toBeNull()
+    await act(async () => {resolvers[1]('new'); await Promise.resolve()})
+    await act(async () => {resolvers[0]('old'); await Promise.resolve()})
+    expect(result.current.data).toBe('new')
+  })
+
+  it('仅修改连接名称保留现有数据且不重拉', async () => {
+    const fn = vi.fn(async () => 'kept')
+    const {result} = renderHook(() => usePolling(fn, 100000))
+    await waitFor(() => expect(result.current.data).toBe('kept'))
+    act(() => saveConnection({...getActiveConnection(), name:'重命名'}))
+    expect(fn).toHaveBeenCalledTimes(1)
+    expect(result.current.data).toBe('kept')
+  })
+
+  it('并发刷新时较早请求迟到不覆盖最新结果', async () => {
+    const {resolvers, fn} = deferred()
+    const {result} = renderHook(() => usePolling(fn, 100000))
+    let newer!: Promise<void>
+    act(() => {newer = result.current.refresh()})
+    await act(async () => {resolvers[1]('new'); await newer})
+    await act(async () => {resolvers[0]('old'); await Promise.resolve()})
+    expect(result.current.data).toBe('new')
+  })
+
+  it('慢请求期间开启下一次刷新，不会使所有较早响应都失效', async () => {
+    const {resolvers, fn} = deferred()
+    const {result} = renderHook(() => usePolling(fn, 100000))
+    let newer!: Promise<void>
+    act(() => {newer = result.current.refresh()})
+    await act(async () => {resolvers[0]('first'); await Promise.resolve()})
+    expect(result.current.data).toBe('first')
+    await act(async () => {resolvers[1]('newer'); await newer})
+    expect(result.current.data).toBe('newer')
+  })
+
   it('切换连接后旧数据清空、新数据到达后显示', async () => {
     const other = createConnection('第二大脑', 'http://127.0.0.1:7001', '')
     saveConnection(other)

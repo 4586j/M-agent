@@ -8,6 +8,7 @@ const apiPaths = [
   '/workers', '/tasks', '/dispatch', '/register', '/heartbeat', '/stats', '/proxy',
   // 二期：记忆系统 / 程序记忆演化 / 经验库 / 顾问与翻译 / 调度与审计（三期）
   '/memory', '/experiences', '/recommend', '/translate', '/schedules', '/audit',
+  '/budgets', '/providers', '/sessions', '/knowledge',
 ]
 
 export default defineConfig({

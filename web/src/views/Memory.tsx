@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react'
+import { useMemo, useState, useEffect, useRef } from 'react'
 import type {
   ExperienceRecord, MemoryCoreItem, ProposalRecord, ReflectionReport, TaskRecord,
 } from '../types'
@@ -21,19 +21,52 @@ const TABS: { key: Tab; label: string }[] = [
 /** 记忆系统四层资产库 + 知识库（docs/客户端界面设计.md §3.5） */
 export default function Memory() {
   const [tab, setTab] = useState<Tab>('core')
+  const tabsRef = useRef<HTMLDivElement>(null)
+  const [pillStyle, setPillStyle] = useState<{ left: number; width: number } | null>(null)
+
+  useEffect(() => {
+    const updatePill = () => {
+      if (!tabsRef.current) return
+      const activeBtn = tabsRef.current.querySelector('[data-active="true"]') as HTMLElement | null
+      if (activeBtn) {
+        setPillStyle({
+          left: activeBtn.offsetLeft,
+          width: activeBtn.offsetWidth,
+        })
+      }
+    }
+    updatePill()
+    const t = setTimeout(updatePill, 30)
+    window.addEventListener('resize', updatePill)
+    return () => {
+      clearTimeout(t)
+      window.removeEventListener('resize', updatePill)
+    }
+  }, [tab])
+
   return (
     <div>
-      {/* 分段选择器 */}
-      <div className="inline-flex p-1 bg-zinc-950/80 border border-white/[0.08] rounded-2xl mb-6 shadow-inner">
+      {/* 分段选择器（毛玻璃滑动指示器） */}
+      <div ref={tabsRef} className="inline-flex p-1 bg-zinc-950/80 border border-white/[0.08] rounded-2xl mb-6 shadow-inner relative">
+        {pillStyle && (
+          <div
+            className="absolute top-1 bottom-1 rounded-xl pointer-events-none backdrop-blur-md bg-emerald-500/15 border border-emerald-400/30 shadow-[0_0_20px_rgba(16,185,129,0.15)] transition-all duration-300 ease-[cubic-bezier(0.22,1,0.36,1)] z-0"
+            style={{
+              left: `${pillStyle.left}px`,
+              width: `${pillStyle.width}px`,
+            }}
+          />
+        )}
         {TABS.map((t) => (
           <button
             key={t.key}
             type="button"
+            data-active={tab === t.key}
             onClick={() => setTab(t.key)}
-            className={`btn-press px-4 py-2 text-xs rounded-xl font-medium transition duration-150 ${
+            className={`btn-press px-4 py-2 text-xs rounded-xl font-medium transition duration-150 relative z-10 ${
               tab === t.key
-                ? 'bg-zinc-800 text-emerald-400 shadow-sm border border-white/[0.08] font-semibold'
-                : 'text-zinc-400 hover:text-zinc-200 hover:bg-zinc-900/50'
+                ? 'text-emerald-300 font-semibold'
+                : 'text-zinc-400 hover:text-zinc-200'
             }`}
           >
             {t.label}
@@ -103,7 +136,7 @@ function KnowledgeTab() {
 
   return (
     <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-      <section className="bg-zinc-900/40 backdrop-blur-xl rounded-2xl border border-white/[0.07] shadow-[inset_0_1px_0_0_rgba(255,255,255,0.05)] p-5">
+      <section className="spotlight-card bg-zinc-900/40 backdrop-blur-xl rounded-2xl border border-white/[0.07] shadow-[inset_0_1px_0_0_rgba(255,255,255,0.05)] p-5">
         <h3 className="text-sm font-semibold text-zinc-100 mb-1">上传文档</h3>
         <p className="text-xs text-zinc-400 mb-3">
           项目规范 / API 文档 / 运维手册等确定性资料。派发时自动检索相关片段注入任务上下文（空库零影响）。
@@ -134,7 +167,7 @@ function KnowledgeTab() {
         </div>
       </section>
 
-      <section className="bg-zinc-900/40 backdrop-blur-xl rounded-2xl border border-white/[0.07] shadow-[inset_0_1px_0_0_rgba(255,255,255,0.05)] p-5">
+      <section className="spotlight-card bg-zinc-900/40 backdrop-blur-xl rounded-2xl border border-white/[0.07] shadow-[inset_0_1px_0_0_rgba(255,255,255,0.05)] p-5">
         <h3 className="text-sm font-semibold text-zinc-100 mb-3">文档（{docs.length}）与检索预览</h3>
         <div className="flex items-center gap-2 mb-3">
           <input
@@ -184,7 +217,7 @@ function KnowledgeTab() {
                 </div>
                 <button
                   type="button"
-                  onClick={() => { if (window.confirm(`删除文档「${d.title}」？`)) remove(d.doc_id, d.title) }}
+                  onClick={() => remove(d.doc_id, d.title)}
                   className="px-2.5 py-1 text-xs text-zinc-400 hover:text-rose-400 transition"
                 >
                   删除
@@ -248,7 +281,7 @@ function CoreMemTab() {
 
   return (
     <div className="grid grid-cols-1 lg:grid-cols-3 gap-5">
-      <div className="bg-zinc-900/40 backdrop-blur-xl rounded-2xl border border-white/[0.07] shadow-[inset_0_1px_0_0_rgba(255,255,255,0.05)] p-3.5">
+      <div className="spotlight-card bg-zinc-900/40 backdrop-blur-xl rounded-2xl border border-white/[0.07] shadow-[inset_0_1px_0_0_rgba(255,255,255,0.05)] p-3.5">
         <div className="flex items-center justify-between px-1 mb-2.5">
           <span className="text-xs font-bold text-zinc-400 uppercase tracking-wider">记忆列表</span>
           <button
@@ -282,7 +315,7 @@ function CoreMemTab() {
         </div>
       </div>
 
-      <div className="lg:col-span-2 bg-zinc-900/40 backdrop-blur-xl rounded-2xl border border-white/[0.07] shadow-[inset_0_1px_0_0_rgba(255,255,255,0.05)] p-5">
+      <div className="lg:col-span-2 spotlight-card bg-zinc-900/40 backdrop-blur-xl rounded-2xl border border-white/[0.07] shadow-[inset_0_1px_0_0_rgba(255,255,255,0.05)] p-5">
         {creating ? (
           <>
             <div className="text-xs font-bold text-zinc-400 uppercase tracking-wider mb-2.5">新建核心记忆</div>
@@ -437,7 +470,7 @@ function ContextTab() {
 
   return (
     <div className="space-y-4">
-      <div className="bg-zinc-900/40 backdrop-blur-xl rounded-2xl border border-white/[0.07] shadow-[inset_0_1px_0_0_rgba(255,255,255,0.05)] p-3.5 flex flex-wrap items-center gap-2.5">
+      <div className="spotlight-card bg-zinc-900/40 backdrop-blur-xl rounded-2xl border border-white/[0.07] shadow-[inset_0_1px_0_0_rgba(255,255,255,0.05)] p-3.5 flex flex-wrap items-center gap-2.5">
         <select
           value={taskId}
           onChange={(e) => load(e.target.value)}
@@ -463,7 +496,7 @@ function ContextTab() {
       </div>
 
       {!taskId && (
-        <div className="bg-zinc-900/40 backdrop-blur-xl rounded-2xl border border-white/[0.07] shadow-[inset_0_1px_0_0_rgba(255,255,255,0.05)] p-12 text-center text-sm text-zinc-500">
+        <div className="spotlight-card bg-zinc-900/40 backdrop-blur-xl rounded-2xl border border-white/[0.07] shadow-[inset_0_1px_0_0_rgba(255,255,255,0.05)] p-12 text-center text-sm text-zinc-500">
           选择一个任务查看其上下文记忆（含任务终态自动写入的 result 笔记）
         </div>
       )}
@@ -471,7 +504,7 @@ function ContextTab() {
       {taskId && notes && (
         <div className="space-y-3">
           {Object.entries(notes).map(([k, v]) => (
-            <div key={k} className="bg-zinc-900/40 backdrop-blur-xl rounded-2xl border border-white/[0.07] shadow-[inset_0_1px_0_0_rgba(255,255,255,0.05)] p-4">
+            <div key={k} className="spotlight-card bg-zinc-900/40 backdrop-blur-xl rounded-2xl border border-white/[0.07] shadow-[inset_0_1px_0_0_rgba(255,255,255,0.05)] p-4">
               <div className="flex items-center justify-between mb-2">
                 <span className="font-mono text-xs font-semibold text-zinc-200">{k}</span>
                 {editingKey === k ? (
@@ -586,7 +619,7 @@ function ExperienceTab() {
   const list = results ?? []
   return (
     <div className="space-y-4">
-      <div className="bg-zinc-900/40 backdrop-blur-xl rounded-2xl border border-white/[0.07] shadow-[inset_0_1px_0_0_rgba(255,255,255,0.05)] p-3.5 flex flex-wrap items-center gap-2.5">
+      <div className="spotlight-card bg-zinc-900/40 backdrop-blur-xl rounded-2xl border border-white/[0.07] shadow-[inset_0_1px_0_0_rgba(255,255,255,0.05)] p-3.5 flex flex-wrap items-center gap-2.5">
         <input
           value={q}
           onChange={(e) => setQ(e.target.value)}
@@ -622,11 +655,11 @@ function ExperienceTab() {
       </div>
 
       {results === null ? (
-        <div className="bg-zinc-900/40 backdrop-blur-xl rounded-2xl border border-white/[0.07] p-12 text-center text-sm text-zinc-500">
+        <div className="spotlight-card bg-zinc-900/40 backdrop-blur-xl rounded-2xl border border-white/[0.07] p-12 text-center text-sm text-zinc-500">
           输入关键词检索历史经验（每次派发时系统会自动注入最相关的 3 条成功经验）
         </div>
       ) : list.length === 0 ? (
-        <div className="bg-zinc-900/40 backdrop-blur-xl rounded-2xl border border-white/[0.07] p-12 text-center text-sm text-zinc-500">
+        <div className="spotlight-card bg-zinc-900/40 backdrop-blur-xl rounded-2xl border border-white/[0.07] p-12 text-center text-sm text-zinc-500">
           没有匹配的经验
         </div>
       ) : (
@@ -634,7 +667,7 @@ function ExperienceTab() {
           {list.map((r) => (
             <div
               key={r.exp_id}
-              className="bg-zinc-900/40 backdrop-blur-xl rounded-2xl border border-white/[0.07] shadow-[inset_0_1px_0_0_rgba(255,255,255,0.05)] p-4 hover:border-emerald-500/30 transition duration-150"
+              className="spotlight-card bg-zinc-900/40 backdrop-blur-xl rounded-2xl border border-white/[0.07] shadow-[inset_0_1px_0_0_rgba(255,255,255,0.05)] p-4 hover:border-emerald-500/30 transition duration-150"
             >
               <button
                 type="button"
@@ -720,7 +753,7 @@ function ProposalTab() {
   return (
     <div className="space-y-4">
       {/* 反思报告（证据面板） */}
-      <div className="bg-zinc-900/40 backdrop-blur-xl border border-white/[0.07] rounded-2xl p-5 shadow-[inset_0_1px_0_0_rgba(255,255,255,0.05)]">
+      <div className="spotlight-card bg-zinc-900/40 backdrop-blur-xl border border-white/[0.07] rounded-2xl p-5 shadow-[inset_0_1px_0_0_rgba(255,255,255,0.05)]">
         <div className="flex items-center justify-between mb-3">
           <div className="flex items-center gap-2">
             <span className="w-2 h-2 rounded-full bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.6)]" />
@@ -763,7 +796,7 @@ function ProposalTab() {
 
       {/* 提案列表 */}
       {list.length === 0 ? (
-        <div className="bg-zinc-900/40 backdrop-blur-xl rounded-2xl border border-white/[0.07] p-12 text-center text-sm text-zinc-500">
+        <div className="spotlight-card bg-zinc-900/40 backdrop-blur-xl rounded-2xl border border-white/[0.07] p-12 text-center text-sm text-zinc-500">
           暂无演化提案——由大脑在 G5 复盘时依据反思报告起草
         </div>
       ) : (
@@ -814,7 +847,7 @@ function ProposalCard({
     : p.status === 'rejected' ? 'bg-rose-500/15 text-rose-300 border border-rose-500/30'
     : 'bg-amber-500/15 text-amber-300 border border-amber-500/30'
   return (
-    <div className="bg-zinc-900/40 backdrop-blur-xl rounded-2xl border border-white/[0.07] shadow-[inset_0_1px_0_0_rgba(255,255,255,0.05)] p-4">
+    <div className="spotlight-card bg-zinc-900/40 backdrop-blur-xl rounded-2xl border border-white/[0.07] shadow-[inset_0_1px_0_0_rgba(255,255,255,0.05)] p-4">
       <button type="button" onClick={onToggle} className="w-full text-left">
         <div className="flex items-center gap-2.5 flex-wrap">
           <span className={`px-2 py-0.5 rounded text-xs font-bold font-mono ${statusCls}`}>{p.status}</span>
